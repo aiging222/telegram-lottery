@@ -5,8 +5,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from telegram import Update
-from telegram.error import BadRequest
+from telegram import ChatMember, Update
+from telegram.error import BadRequest, ChatMigrated, Forbidden
 
 from lottery.bot import (
     BotHandlers,
@@ -33,22 +33,39 @@ def setup(tmp_path):
     return store, rid, BotHandlers(store, {99})
 
 
-def command_update(text, user_id=99, chat_type="private"):
+def command_update(text, user_id=99, chat_type="private", chat_id=GROUP["id"]):
     message = SimpleNamespace(
         text=text, sender_chat=None, reply_text=AsyncMock(), reply_document=AsyncMock()
     )
     update = SimpleNamespace(
         effective_message=message,
         effective_user=SimpleNamespace(id=user_id, is_bot=False),
-        effective_chat=SimpleNamespace(type=chat_type),
+        effective_chat=SimpleNamespace(
+            type=chat_type, id=user_id if chat_type == "private" else chat_id
+        ),
     )
     return update, SimpleNamespace(args=text.split()[1:])
 
 
-def run_command(handlers, text, user_id=99, chat_type="private"):
-    update, context = command_update(text, user_id, chat_type)
+def run_command(handlers, text, user_id=99, chat_type="private", chat_id=GROUP["id"]):
+    update, context = command_update(text, user_id, chat_type, chat_id)
     asyncio.run(handlers.command(update, context))
     return update.effective_message
+
+
+def member(status, **fields):
+    return AsyncMock(return_value=SimpleNamespace(status=status, **fields))
+
+
+def join_click(handlers, rid, get_chat_member, answer=None):
+    query = SimpleNamespace(
+        data=f"join:{rid}",
+        answer=answer or AsyncMock(),
+        from_user=SimpleNamespace(id=123, full_name="Alice", is_bot=False),
+    )
+    context = SimpleNamespace(bot=SimpleNamespace(get_chat_member=get_chat_member))
+    asyncio.run(handlers.callback(SimpleNamespace(callback_query=query), context))
+    return query.answer.call_args.args[0]
 
 
 def test_non_admin_cannot_change_weights_or_draw(setup):
@@ -75,6 +92,7 @@ def test_admin_flow_and_group_draw(setup):
     assert store.view(rid)["entries"][0]["weight"] == 3
     message = run_command(handlers, f"/publish {rid}", chat_type="supergroup")
     assert message.reply_text.call_args.kwargs["reply_markup"] is not None
+    assert store.view(rid)["chat_id"] == GROUP["id"]
     run_command(handlers, f"/freeze {rid}")
     first = run_command(handlers, f"/draw {rid}", chat_type="supergroup")
     second = run_command(handlers, f"/draw {rid}", chat_type="supergroup")
@@ -97,19 +115,89 @@ def test_bad_arguments_do_not_modify_data(setup):
 
 def test_callback_registration_and_deadline(setup):
     store, rid, handlers = setup
-    query = SimpleNamespace(
-        data=f"join:{rid}",
-        answer=AsyncMock(),
-        from_user=SimpleNamespace(id=123, full_name="Alice", is_bot=False),
-    )
-    update = SimpleNamespace(callback_query=query)
-    asyncio.run(handlers.callback(update, None))
-    assert "成功" in query.answer.call_args.args[0]
-    asyncio.run(handlers.callback(update, None))
-    assert "无需重复" in query.answer.call_args.args[0]
+    store.bind(rid, 99, GROUP["id"])
+    assert "成功" in join_click(handlers, rid, member(ChatMember.MEMBER))
+    assert "无需重复" in join_click(handlers, rid, member(ChatMember.MEMBER))
     store.freeze(rid, 99)
-    asyncio.run(handlers.callback(update, None))
-    assert "冻结" in query.answer.call_args.args[0]
+    assert "冻结" in join_click(handlers, rid, member(ChatMember.MEMBER))
+
+
+def test_join_requires_group_binding(setup):
+    store, rid, handlers = setup
+    lookup = member(ChatMember.MEMBER)
+    assert "尚未在群里发布" in join_click(handlers, rid, lookup)
+    lookup.assert_not_awaited()
+    assert store.view(rid)["entries"] == []
+
+
+@pytest.mark.parametrize(
+    "status, fields, allowed",
+    [
+        (ChatMember.OWNER, {}, True),
+        (ChatMember.ADMINISTRATOR, {}, True),
+        (ChatMember.MEMBER, {}, True),
+        (ChatMember.RESTRICTED, {"is_member": True}, True),
+        (ChatMember.RESTRICTED, {"is_member": False}, False),
+        (ChatMember.LEFT, {}, False),
+        (ChatMember.BANNED, {}, False),
+    ],
+)
+def test_join_checks_current_group_membership(setup, status, fields, allowed):
+    store, rid, handlers = setup
+    store.bind(rid, 99, GROUP["id"])
+    lookup = member(status, **fields)
+    text = join_click(handlers, rid, lookup)
+    assert lookup.await_args.args == (GROUP["id"], 123)
+    assert ("成功" in text) is allowed
+    assert len(store.view(rid)["entries"]) == int(allowed)
+
+
+def test_membership_lookup_failure_fails_closed(setup):
+    store, rid, handlers = setup
+    store.bind(rid, 99, GROUP["id"])
+    text = join_click(handlers, rid, AsyncMock(side_effect=Forbidden("bot was kicked")))
+    assert "暂时无法确认" in text
+    assert store.view(rid)["entries"] == []
+
+
+def test_join_follows_supergroup_upgrade(setup):
+    store, rid, handlers = setup
+    store.bind(rid, 99, -1)
+    lookup = AsyncMock(side_effect=[ChatMigrated(-1001), SimpleNamespace(status=ChatMember.MEMBER)])
+    assert "成功" in join_click(handlers, rid, lookup)
+    assert lookup.await_args.args == (-1001, 123)
+    assert store.view(rid)["chat_id"] == -1001
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        SimpleNamespace(chat=SimpleNamespace(id=-1), migrate_to_chat_id=-1001),
+        SimpleNamespace(
+            chat=SimpleNamespace(id=-1001), migrate_to_chat_id=None, migrate_from_chat_id=-1
+        ),
+    ],
+)
+def test_supergroup_upgrade_message_moves_binding(setup, message):
+    store, rid, handlers = setup
+    store.bind(rid, 99, -1)
+    asyncio.run(handlers.migrate(SimpleNamespace(effective_message=message), None))
+    assert store.view(rid)["chat_id"] == -1001
+
+
+def test_publish_binds_first_group_only(setup):
+    store, rid, handlers = setup
+    unbound = run_command(handlers, f"/raffle {rid}")
+    assert "尚未在群里发布" in unbound.reply_text.call_args.args[0]
+    assert all(
+        not b.callback_data.startswith("join:")
+        for row in unbound.reply_text.call_args.kwargs["reply_markup"].inline_keyboard
+        for b in row
+    )
+    run_command(handlers, f"/publish {rid}", chat_type="supergroup")
+    other = run_command(handlers, f"/publish {rid}", chat_type="supergroup", chat_id=-200)
+    assert "其他群" in other.reply_text.call_args.args[0]
+    assert store.view(rid)["chat_id"] == GROUP["id"]
 
 
 def test_personal_weight_zero_and_result_display(setup):
@@ -134,7 +222,7 @@ def test_build_application_offline(tmp_path, monkeypatch):
     app = build_application(
         Settings("123456:offline-test-token", frozenset({99}), str(tmp_path / "test.sqlite3"))
     )
-    assert len(app.handlers[0]) == 2
+    assert len(app.handlers[0]) == 3
     assert app.concurrent_updates == 1
 
 
@@ -218,12 +306,9 @@ def test_freeze_after_draw_reports_saved_result(setup):
 
 def test_stale_button_answer_failure_keeps_join_and_stays_silent(setup):
     store, rid, handlers = setup
-    query = SimpleNamespace(
-        data=f"join:{rid}",
-        answer=AsyncMock(side_effect=BadRequest("Query is too old")),
-        from_user=SimpleNamespace(id=123, full_name="Alice", is_bot=False),
-    )
-    asyncio.run(handlers.callback(SimpleNamespace(callback_query=query), None))
+    store.bind(rid, 99, GROUP["id"])
+    stale = AsyncMock(side_effect=BadRequest("Query is too old"))
+    join_click(handlers, rid, member(ChatMember.MEMBER), answer=stale)
     assert [p["user_id"] for p in store.view(rid)["entries"]] == [123]
 
 

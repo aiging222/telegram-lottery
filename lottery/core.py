@@ -65,7 +65,8 @@ class Store:
                     created_by INTEGER NOT NULL,
                     snapshot TEXT,
                     snapshot_hash TEXT,
-                    result TEXT
+                    result TEXT,
+                    chat_id INTEGER
                 );
                 CREATE TABLE IF NOT EXISTS participants (
                     raffle_id INTEGER REFERENCES raffles(id),
@@ -101,6 +102,9 @@ class Store:
                     at REAL NOT NULL
                 );
             """)
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(raffles)")}
+            if "chat_id" not in columns:  # databases created before group binding
+                db.execute("ALTER TABLE raffles ADD COLUMN chat_id INTEGER")
 
     @contextmanager
     def transaction(self):
@@ -129,11 +133,48 @@ class Store:
             raise LotteryError("抽奖不存在。")
         return dict(row)
 
+    def _open(self, raffle):
+        return raffle["status"] == "OPEN" and self.clock() < raffle["deadline"]
+
     def _editable(self, db, raffle_id):
         raffle = self._get(db, raffle_id)
-        if raffle["status"] != "OPEN" or self.clock() >= raffle["deadline"]:
+        if not self._open(raffle):
             raise LotteryError("本场抽奖已截止或冻结，不能报名或修改权重。")
         return raffle
+
+    def bind(self, raffle_id, actor, chat_id):
+        """Tie an open raffle to the one group whose members may join; it never moves."""
+        with self.transaction() as db:
+            raffle = self._get(db, raffle_id)
+            if not self._open(raffle) or raffle["chat_id"] == chat_id:
+                return  # closed cards carry no join button, so any chat may show them
+            if raffle["chat_id"] is not None:
+                raise LotteryError(
+                    "本场抽奖已在其他群发布，仅限该群成员报名。如需在此群抽奖，请新建抽奖。"
+                )
+            db.execute("UPDATE raffles SET chat_id=? WHERE id=?", (chat_id, raffle_id))
+            self.audit(db, raffle_id, actor, "bind", {"chat_id": chat_id})
+
+    def target_chat(self, raffle_id):
+        """The group a join must be verified against; raises while joining is closed."""
+        with self.transaction() as db:
+            chat_id = self._editable(db, raffle_id)["chat_id"]
+        if chat_id is None:
+            raise LotteryError("本场抽奖尚未在群里发布，暂不能报名。")
+        return chat_id
+
+    def migrate_chat(self, old_chat_id, new_chat_id):
+        """Follow Telegram's group-to-supergroup upgrade, which changes the chat ID."""
+        with self.transaction() as db:
+            ids = [
+                row["id"]
+                for row in db.execute("SELECT id FROM raffles WHERE chat_id=?", (old_chat_id,))
+            ]
+            db.execute("UPDATE raffles SET chat_id=? WHERE chat_id=?", (new_chat_id, old_chat_id))
+            for raffle_id in ids:
+                self.audit(
+                    db, raffle_id, 0, "migrate_chat", {"before": old_chat_id, "after": new_chat_id}
+                )
 
     def create(self, actor, title, winner_count, minutes):
         integer(winner_count, "中奖名额", 1, 100)
@@ -364,7 +405,7 @@ class Store:
             raffle = self._get(db, raffle_id)
             if raffle["result"]:
                 return json.loads(raffle["result"])
-            if raffle["status"] == "OPEN" and self.clock() < raffle["deadline"]:
+            if self._open(raffle):
                 raise LotteryError("尚未到截止时间。如需提前开奖，请先 /freeze 冻结名单。")
             raffle = self._freeze(db, raffle, actor)
             snapshot = json.loads(raffle["snapshot"])

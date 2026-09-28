@@ -10,13 +10,14 @@ from io import BytesIO
 from pathlib import Path
 
 from dotenv import load_dotenv
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import TelegramError
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler
+from telegram import BotCommand, ChatMember, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import ChatMigrated, TelegramError
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
 from lottery.core import LotteryError, Store, integer
 
 LOG = logging.getLogger(__name__)
+MEMBER_STATUSES = {ChatMember.OWNER, ChatMember.ADMINISTRATOR, ChatMember.MEMBER}
 ADMIN_COMMANDS = {
     "new",
     "config",
@@ -64,7 +65,7 @@ PUBLIC_HELP = """🎲 加权抽奖机器人
 /result 抽奖ID — 查询已保存的开奖结果
 
 抽奖按权重随机抽取，每人最多中奖一次。权重为 0 不参与抽取。
-规则加成由管理员核验后授予；管理员可在截止前覆盖个人权重。
+仅限发布群的成员报名。规则加成由管理员核验后授予；管理员可在截止前覆盖个人权重。
 截止后名单与权重不可修改，由管理员执行开奖。"""
 ADMIN_HELP = """
 
@@ -80,7 +81,8 @@ ADMIN_HELP = """
 /weight 1 123456789 auto — 恢复规则计算
 /preview 1 — 预览名单及首轮概率
 /export 1 — 导出完整 JSON 及修改记录
-/publish 1 — 在当前聊天发布报名卡片
+/publish 1 — 在目标群发布报名卡片，首次发布即绑定该群，仅限群成员报名
+（机器人需为群管理员，才能可靠查询成员身份）
 /freeze 1 — 提前截止，冻结后不可撤销
 /draw 1 — 截止或冻结后开奖，并在当前聊天公布
 /raffles — 最近 20 场抽奖
@@ -136,8 +138,11 @@ def card(raffle):
         "按钮查询的是当前状态，上方报名人数为发布时数据。"
     )
     buttons = []
-    if raffle["status"] == "OPEN":
+    if raffle["status"] == "OPEN" and raffle["chat_id"] is not None:
+        text += "\n仅限发布群的成员报名。"
         buttons.append([InlineKeyboardButton("🎟 报名", callback_data=f"join:{raffle['id']}")])
+    elif raffle["status"] == "OPEN":
+        text += f"\n尚未在群里发布：管理员在目标群发送 /publish {raffle['id']} 后开放报名。"
     buttons.append([InlineKeyboardButton("查看我的权重", callback_data=f"weight:{raffle['id']}")])
     return text, InlineKeyboardMarkup(buttons)
 
@@ -172,6 +177,17 @@ def result_text(result):
         ]
     )
     return "\n".join(lines)
+
+
+async def group_member(bot, store, chat_id, user_id):
+    """Ask Telegram whether user_id is in chat_id now, following a supergroup upgrade."""
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+    except ChatMigrated as exc:
+        await asyncio.to_thread(store.migrate_chat, chat_id, exc.new_chat_id)
+        member = await bot.get_chat_member(exc.new_chat_id, user_id)
+    # Restricted users may still be in the group; only ChatMemberRestricted has is_member.
+    return member.status in MEMBER_STATUSES or getattr(member, "is_member", False)
 
 
 async def reply(message, text, markup=None):
@@ -263,6 +279,8 @@ class BotHandlers:
                 )
                 return
             else:
+                if command == "publish" and update.effective_chat.type != "private":
+                    await asyncio.to_thread(self.store.bind, rid, user.id, update.effective_chat.id)
                 raffle = await asyncio.to_thread(self.store.view, rid)
                 if command in ("publish", "raffle"):
                     if raffle["result"]:
@@ -316,6 +334,17 @@ class BotHandlers:
             action, raw_id = query.data.split(":", 1)
             rid = integer(int(raw_id), "抽奖 ID", 1, 2**63 - 1)
             if action == "join":
+                chat_id = await asyncio.to_thread(self.store.target_chat, rid)
+                try:
+                    member = await group_member(
+                        context.bot, self.store, chat_id, query.from_user.id
+                    )
+                except TelegramError as exc:
+                    # Fail closed: without a definite answer nobody is let in.
+                    LOG.warning("群成员校验失败：%s", exc)
+                    raise LotteryError("暂时无法确认你的群成员身份，请稍后重试。") from None
+                if not member:
+                    raise LotteryError("仅限发布群的成员报名，请先加入该群。")
                 added = await asyncio.to_thread(
                     self.store.join, rid, query.from_user.id, name_text(query.from_user.full_name)
                 )
@@ -333,6 +362,15 @@ class BotHandlers:
             # Clicks replayed after downtime are too old to answer. Any join above is
             # already saved, so there is nothing to retry and nothing to tell the group.
             LOG.warning("按钮应答失败：%s", exc)
+
+    async def migrate(self, update, context):
+        # Telegram sends one service message in the old group and one in the new supergroup.
+        message = update.effective_message
+        if message.migrate_to_chat_id:
+            old, new = message.chat.id, message.migrate_to_chat_id
+        else:
+            old, new = message.migrate_from_chat_id, message.chat.id
+        await asyncio.to_thread(self.store.migrate_chat, old, new)
 
 
 def redact(text, token):
@@ -402,6 +440,7 @@ def build_application(settings):
     )
     app.add_handler(CommandHandler(commands, handlers.command))
     app.add_handler(CallbackQueryHandler(handlers.callback, pattern=r"^(join|weight):[0-9]{1,19}$"))
+    app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, handlers.migrate))
     app.add_error_handler(on_error)
     return app
 

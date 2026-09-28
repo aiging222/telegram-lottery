@@ -1,5 +1,6 @@
 import hashlib
 import json
+import sqlite3
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
@@ -186,6 +187,45 @@ def test_random_failure_rolls_back_draw(setup, monkeypatch):
         row = db.execute("SELECT status,result,snapshot FROM raffles WHERE id=?", (rid,)).fetchone()
         assert tuple(row) == ("OPEN", None, None)
         assert db.execute("SELECT COUNT(*) FROM audit WHERE action='draw'").fetchone()[0] == 0
+
+
+def test_group_binding_rules(setup):
+    store, rid, now = setup
+    with pytest.raises(LotteryError, match="尚未在群里发布"):
+        store.target_chat(rid)
+    store.bind(rid, 99, -100)
+    store.bind(rid, 99, -100)
+    with pytest.raises(LotteryError, match="其他群"):
+        store.bind(rid, 99, -200)
+    store.migrate_chat(-100, -1001)
+    assert store.target_chat(rid) == -1001
+    actions = [e["action"] for e in store.export(rid)["audit"]]
+    assert actions.count("bind") == 1
+    assert actions.count("migrate_chat") == 1
+    now[0] += 3600
+    with pytest.raises(LotteryError, match="截止"):
+        store.target_chat(rid)
+    store.bind(rid, 99, -200)  # closed raffles may be shown anywhere; binding stays
+    assert store.view(rid)["chat_id"] == -1001
+
+
+def test_database_from_before_group_binding_is_upgraded(tmp_path):
+    path = tmp_path / "old.sqlite3"
+    db = sqlite3.connect(path)
+    db.execute(
+        "CREATE TABLE raffles (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, "
+        "winner_count INTEGER NOT NULL, deadline REAL NOT NULL, "
+        "default_weight INTEGER NOT NULL DEFAULT 1, weight_cap INTEGER NOT NULL DEFAULT 100, "
+        "status TEXT NOT NULL DEFAULT 'OPEN', created_by INTEGER NOT NULL, snapshot TEXT, "
+        "snapshot_hash TEXT, result TEXT)"
+    )
+    db.execute("INSERT INTO raffles(title,winner_count,deadline,created_by) VALUES('old',1,9e9,99)")
+    db.commit()
+    db.close()
+    store = Store(path)
+    assert store.view(1)["chat_id"] is None
+    store.bind(1, 99, -100)
+    assert store.target_chat(1) == -100
 
 
 def test_raffles_isolated(setup):
