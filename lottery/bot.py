@@ -454,9 +454,10 @@ def build_application(settings):
 
 def main():
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+    # The HTTP layer logs every polling request; PTB's own warnings stay visible, and
+    # TokenFilter masks the token in whatever gets through.
     logging.getLogger("httpx").setLevel(logging.CRITICAL)
     logging.getLogger("httpcore").setLevel(logging.CRITICAL)
-    logging.getLogger("telegram").setLevel(logging.CRITICAL)
     try:
         settings = Settings.from_env()
         for handler in logging.getLogger().handlers:
