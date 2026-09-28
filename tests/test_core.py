@@ -255,6 +255,36 @@ def test_recent_freezes_expired_raffles_in_one_pass(setup):
     assert store.view(rid)["snapshot_hash"]
 
 
+def test_leaving_group_cancels_joins_only_in_open_raffles_of_that_group(setup):
+    store, rid, _ = setup
+    other = store.create(99, "other group", 1, 60)
+    frozen = store.create(99, "frozen", 1, 60)
+    for raffle_id, chat_id in ((rid, -100), (other, -200), (frozen, -100)):
+        store.bind(raffle_id, 99, chat_id)
+        store.join(raffle_id, 123, "Alice")
+        store.join(raffle_id, 456, "Bob")
+    store.freeze(frozen, 99)
+    assert store.leave_group(-100, 123, store.clock()) == [rid]
+    assert [e["user_id"] for e in store.view(rid)["entries"]] == [456]
+    assert len(store.view(other)["entries"]) == 2
+    assert len(store.view(frozen)["entries"]) == 2  # the frozen snapshot is final
+    entry = store.export(rid)["audit"][-1]
+    assert (entry["action"], entry["actor_id"]) == ("leave", 0)
+    assert store.leave_group(-100, 123, store.clock()) == []
+
+
+def test_leave_is_judged_by_when_it_happened(setup):
+    store, rid, now = setup
+    deadline = now[0] + 3600
+    store.bind(rid, 99, -100)
+    for uid in (1, 2):
+        store.join(rid, uid, str(uid))
+    now[0] = deadline + 60  # the bot restarts after the deadline and replays old updates
+    assert store.leave_group(-100, 1, deadline - 1) == [rid]
+    assert store.leave_group(-100, 2, deadline + 1) == []
+    assert [e["user_id"] for e in store.view(rid)["entries"]] == [2]
+
+
 def test_raffles_isolated(setup):
     store, rid, _ = setup
     other = store.create(99, "other", 1, 60)

@@ -193,6 +193,27 @@ class Store:
                     db, raffle_id, 0, "migrate_chat", {"before": old_chat_id, "after": new_chat_id}
                 )
 
+    def leave_group(self, chat_id, user_id, left_at):
+        """Cancel user_id's joins in raffles bound to chat_id that were still open at left_at.
+
+        Frozen raffles are untouched: their snapshot is the fixed list of the draw.
+        """
+        with self.transaction() as db:
+            ids = [
+                row["id"]
+                for row in db.execute(
+                    "SELECT r.id FROM raffles r JOIN participants p ON p.raffle_id=r.id "
+                    "WHERE r.chat_id=? AND p.user_id=? AND r.status='OPEN' AND r.deadline>?",
+                    (chat_id, user_id, left_at),
+                )
+            ]
+            for raffle_id in ids:
+                db.execute(
+                    "DELETE FROM participants WHERE raffle_id=? AND user_id=?", (raffle_id, user_id)
+                )
+                self.audit(db, raffle_id, 0, "leave", {"user_id": user_id, "chat_id": chat_id})
+            return ids
+
     def create(self, actor, title, winner_count, minutes):
         integer(winner_count, "中奖名额", 1, 100)
         integer(minutes, "报名时长（分钟）", 1, 525600)

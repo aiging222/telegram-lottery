@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import sys
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
@@ -10,6 +11,7 @@ from telegram import ChatMember, Update
 from telegram.error import BadRequest, ChatMigrated, Forbidden
 
 from lottery.bot import (
+    ALLOWED_UPDATES,
     BotHandlers,
     Settings,
     TokenFilter,
@@ -225,8 +227,9 @@ def test_build_application_offline(tmp_path, monkeypatch):
         "123456:offline-test-token", frozenset({99}), str(tmp_path / "test.sqlite3"), SHANGHAI
     )
     app = build_application(settings)
-    assert len(app.handlers[0]) == 3
+    assert len(app.handlers[0]) == 4
     assert app.concurrent_updates == 1
+    assert "chat_member" in ALLOWED_UPDATES
 
 
 def test_missing_configuration_fails_closed(monkeypatch, tmp_path):
@@ -425,6 +428,44 @@ def test_repeated_grant_and_missing_revoke_are_reported(setup):
     assert "没有此条件" in replies[3]
     actions = [e["action"] for e in store.export(rid)["audit"]]
     assert (actions.count("grant"), actions.count("revoke")) == (1, 1)
+
+
+def member_update(status, left_at, **fields):
+    change = SimpleNamespace(
+        chat=SimpleNamespace(id=GROUP["id"]),
+        date=datetime.fromtimestamp(left_at, UTC),
+        new_chat_member=SimpleNamespace(status=status, user=SimpleNamespace(id=123), **fields),
+    )
+    return SimpleNamespace(chat_member=change)
+
+
+@pytest.mark.parametrize(
+    "status, fields, kept",
+    [
+        (ChatMember.LEFT, {}, False),
+        (ChatMember.BANNED, {}, False),
+        (ChatMember.RESTRICTED, {"is_member": False}, False),
+        (ChatMember.RESTRICTED, {"is_member": True}, True),
+        (ChatMember.ADMINISTRATOR, {}, True),
+    ],
+)
+def test_leaving_group_cancels_join(setup, status, fields, kept):
+    store, rid, handlers = setup
+    store.bind(rid, 99, GROUP["id"])
+    store.join(rid, 123, "Alice")
+    left_at = store.view(rid)["deadline"] - 60
+    asyncio.run(handlers.member_changed(member_update(status, left_at, **fields), None))
+    assert len(store.view(rid)["entries"]) == int(kept)
+
+
+def test_rejoining_group_allows_joining_again(setup):
+    store, rid, handlers = setup
+    store.bind(rid, 99, GROUP["id"])
+    assert "成功" in join_click(handlers, rid, member(ChatMember.MEMBER))
+    left_at = store.view(rid)["deadline"] - 60
+    asyncio.run(handlers.member_changed(member_update(ChatMember.LEFT, left_at), None))
+    assert store.view(rid)["entries"] == []
+    assert "成功" in join_click(handlers, rid, member(ChatMember.MEMBER))
 
 
 def test_raffles_lists_current_status(setup):

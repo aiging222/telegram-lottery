@@ -13,13 +13,22 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from dotenv import load_dotenv
 from telegram import BotCommand, ChatMember, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import ChatMigrated, TelegramError
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    ChatMemberHandler,
+    CommandHandler,
+    MessageHandler,
+    filters,
+)
 
 from lottery.core import LotteryError, Store, integer
 
 LOG = logging.getLogger(__name__)
 MEMBER_STATUSES = {ChatMember.OWNER, ChatMember.ADMINISTRATOR, ChatMember.MEMBER}
 DEFAULT_TIMEZONE = "Asia/Shanghai"
+# chat_member carries leave/kick events; Telegram sends it only to bots that are group admins.
+ALLOWED_UPDATES = ["message", "callback_query", "chat_member"]
 ADMIN_COMMANDS = {
     "new",
     "config",
@@ -67,7 +76,8 @@ PUBLIC_HELP = """🎲 加权抽奖机器人
 /result 抽奖ID — 查询已保存的开奖结果
 
 抽奖按权重随机抽取，每人最多中奖一次。权重为 0 不参与抽取。
-仅限发布群的成员报名。规则加成由管理员核验后授予；管理员可在截止前覆盖个人权重。
+仅限发布群的成员报名，截止前退群会取消报名。
+规则加成由管理员核验后授予；管理员可在截止前覆盖个人权重。
 截止后名单与权重不可修改，由管理员执行开奖。"""
 ADMIN_HELP = """
 
@@ -84,7 +94,7 @@ ADMIN_HELP = """
 /preview 1 — 预览名单及首轮概率
 /export 1 — 导出完整 JSON 及修改记录
 /publish 1 — 在目标群发布报名卡片，首次发布即绑定该群，仅限群成员报名
-（机器人需为群管理员，才能可靠查询成员身份）
+（机器人需为群管理员，才能可靠查询成员身份并收到退群通知）
 /freeze 1 — 提前截止，冻结后不可撤销
 /draw 1 — 截止或冻结后开奖，并在当前聊天公布
 /raffles — 最近 20 场抽奖
@@ -150,7 +160,7 @@ def card(raffle, timezone):
     )
     buttons = []
     if raffle["status"] == "OPEN" and raffle["chat_id"] is not None:
-        text += "\n仅限发布群的成员报名。"
+        text += "\n仅限发布群的成员报名，截止前退群会取消报名。"
         buttons.append([InlineKeyboardButton("🎟 报名", callback_data=f"join:{raffle['id']}")])
     elif raffle["status"] == "OPEN":
         text += f"\n尚未在群里发布：管理员在目标群发送 /publish {raffle['id']} 后开放报名。"
@@ -197,6 +207,10 @@ async def group_member(bot, store, chat_id, user_id):
     except ChatMigrated as exc:
         await asyncio.to_thread(store.migrate_chat, chat_id, exc.new_chat_id)
         member = await bot.get_chat_member(exc.new_chat_id, user_id)
+    return in_group(member)
+
+
+def in_group(member):
     # Restricted users may still be in the group; only ChatMemberRestricted has is_member.
     return member.status in MEMBER_STATUSES or getattr(member, "is_member", False)
 
@@ -382,6 +396,19 @@ class BotHandlers:
             # already saved, so there is nothing to retry and nothing to tell the group.
             LOG.warning("按钮应答失败：%s", exc)
 
+    async def member_changed(self, update, context):
+        change = update.chat_member
+        if in_group(change.new_chat_member):
+            return
+        # Judge by when the member left, not when the update arrives: after downtime a
+        # leave from before the deadline still cancels the join if the list is not frozen.
+        await asyncio.to_thread(
+            self.store.leave_group,
+            change.chat.id,
+            change.new_chat_member.user.id,
+            change.date.timestamp(),
+        )
+
     async def migrate(self, update, context):
         # Telegram sends one service message in the old group and one in the new supergroup.
         message = update.effective_message
@@ -460,6 +487,7 @@ def build_application(settings):
     app.add_handler(CommandHandler(commands, handlers.command))
     app.add_handler(CallbackQueryHandler(handlers.callback, pattern=r"^(join|weight):[0-9]{1,19}$"))
     app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, handlers.migrate))
+    app.add_handler(ChatMemberHandler(handlers.member_changed, ChatMemberHandler.CHAT_MEMBER))
     app.add_error_handler(on_error)
     return app
 
@@ -476,9 +504,7 @@ def main():
             handler.addFilter(TokenFilter(settings.token))
         application = build_application(settings)
         print("抽奖机器人正在启动。按 Ctrl+C 停止。", flush=True)
-        application.run_polling(
-            allowed_updates=["message", "callback_query"], drop_pending_updates=False
-        )
+        application.run_polling(allowed_updates=ALLOWED_UPDATES, drop_pending_updates=False)
     except LotteryError as exc:
         raise SystemExit(str(exc)) from None
     except Exception as exc:  # noqa: BLE001 - CLI boundary: keep the cause, mask the token.
