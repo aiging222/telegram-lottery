@@ -21,6 +21,23 @@ def integer(value, name, low=0, high=1_000_000):
     return value
 
 
+def check_prizes(prizes):
+    """[[name, count], ...] with 1..MAX_PRIZES kinds and 1..100 winners in all."""
+    if not 1 <= len(prizes) <= MAX_PRIZES:
+        raise LotteryError(f"奖品需为 1～{MAX_PRIZES} 种。")
+    for name, count in prizes:
+        if not 1 <= len(name.strip()) <= 64:
+            raise LotteryError("奖品名称需为 1～64 字。")
+        integer(count, "奖品份数", 1, 100)
+    return integer(sum(count for _, count in prizes), "中奖总人数", 1, 100)
+
+
+def check_keyword(keyword):
+    if not 1 <= len(keyword) <= MAX_KEYWORD or keyword.startswith("/"):
+        raise LotteryError(f"口令需为 1～{MAX_KEYWORD} 字，且不能以 / 开头。")
+    return keyword
+
+
 def encode(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -137,7 +154,15 @@ MIGRATIONS = [
     WHERE id IN (SELECT raffle_id FROM overrides)
     OR id IN (SELECT raffle_id FROM rules WHERE bonus > 0)
     """,
+    # 7: a prize list (JSON [[name, count], ...], handed out in draw order) and an optional
+    # keyword that people send in the group to join instead of pressing the card's button.
+    """
+    ALTER TABLE raffles ADD COLUMN prizes TEXT;
+    ALTER TABLE raffles ADD COLUMN keyword TEXT
+    """,
 ]
+MAX_PRIZES = 10
+MAX_KEYWORD = 32
 
 
 class Store:
@@ -275,11 +300,21 @@ class Store:
         chat_id=None,
         target=None,
         weighted=False,
+        prizes=None,
+        keyword=None,
     ):
         """Create a raffle ending after `minutes` or at `deadline`, or earlier once `target`
         people have joined. Menus create it already bound to `chat_id`; `weighted` shows the
-        bonus notice on the card from the start, before any weight is set."""
+        bonus notice on the card from the start, before any weight is set. `prizes` are
+        handed out in draw order and must add up to `winner_count`; with a `keyword`, people
+        join by sending it in the group."""
         integer(winner_count, "中奖名额", 1, 100)
+        if prizes is not None:
+            prizes = [[name.strip(), count] for name, count in prizes]
+            if check_prizes(prizes) != winner_count:
+                raise LotteryError("奖品份数之和需等于中奖人数。")
+        if keyword is not None:
+            keyword = check_keyword(keyword.strip())
         if not 1 <= len(title.strip()) <= 160:
             raise LotteryError("标题长度需为 1～160 字。")
         if target is not None:
@@ -292,10 +327,19 @@ class Store:
             elif not now + 60 <= deadline <= now + 525600 * 60:
                 raise LotteryError("开奖时间需在 1 分钟到 365 天之后。")
             cursor = db.execute(
-                "INSERT INTO raffles"
-                "(title,winner_count,deadline,created_by,chat_id,target_count,weighted) "
-                "VALUES(?,?,?,?,?,?,?)",
-                (title.strip(), winner_count, deadline, actor, chat_id, target, int(weighted)),
+                "INSERT INTO raffles(title,winner_count,deadline,created_by,chat_id,"
+                "target_count,weighted,prizes,keyword) VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    title.strip(),
+                    winner_count,
+                    deadline,
+                    actor,
+                    chat_id,
+                    target,
+                    int(weighted),
+                    None if prizes is None else encode(prizes),
+                    keyword,
+                ),
             )
             raffle_id = cursor.lastrowid
             self.audit(
@@ -310,6 +354,8 @@ class Store:
                     "chat_id": chat_id,
                     "target": target,
                     "weighted": weighted,
+                    "prizes": prizes,
+                    "keyword": keyword,
                 },
             )
             return raffle_id
@@ -328,6 +374,16 @@ class Store:
                 "INSERT INTO participants VALUES(?,?,?)", (raffle_id, user_id, display_name[:128])
             )
             return True
+
+    def keyword_raffles(self, chat_id, text):
+        """Open raffles of chat_id that people join by sending `text` (any letter case)."""
+        with self.transaction() as db:
+            rows = db.execute(
+                "SELECT id,keyword FROM raffles WHERE chat_id=? AND status='OPEN' "
+                "AND keyword IS NOT NULL AND deadline>?",
+                (chat_id, self.clock()),
+            ).fetchall()
+        return [row["id"] for row in rows if row["keyword"].casefold() == text.casefold()]
 
     def is_full(self, raffle_id):
         with self.transaction() as db:
@@ -564,6 +620,7 @@ class Store:
                 )
             ]
         raffle["weighted"] = bool(raffle["weighted"])
+        raffle["prizes"] = json.loads(raffle["prizes"]) if raffle["prizes"] else None
         raffle["result"] = json.loads(raffle["result"]) if raffle["result"] else None
         return raffle
 
@@ -579,6 +636,11 @@ class Store:
             raffle = self._freeze(db, raffle, actor)
             snapshot = json.loads(raffle["snapshot"])
             winners = weighted_draw(snapshot["entries"], raffle["winner_count"])
+            if raffle["prizes"]:
+                # The first winners drawn take the first prizes listed.
+                names = [name for name, count in json.loads(raffle["prizes"]) for _ in range(count)]
+                for winner, name in zip(winners, names, strict=False):
+                    winner["prize"] = name
             result = {
                 "raffle_id": raffle_id,
                 "title": raffle["title"],

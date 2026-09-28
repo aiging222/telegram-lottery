@@ -353,6 +353,11 @@ def test_raffle_ends_once_full(setup):
     [
         ({"minutes": 60, "target": 1}, "满人开奖人数"),  # fewer people than winners
         ({"deadline": 1_800_000_030.0}, "1 分钟"),  # too soon
+        ({"minutes": 60, "prizes": [["a", 1]]}, "奖品份数之和"),  # 1 prize, 2 winners
+        ({"minutes": 60, "prizes": []}, "奖品需为"),
+        ({"minutes": 60, "prizes": [[" ", 2]]}, "奖品名称"),
+        ({"minutes": 60, "keyword": "/start"}, "口令"),
+        ({"minutes": 60, "keyword": "x" * 33}, "口令"),
     ],
 )
 def test_create_validation(setup, options, message):
@@ -457,3 +462,29 @@ def test_upgrade_marks_raffles_that_already_had_weights(tmp_path):
     db.close()
     store = Store(path)
     assert [store.view(rid)["weighted"] for rid in (1, 2, 3, 4)] == [False, True, True, False]
+
+
+def test_prizes_go_to_winners_in_draw_order(setup):
+    store, _, _ = setup
+    rid = store.create(99, "多奖品", 3, 60, prizes=[["iPhone", 1], ["1usdt", 2]])
+    for uid in (1, 2, 3, 4):
+        store.join(rid, uid, f"u{uid}")
+    store.freeze(rid, 99)
+    winners = store.draw(rid, 99)["winners"]
+    assert [w["prize"] for w in winners] == ["iPhone", "1usdt", "1usdt"]
+    assert store.view(rid)["prizes"] == [["iPhone", 1], ["1usdt", 2]]
+    short = store.create(99, "人不够", 3, 60, prizes=[["iPhone", 1], ["1usdt", 2]])
+    store.join(short, 1, "u1")
+    store.freeze(short, 99)
+    assert [w["prize"] for w in store.draw(short, 99)["winners"]] == ["iPhone"]
+
+
+def test_keyword_raffles(setup):
+    store, _, now = setup
+    rid = store.create(99, "a", 1, 60, chat_id=-100, keyword=" Hello ")
+    store.create(99, "b", 1, 60, chat_id=-200, keyword="hello")
+    store.create(99, "c", 1, 60, chat_id=-100)
+    assert store.keyword_raffles(-100, "HELLO") == [rid]
+    assert store.keyword_raffles(-100, "hell") == []
+    now[0] += 3600
+    assert store.keyword_raffles(-100, "hello") == []

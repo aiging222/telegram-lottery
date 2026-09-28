@@ -10,7 +10,7 @@ from telegram.error import Forbidden
 
 from lottery.bot import BotHandlers
 from lottery.core import LotteryError, Store
-from lottery.menu import Menu, parse_deadline
+from lottery.menu import NOT_MANAGER, Menu, parse_deadline
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 NOW = 1_800_000_000.0  # 2027-01-15 16:00 in Shanghai
@@ -137,49 +137,80 @@ def test_my_groups_lists_only_groups_the_user_manages(env):
     assert text.startswith("还没有你能管理的群")
 
 
+HEADER = "🎁 发起抽奖（/cancel 退出）\n\n"
+
+
 def test_wizard_publishes_a_timed_raffle(env):
     text, _ = shown(press(env, OWNER, f"m:new:{GROUP}"))
-    assert text == "① 奖品名称？直接发送文字。"
-    text, buttons = type_text(env, OWNER, "坦克300")
-    assert text == "② 中奖人数"
+    assert text == HEADER + "请发送奖品名称，例如：1USDT"
+    text, buttons = type_text(env, OWNER, "1usdt")
+    assert text.endswith("「1usdt」有几份？点按钮或直接发送数字：")
     text, buttons = shown(press(env, OWNER, buttons["2"]))
-    assert text == "③ 开奖方式"
+    assert text == HEADER + "├ 奖品：1usdt ×2\n\n怎么开奖？"
     text, buttons = shown(press(env, OWNER, buttons["⏰ 定时开奖"]))
-    assert text == "④ 多久后开奖？"
+    assert text.endswith("🕒 现在是 2027-01-15 16:00（UTC+08:00）")
     text, buttons = shown(press(env, OWNER, buttons["1天"]))
-    assert text == "坦克300\n2 人中奖 · 开奖时间：2027-01-16 16:00（UTC+08:00）\n确认后发布到群。"
-    text, _ = shown(press(env, OWNER, buttons["✅ 发布到群"]))
+    assert text.endswith("├ 开奖时间：2027-01-16 16:00（UTC+08:00）\n\n怎么参与？")
+    text, buttons = shown(press(env, OWNER, buttons["🎟 点按钮参与"]))
+    assert text.endswith("最后，请发送抽奖活动名称：")
+    text, buttons = type_text(env, OWNER, "周末福利")
+    assert text == HEADER + (
+        "周末福利\n├ 奖品：1usdt ×2\n├ 开奖时间：2027-01-16 16:00（UTC+08:00）\n├ 点按钮参与\n\n"
+        "🎉 已填写完成，发布到「测试群」？"
+    )
+    assert set(buttons) == {"✅ 发布抽奖", "❌ 取消发布", "➕ 添加奖品", "🔄 换个群"}
+    text, _ = shown(press(env, OWNER, buttons["✅ 发布抽奖"]))
     assert text == "✅ 已发布到群。"
-    (raffle,), _ = env.store.group_raffles(GROUP, 0, 8)
+    (row,), _ = env.store.group_raffles(GROUP, 0, 8)
+    raffle = env.store.view(row["id"])
     assert (raffle["title"], raffle["winner_count"], raffle["deadline"]) == (
-        "坦克300",
+        "周末福利",
         2,
         NOW + 86400,
     )
-    assert raffle["card_message_id"] == 500
+    assert (raffle["prizes"], raffle["keyword"], raffle["card_message_id"]) == (
+        [["1usdt", 2]],
+        None,
+        500,
+    )
     chat_id, card_text = env.bot.send_message.await_args.args
     assert chat_id == GROUP
-    assert card_text.startswith("🎁 坦克300")
+    assert card_text.startswith("🎁 周末福利  #1\n🏆 1usdt ×2\n")
     assert env.store.draft(OWNER) is None
 
 
-def test_wizard_typed_values_and_full_mode(env):
+def test_wizard_several_prizes_keyword_and_full_mode(env):
     press(env, OWNER, f"m:new:{GROUP}")
-    type_text(env, OWNER, "耳机")
-    text, _ = shown(press(env, OWNER, "m:c:x"))
-    assert text == "请输入中奖人数（1～100）。"
-    text, _ = type_text(env, OWNER, "abc")
-    assert text == "中奖人数需为 1～100 的整数，请重新输入。"
-    text, buttons = type_text(env, OWNER, "20")
-    assert text == "③ 开奖方式"
-    text, buttons = shown(press(env, OWNER, buttons["👥 满人开奖"]))
-    assert text == "④ 满多少人开奖？"
-    assert "10" not in buttons  # fewer people than winners makes no sense
-    text, buttons = shown(press(env, OWNER, buttons["50"]))
-    assert "满 50 人开奖（最晚 2027-01-22 16:00（UTC+08:00））" in text
-    press(env, OWNER, buttons["✅ 发布到群"])
-    (raffle,), _ = env.store.group_raffles(GROUP, 0, 8)
-    assert (raffle["winner_count"], raffle["target_count"]) == (20, 50)
+    type_text(env, OWNER, "iPhone")
+    text, _ = type_text(env, OWNER, "1")  # counts can be typed instead of pressed
+    assert text.endswith("怎么开奖？")
+    assert type_text(env, OWNER, "满人")[0] == "请点上面消息里的按钮选择，或发送 /cancel 退出。"
+    text, buttons = shown(press(env, OWNER, "m:mode:f"))
+    assert text.endswith("满多少人开奖？点按钮或直接发送数字（至少 1）：")
+    assert type_text(env, OWNER, "abc")[0] == "满人开奖人数需为 1～100000 的整数，请重新输入。"
+    text, _ = type_text(env, OWNER, "3")
+    assert "├ 满 3 人开奖（最晚 2027-01-22 16:00（UTC+08:00））" in text
+    text, _ = shown(press(env, OWNER, "m:j:k"))
+    assert text.endswith("请发送参与口令，群友在群里发这句话就能参与，例如：帅哥")
+    assert type_text(env, OWNER, "/start")[0] == "口令需为 1～32 字，且不能以 / 开头。"
+    text, buttons = type_text(env, OWNER, "帅哥")
+    text, buttons = shown(press(env, OWNER, buttons["用「iPhone」作名称"]))
+    assert "iPhone\n├ 奖品：iPhone ×1\n" in text
+    assert "├ 在群里发送「帅哥」参与" in text
+    text, _ = shown(press(env, OWNER, buttons["➕ 添加奖品"]))
+    assert text.endswith("请发送下一个奖品的名称：")
+    type_text(env, OWNER, "1usdt")
+    assert type_text(env, OWNER, "3")[0] == "中奖总人数不能超过满人开奖人数 3。"
+    text, buttons = type_text(env, OWNER, "2")
+    assert "├ 奖品：iPhone ×1、1usdt ×2" in text
+    assert "➕ 添加奖品" not in buttons  # every place is taken
+    press(env, OWNER, "m:pub")
+    raffle = env.store.view(1)
+    assert (raffle["winner_count"], raffle["target_count"], raffle["keyword"]) == (3, 3, "帅哥")
+    assert raffle["prizes"] == [["iPhone", 1], ["1usdt", 2]]
+    card = env.bot.send_message.await_args
+    assert "👉 在群里发送「帅哥」参与" in card.args[1]
+    assert card.kwargs["reply_markup"] is None  # no button to press
 
 
 def test_wizard_typed_deadline(env):
@@ -187,11 +218,61 @@ def test_wizard_typed_deadline(env):
     type_text(env, OWNER, "耳机")
     press(env, OWNER, "m:c:1")
     press(env, OWNER, "m:mode:t")
-    press(env, OWNER, "m:t:x")
     text, _ = type_text(env, OWNER, "0分钟")
     assert text == "开奖时间需在 1 分钟到 365 天之后，请重新输入。"
     text, _ = type_text(env, OWNER, "01-20 20:00")
-    assert "开奖时间：2027-01-20 20:00（UTC+08:00）" in text
+    assert "├ 开奖时间：2027-01-20 20:00（UTC+08:00）" in text
+
+
+def test_wizard_can_publish_to_another_group(env):
+    env.store.remember_group(-200, "二群")
+    env.store.remember_group(-300, "别人的群")
+    env.statuses[(-200, OWNER)] = ChatMember.ADMINISTRATOR
+    fill_wizard(env, OWNER)
+    text, buttons = shown(press(env, OWNER, "m:to"))
+    assert text == "发布到哪个群？"
+    assert buttons == {"✅ 测试群": f"m:to:{GROUP}", "二群": "m:to:-200", "⬅️ 返回": "m:cur"}
+    text, _ = shown(press(env, OWNER, "m:to:-200"))
+    assert text.endswith("发布到「二群」？")
+    assert press(env, OWNER, "m:to:-300").answer.await_args.args[0] == NOT_MANAGER
+    press(env, OWNER, "m:pub")
+    assert env.store.view(1)["chat_id"] == -200
+    assert env.bot.send_message.await_args.args[0] == -200
+
+
+def test_cancel_command_leaves_the_wizard(env):
+    press(env, OWNER, f"m:new:{GROUP}")
+    for expected in ("🎁 测试群 · 抽奖", "已退出。发送 /start 打开菜单。"):
+        message = SimpleNamespace(reply_text=AsyncMock())
+        update = SimpleNamespace(
+            effective_message=message, effective_user=SimpleNamespace(id=OWNER)
+        )
+        asyncio.run(env.menu.cancel(update, SimpleNamespace(bot=env.bot)))
+        assert message.reply_text.await_args.args[0].startswith(expected)
+    assert env.store.draft(OWNER) is None
+
+
+def say(env, user_id, text, chat_id=GROUP):
+    """A group message, as the keyword handler sees it."""
+    message = SimpleNamespace(
+        text=text, chat=SimpleNamespace(id=chat_id), sender_chat=None, set_reaction=AsyncMock()
+    )
+    user = SimpleNamespace(id=user_id, full_name=f"user{user_id}", is_bot=False)
+    update = SimpleNamespace(effective_message=message, effective_user=user)
+    asyncio.run(env.handlers.keyword(update, SimpleNamespace(bot=env.bot, job_queue=None)))
+    return message
+
+
+def test_joining_by_keyword(env):
+    rid = env.store.create(OWNER, "口令", 1, 60, chat_id=GROUP, keyword="Hello")
+    assert say(env, 1, " hello ").set_reaction.await_args.args == ("🎉",)
+    say(env, 1, "HELLO").set_reaction.assert_not_awaited()  # already joined
+    say(env, 2, "hello there").set_reaction.assert_not_awaited()
+    say(env, 3, "hello", chat_id=-200).set_reaction.assert_not_awaited()
+    assert [e["user_id"] for e in env.store.view(rid)["entries"]] == [1]
+    full = env.store.create(OWNER, "满人", 1, 60, chat_id=GROUP, keyword="go", target=1)
+    say(env, 4, "go")
+    assert env.store.view(full)["status"] == "DRAWN"  # the last place draws at once
 
 
 @pytest.mark.parametrize(
@@ -426,7 +507,9 @@ def fill_wizard(env, user_id):
     type_text(env, user_id, "坦克300")
     press(env, user_id, "m:c:1")
     press(env, user_id, "m:mode:t")
-    return shown(press(env, user_id, "m:t:1440"))
+    press(env, user_id, "m:t:1440")
+    press(env, user_id, "m:j:b")
+    return type_text(env, user_id, "坦克300 抽奖")
 
 
 def test_super_admins_can_publish_with_the_notice_from_the_start(env):

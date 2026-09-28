@@ -19,7 +19,7 @@ from telegram.ext import (
     filters,
 )
 
-from lottery.core import LotteryError, Store, integer
+from lottery.core import MAX_KEYWORD, LotteryError, Store, integer
 from lottery.menu import Menu
 from lottery.views import (
     EXPORT_CAPTION,
@@ -40,6 +40,7 @@ DEFAULT_TIMEZONE = "Asia/Shanghai"
 ALLOWED_UPDATES = ["message", "callback_query", "chat_member", "my_chat_member"]
 AUTO_DRAW_SECONDS = 30  # how often due raffles are drawn and announced
 CARD_REFRESH_SECONDS = 5  # joins arriving within this window share one card edit
+JOINED_REACTION = "🎉"  # a keyword join is confirmed quietly, with a reaction
 ADMIN_COMMANDS = {
     "new",
     "config",
@@ -354,6 +355,32 @@ class BotHandlers:
             # already saved, so there is nothing to retry and nothing to tell the group.
             LOG.warning("按钮应答失败：%s", exc)
 
+    async def keyword(self, update, context):
+        """Join by sending a raffle's keyword in its group. Whoever writes in the group is a
+        member, so no membership lookup is needed; admins must not post anonymously."""
+        message, user = update.effective_message, update.effective_user
+        if message is None or user is None or user.is_bot or message.sender_chat:
+            return
+        text = message.text.strip()
+        if len(text) > MAX_KEYWORD:
+            return
+        joined = False
+        for rid in await asyncio.to_thread(self.store.keyword_raffles, message.chat.id, text):
+            try:
+                added = await asyncio.to_thread(
+                    self.store.join, rid, user.id, name_text(user.full_name)
+                )
+            except LotteryError:
+                continue  # full or just closed
+            if added:
+                joined = True
+                await self.after_join(context, rid)
+        if joined:
+            try:
+                await message.set_reaction(JOINED_REACTION)
+            except TelegramError as exc:
+                LOG.info("报名成功的表情回应失败：%s", exc)
+
     async def member_changed(self, update, context):
         change = update.chat_member
         if in_group(change.new_chat_member):
@@ -489,6 +516,7 @@ async def register_commands(app):
     await app.bot.set_my_commands(
         [
             BotCommand("start", "打开菜单"),
+            BotCommand("cancel", "退出正在进行的操作"),
             BotCommand("help", "使用说明"),
             BotCommand("raffle", "查看抽奖"),
             BotCommand("result", "查看开奖结果"),
@@ -509,12 +537,16 @@ def build_application(settings):
     menu = Menu(handlers)
     commands = sorted(ADMIN_COMMANDS | {"help", "id", "raffle", "result"})
     app.add_handler(CommandHandler("start", menu.start))
+    app.add_handler(CommandHandler("cancel", menu.cancel, filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler(commands, handlers.command))
     app.add_handler(CallbackQueryHandler(handlers.callback, pattern=r"^(join|weight):[0-9]{1,19}$"))
     app.add_handler(CallbackQueryHandler(menu.callback, pattern=r"^m:"))
     app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, handlers.migrate))
     app.add_handler(
         MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, menu.text)
+    )
+    app.add_handler(
+        MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, handlers.keyword)
     )
     app.add_handler(ChatMemberHandler(handlers.member_changed, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(ChatMemberHandler(menu.bot_membership, ChatMemberHandler.MY_CHAT_MEMBER))

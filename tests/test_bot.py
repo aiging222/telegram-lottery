@@ -256,7 +256,7 @@ def test_build_application_offline(tmp_path, monkeypatch):
         "123456:offline-test-token", frozenset({99}), str(tmp_path / "test.sqlite3"), SHANGHAI
     )
     app = build_application(settings)
-    assert len(app.handlers[0]) == 8
+    assert len(app.handlers[0]) == 10
     assert app.concurrent_updates == 1
     assert {"chat_member", "my_chat_member"} <= set(ALLOWED_UPDATES)
     assert [job.callback.__name__ for job in app.job_queue.jobs()] == ["auto_draw"]
@@ -575,3 +575,18 @@ def test_early_manual_draw_reaches_group_once(due, chat_type, group_posts):
     run_command(handlers, f"/draw {rid}", chat_type=chat_type)
     assert run_auto_draw(handlers).await_count == group_posts
     run_auto_draw(handlers).assert_not_awaited()
+
+
+def test_result_names_each_winners_prize():
+    result = {
+        "raffle_id": 1,
+        "title": "t",
+        "requested_count": 2,
+        "winners": [
+            {"user_id": 1, "display_name": "A", "prize": "iPhone"},
+            {"user_id": 2, "display_name": "B", "prize": "<1usdt>"},
+        ],
+        "snapshot_hash": "h",
+    }
+    assert "1. A（ID：1） — iPhone" in result_text(result)
+    assert '2. <a href="tg://user?id=2">B</a> — &lt;1usdt&gt;' in result_text(result, mention=True)

@@ -32,6 +32,14 @@ def percent(weight, total):
     return f"{value:.{digits}f}%"
 
 
+def prize_text(prizes):
+    return "、".join(f"{name} ×{count}" for name, count in prizes)
+
+
+def join_text(keyword):
+    return f"在群里发送「{keyword}」参与" if keyword else "点按钮参与"
+
+
 def draw_rule(raffle, timezone):
     """When the raffle is drawn: at its deadline, or once full but no later than it."""
     when = when_text(raffle["deadline"], timezone)
@@ -43,8 +51,10 @@ def draw_rule(raffle, timezone):
 def card(raffle, timezone):
     """The group card. Participants see the essentials only; weight details stay private,
     but a weighted raffle always says that it is weighted."""
-    lines = [
-        f"🎁 {raffle['title']}  #{raffle['id']}",
+    lines = [f"🎁 {raffle['title']}  #{raffle['id']}"]
+    if raffle["prizes"]:
+        lines.append(f"🏆 {prize_text(raffle['prizes'])}")
+    lines += [
         f"中奖 {raffle['winner_count']} 人 · 已参与 {len(raffle['entries'])} 人",
         draw_rule(raffle, timezone),
     ]
@@ -52,9 +62,12 @@ def card(raffle, timezone):
         lines.append("本场设有中奖加成")
     markup = None
     if raffle["status"] == "OPEN" and raffle["chat_id"] is not None:
-        markup = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🎟 参与抽奖", callback_data=f"join:{raffle['id']}")]]
-        )
+        if raffle["keyword"]:
+            lines.append(f"👉 {join_text(raffle['keyword'])}")
+        else:
+            markup = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🎟 参与抽奖", callback_data=f"join:{raffle['id']}")]]
+            )
     elif raffle["status"] == "OPEN":
         lines.append("尚未在群里发布，暂不能报名。")
     else:
@@ -68,10 +81,12 @@ def result_text(result, mention=False):
     lines = [f"🎉 {safe(result['title'])} 开奖结果  #{result['raffle_id']}"]
     for index, winner in enumerate(result["winners"], 1):
         name = safe(name_text(winner["display_name"]))
+        prize = f" — {safe(winner['prize'])}" if winner.get("prize") else ""
         if mention:
-            lines.append(f'{index}. <a href="tg://user?id={winner["user_id"]}">{name}</a>')
+            link = f'<a href="tg://user?id={winner["user_id"]}">{name}</a>'
+            lines.append(f"{index}. {link}{prize}")
         else:
-            lines.append(f"{index}. {name}（ID：{winner['user_id']}）")
+            lines.append(f"{index}. {name}（ID：{winner['user_id']}）{prize}")
     if len(result["winners"]) < result["requested_count"]:
         lines.append(
             f"有效参与人数不足：原定 {result['requested_count']} 名，"
