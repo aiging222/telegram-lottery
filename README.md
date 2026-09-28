@@ -49,7 +49,38 @@ python -m lottery.bot
 
 机器人如果是在本版本之前进的群，菜单里还没有这个群：在群里发一次 `/start` 即可登记。
 
-当前使用长轮询，不需要公网 Webhook 地址。运行机器需要能访问 Telegram；同一令牌只运行一个轮询进程。停止进程后机器人不再响应，恢复运行后从数据库继续。此交付未配置服务器常驻部署。
+当前使用长轮询，不需要公网 Webhook 地址。运行机器需要能访问 Telegram；同一令牌只运行一个轮询进程。停止进程后机器人不再响应，恢复运行后从数据库继续。
+
+## 服务器常驻与更新
+
+在 Linux 服务器上用 systemd 常驻运行：崩溃 5 秒后自动重启，开机自动启动。以下以系统用户 `lottery`、项目目录 `/home/lottery/telegram-lottery` 为例，只需配置一次。用 root 创建 `/etc/systemd/system/lottery-bot.service`：
+
+```ini
+[Unit]
+Description=Telegram lottery bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=lottery
+WorkingDirectory=/home/lottery/telegram-lottery
+ExecStart=/home/lottery/telegram-lottery/.venv/bin/python -m lottery.bot
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+然后执行 `systemctl daemon-reload` 和 `systemctl enable --now lottery-bot`。日志用 `journalctl -u lottery-bot -n 50 --no-pager` 查看。
+
+以后更新代码，只需用 root 执行一条命令：
+
+```bash
+bash /home/lottery/telegram-lottery/scripts/update.sh
+```
+
+脚本会依次停止机器人、备份数据库（`data/backup-时间.sqlite3`，保留最近 5 份）、拉取 `main`、安装锁定的依赖、重新启动，最后显示运行状态。中途任何一步失败，也会把机器人重新启动。数据库表结构在启动时自动升级。
 
 ## 谁能做什么
 
