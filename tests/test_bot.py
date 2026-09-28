@@ -376,3 +376,9 @@ def test_startup_failure_keeps_cause_but_masks_token(monkeypatch, tmp_path):
     message = str(exit_info.value)
     assert 'RuntimeError: install "python-telegram-bot[socks]"' in message
     assert "SECRET" not in message
+
+
+def test_raffles_lists_current_status(setup):
+    _, rid, handlers = setup
+    text = run_command(handlers, "/raffles").reply_text.call_args.args[0]
+    assert f"{rid}｜测试抽奖｜报名中" in text

@@ -244,6 +244,14 @@ def test_failed_migration_changes_nothing(tmp_path, monkeypatch):
     db.close()
 
 
+def test_recent_freezes_expired_raffles_in_one_pass(setup):
+    store, rid, now = setup
+    later = store.create(99, "later", 1, 120)
+    now[0] += 3600
+    assert {r["id"]: r["status"] for r in store.recent()} == {rid: "FROZEN", later: "OPEN"}
+    assert store.view(rid)["snapshot_hash"]
+
+
 def test_raffles_isolated(setup):
     store, rid, _ = setup
     other = store.create(99, "other", 1, 60)

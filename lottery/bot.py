@@ -225,10 +225,9 @@ class BotHandlers:
                 return
             if command == "raffles":
                 rows = await asyncio.to_thread(self.store.recent)
-                views = [await asyncio.to_thread(self.store.view, r["id"]) for r in rows]
                 await reply(
                     message,
-                    "\n".join(f"{r['id']}｜{r['title']}｜{status_text(r)}" for r in views)
+                    "\n".join(f"{r['id']}｜{r['title']}｜{status_text(r)}" for r in rows)
                     or "暂无抽奖。",
                 )
                 return

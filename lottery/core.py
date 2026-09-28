@@ -443,12 +443,9 @@ class Store:
 
     def recent(self):
         with self.transaction() as db:
-            return [
-                dict(r)
-                for r in db.execute(
-                    "SELECT id,title,status,deadline FROM raffles ORDER BY id DESC LIMIT 20"
-                )
-            ]
+            rows = [dict(r) for r in db.execute("SELECT * FROM raffles ORDER BY id DESC LIMIT 20")]
+            # Same freeze-on-read rule as view(), applied to every row in one transaction.
+            return [r if self._open(r) else self._freeze(db, r, 0) for r in rows]
 
     def export(self, raffle_id):
         with self.transaction() as db:
