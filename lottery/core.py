@@ -110,6 +110,25 @@ MIGRATIONS = [
     UPDATE raffles SET announced_at = 0
     WHERE result IS NOT NULL OR deadline <= CAST(strftime('%s', 'now') AS REAL)
     """,
+    # 5: button menus. Raffles may end once full and remember their group card for edits;
+    # the bot remembers its groups; each admin has at most one unfinished creation wizard.
+    """
+    ALTER TABLE raffles ADD COLUMN target_count INTEGER;
+    ALTER TABLE raffles ADD COLUMN card_message_id INTEGER;
+    CREATE INDEX IF NOT EXISTS raffles_by_chat ON raffles(chat_id);
+    CREATE TABLE IF NOT EXISTS groups (
+        chat_id INTEGER PRIMARY KEY,
+        title TEXT NOT NULL,
+        active INTEGER NOT NULL,
+        updated_at REAL NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS drafts (
+        user_id INTEGER PRIMARY KEY,
+        chat_id INTEGER NOT NULL,
+        data TEXT NOT NULL,
+        updated_at REAL NOT NULL
+    )
+    """,
 ]
 
 
@@ -160,8 +179,20 @@ class Store:
     def _open(self, raffle):
         return raffle["status"] == "OPEN" and self.clock() < raffle["deadline"]
 
+    def _full(self, db, raffle):
+        target = raffle["target_count"]
+        return (
+            target is not None
+            and db.execute(
+                "SELECT COUNT(*) FROM participants WHERE raffle_id=?", (raffle["id"],)
+            ).fetchone()[0]
+            >= target
+        )
+
     def _editable(self, db, raffle_id):
         raffle = self._get(db, raffle_id)
+        if raffle["status"] == "CANCELLED":
+            raise LotteryError("本场抽奖已取消。")
         if not self._open(raffle):
             raise LotteryError("本场抽奖报名已截止，不能报名或修改权重。")
         return raffle
@@ -195,6 +226,10 @@ class Store:
                 for row in db.execute("SELECT id FROM raffles WHERE chat_id=?", (old_chat_id,))
             ]
             db.execute("UPDATE raffles SET chat_id=? WHERE chat_id=?", (new_chat_id, old_chat_id))
+            db.execute(
+                "UPDATE OR REPLACE groups SET chat_id=? WHERE chat_id=?", (new_chat_id, old_chat_id)
+            )
+            db.execute("UPDATE drafts SET chat_id=? WHERE chat_id=?", (new_chat_id, old_chat_id))
             for raffle_id in ids:
                 self.audit(
                     db, raffle_id, 0, "migrate_chat", {"before": old_chat_id, "after": new_chat_id}
@@ -221,16 +256,27 @@ class Store:
                 self.audit(db, raffle_id, 0, "leave", {"user_id": user_id, "chat_id": chat_id})
             return ids
 
-    def create(self, actor, title, winner_count, minutes):
+    def create(
+        self, actor, title, winner_count, minutes=None, *, deadline=None, chat_id=None, target=None
+    ):
+        """Create a raffle ending after `minutes` or at `deadline`, or earlier once `target`
+        people have joined. Menus create it already bound to `chat_id`."""
         integer(winner_count, "中奖名额", 1, 100)
-        integer(minutes, "报名时长（分钟）", 1, 525600)
         if not 1 <= len(title.strip()) <= 160:
             raise LotteryError("标题长度需为 1～160 字。")
+        if target is not None:
+            integer(target, "满人开奖人数", winner_count, 100_000)
         with self.transaction() as db:
-            deadline = self.clock() + minutes * 60
+            now = self.clock()
+            if deadline is None:
+                integer(minutes, "报名时长（分钟）", 1, 525600)
+                deadline = now + minutes * 60
+            elif not now + 60 <= deadline <= now + 525600 * 60:
+                raise LotteryError("开奖时间需在 1 分钟到 365 天之后。")
             cursor = db.execute(
-                "INSERT INTO raffles(title,winner_count,deadline,created_by) VALUES(?,?,?,?)",
-                (title.strip(), winner_count, deadline, actor),
+                "INSERT INTO raffles(title,winner_count,deadline,created_by,chat_id,target_count) "
+                "VALUES(?,?,?,?,?,?)",
+                (title.strip(), winner_count, deadline, actor, chat_id, target),
             )
             raffle_id = cursor.lastrowid
             self.audit(
@@ -238,19 +284,50 @@ class Store:
                 raffle_id,
                 actor,
                 "create",
-                {"title": title, "deadline": deadline, "winner_count": winner_count},
+                {
+                    "title": title,
+                    "deadline": deadline,
+                    "winner_count": winner_count,
+                    "chat_id": chat_id,
+                    "target": target,
+                },
             )
             return raffle_id
 
     def join(self, raffle_id, user_id, display_name):
         integer(user_id, "用户 ID", 1, 2**63 - 1)
         with self.transaction() as db:
-            self._editable(db, raffle_id)
-            cursor = db.execute(
-                "INSERT OR IGNORE INTO participants VALUES(?,?,?)",
-                (raffle_id, user_id, display_name[:128]),
+            raffle = self._editable(db, raffle_id)
+            if db.execute(
+                "SELECT 1 FROM participants WHERE raffle_id=? AND user_id=?", (raffle_id, user_id)
+            ).fetchone():
+                return False
+            if self._full(db, raffle):
+                raise LotteryError("名额已满，即将开奖。")
+            db.execute(
+                "INSERT INTO participants VALUES(?,?,?)", (raffle_id, user_id, display_name[:128])
             )
-            return cursor.rowcount == 1
+            return True
+
+    def is_full(self, raffle_id):
+        with self.transaction() as db:
+            return self._full(db, self._get(db, raffle_id))
+
+    def cancel(self, raffle_id, actor):
+        """Call off a raffle that has not been drawn; False if it already was cancelled."""
+        with self.transaction() as db:
+            raffle = self._get(db, raffle_id)
+            if raffle["status"] == "DRAWN":
+                raise LotteryError("本场抽奖已开奖，不能取消。")
+            if raffle["status"] == "CANCELLED":
+                return False
+            db.execute("UPDATE raffles SET status='CANCELLED' WHERE id=?", (raffle_id,))
+            self.audit(db, raffle_id, actor, "cancel", {})
+            return True
+
+    def set_card(self, raffle_id, message_id):
+        with self.transaction() as db:
+            db.execute("UPDATE raffles SET card_message_id=? WHERE id=?", (message_id, raffle_id))
 
     def configure(self, raffle_id, actor, default, cap):
         integer(default, "默认权重")
@@ -439,6 +516,7 @@ class Store:
         if raffle["snapshot"]:
             snapshot = json.loads(raffle["snapshot"])
             raffle["entries"], raffle["rules"] = snapshot["entries"], snapshot["rules"]
+            overridden = any(e["override"] is not None for e in raffle["entries"])
         else:
             raffle["entries"] = self._entries(db, raffle)
             raffle["rules"] = [
@@ -447,6 +525,11 @@ class Store:
                     "SELECT tag,bonus FROM rules WHERE raffle_id=? ORDER BY tag", (raffle_id,)
                 )
             ]
+            overridden = bool(
+                db.execute("SELECT 1 FROM overrides WHERE raffle_id=?", (raffle_id,)).fetchone()
+            )
+        # Any bonus or personal weight makes the odds unequal, and the group card says so.
+        raffle["weighted"] = overridden or any(r["bonus"] for r in raffle["rules"])
         raffle["result"] = json.loads(raffle["result"]) if raffle["result"] else None
         return raffle
 
@@ -455,7 +538,9 @@ class Store:
             raffle = self._get(db, raffle_id)
             if raffle["result"]:
                 return json.loads(raffle["result"])
-            if self._open(raffle):
+            if raffle["status"] == "CANCELLED":
+                raise LotteryError("本场抽奖已取消。")
+            if self._open(raffle) and not self._full(db, raffle):
                 raise LotteryError("尚未到截止时间。如需提前开奖，请先 /freeze 截止报名。")
             raffle = self._freeze(db, raffle, actor)
             snapshot = json.loads(raffle["snapshot"])
@@ -475,13 +560,15 @@ class Store:
             return result
 
     def pending_announcements(self):
-        """Group-bound raffles whose result is due in their group: past deadline, or drawn."""
+        """Group-bound raffles whose result is due in their group: drawn, past deadline or full."""
         with self.transaction() as db:
             return [
                 (row["id"], row["chat_id"])
                 for row in db.execute(
-                    "SELECT id,chat_id FROM raffles WHERE chat_id IS NOT NULL "
-                    "AND announced_at IS NULL AND (result IS NOT NULL OR deadline<=?) "
+                    "SELECT id,chat_id FROM raffles r WHERE chat_id IS NOT NULL "
+                    "AND announced_at IS NULL AND status!='CANCELLED' "
+                    "AND (result IS NOT NULL OR deadline<=? OR (target_count IS NOT NULL AND "
+                    "(SELECT COUNT(*) FROM participants p WHERE p.raffle_id=r.id)>=target_count)) "
                     "ORDER BY deadline",
                     (self.clock(),),
                 )
@@ -504,6 +591,76 @@ class Store:
             rows = [dict(r) for r in db.execute("SELECT * FROM raffles ORDER BY id DESC LIMIT 20")]
             # Same freeze-on-read rule as view(), applied to every row in one transaction.
             return [r if self._open(r) else self._freeze(db, r, 0) for r in rows]
+
+    def group_summary(self, chat_id):
+        with self.transaction() as db:
+            counts = dict(
+                db.execute(
+                    "SELECT status,COUNT(*) FROM raffles WHERE chat_id=? GROUP BY status",
+                    (chat_id,),
+                ).fetchall()
+            )
+        return {
+            "active": counts.get("OPEN", 0) + counts.get("FROZEN", 0),
+            "drawn": counts.get("DRAWN", 0),
+            "cancelled": counts.get("CANCELLED", 0),
+        }
+
+    def group_raffles(self, chat_id, page, size):
+        """One page of a group's raffles, newest first, and whether another page follows."""
+        with self.transaction() as db:
+            rows = [
+                dict(r)
+                for r in db.execute(
+                    "SELECT * FROM raffles WHERE chat_id=? ORDER BY id DESC LIMIT ? OFFSET ?",
+                    (chat_id, size + 1, page * size),
+                )
+            ]
+            shown = [r if self._open(r) else self._freeze(db, r, 0) for r in rows[:size]]
+            return shown, len(rows) > size
+
+    def remember_group(self, chat_id, title, active=True):
+        with self.transaction() as db:
+            db.execute(
+                "INSERT INTO groups VALUES(?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET "
+                "title=excluded.title,active=excluded.active,updated_at=excluded.updated_at",
+                (chat_id, title, int(active), self.clock()),
+            )
+
+    def groups(self):
+        """Groups the bot is currently in, as (chat_id, title)."""
+        with self.transaction() as db:
+            return [
+                (r["chat_id"], r["title"])
+                for r in db.execute(
+                    "SELECT chat_id,title FROM groups WHERE active=1 ORDER BY title"
+                )
+            ]
+
+    def group_title(self, chat_id):
+        with self.transaction() as db:
+            row = db.execute("SELECT title FROM groups WHERE chat_id=?", (chat_id,)).fetchone()
+        return row["title"] if row else str(chat_id)
+
+    def save_draft(self, user_id, chat_id, data):
+        with self.transaction() as db:
+            db.execute(
+                "INSERT INTO drafts VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET "
+                "chat_id=excluded.chat_id,data=excluded.data,updated_at=excluded.updated_at",
+                (user_id, chat_id, encode(data), self.clock()),
+            )
+
+    def draft(self, user_id):
+        """The user's unfinished creation wizard as (chat_id, data), or None."""
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT chat_id,data FROM drafts WHERE user_id=?", (user_id,)
+            ).fetchone()
+        return (row["chat_id"], json.loads(row["data"])) if row else None
+
+    def drop_draft(self, user_id):
+        with self.transaction() as db:
+            db.execute("DELETE FROM drafts WHERE user_id=?", (user_id,))
 
     def export(self, raffle_id):
         with self.transaction() as db:

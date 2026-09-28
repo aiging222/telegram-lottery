@@ -3,8 +3,8 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from lottery.bot import personal_weight, result_text
 from lottery.core import Store
+from lottery.views import result_text
 
 
 def main():
@@ -18,8 +18,11 @@ def main():
         store.override(rid, 99, 103, 6)
         store.override(rid, 99, 104, 0)
         raffle = store.view(rid)
-        print("演示权重：小明 1、小红 3、小林 6、小王 0。\n")
-        print("小林的查询结果：\n" + personal_weight(raffle, 103))
+        total = sum(p["weight"] for p in raffle["entries"])
+        print("演示权重（只有超级管理员能看到）：")
+        for person in raffle["entries"]:
+            chance = 100 * person["weight"] / total
+            print(f"  {person['display_name']}：权重 {person['weight']}，首轮 {chance:.0f}%")
         store.freeze(rid, 99)
         result = store.draw(rid, 99)
         print("\n" + result_text(result))

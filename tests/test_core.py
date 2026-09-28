@@ -330,3 +330,83 @@ def test_raffles_isolated(setup):
     store.override(rid, 99, 123, 0)
     store.join(other, 123, "Alice")
     assert store.view(other)["entries"][0]["weight"] == 1
+
+
+def test_raffle_ends_once_full(setup):
+    store, _, now = setup
+    rid = store.create(99, "满人", 1, deadline=now[0] + 7200, chat_id=-100, target=2)
+    store.join(rid, 1, "one")
+    with pytest.raises(LotteryError, match="尚未到截止时间"):
+        store.draw(rid, 0)
+    assert store.pending_announcements() == []
+    store.join(rid, 2, "two")
+    assert store.is_full(rid)
+    assert not store.join(rid, 2, "two")  # joining twice is still just "already joined"
+    with pytest.raises(LotteryError, match="名额已满"):
+        store.join(rid, 3, "three")
+    assert store.pending_announcements() == [(rid, -100)]
+    assert len(store.draw(rid, 0)["winners"]) == 1
+
+
+@pytest.mark.parametrize(
+    "options, message",
+    [
+        ({"minutes": 60, "target": 1}, "满人开奖人数"),  # fewer people than winners
+        ({"deadline": 1_800_000_030.0}, "1 分钟"),  # too soon
+    ],
+)
+def test_create_validation(setup, options, message):
+    store, _, _ = setup
+    with pytest.raises(LotteryError, match=message):
+        store.create(99, "x", 2, **options)
+
+
+def test_cancel(setup):
+    store, rid, now = setup
+    store.bind(rid, 99, -100)
+    store.join(rid, 1, "one")
+    assert store.cancel(rid, 99)
+    assert not store.cancel(rid, 99)
+    for operation in (lambda: store.join(rid, 2, "two"), lambda: store.draw(rid, 99)):
+        with pytest.raises(LotteryError, match="已取消"):
+            operation()
+    now[0] += 3600
+    assert store.pending_announcements() == []
+    assert store.view(rid)["status"] == "CANCELLED"
+    drawn = store.create(99, "drawn", 1, 60)
+    store.freeze(drawn, 99)
+    store.draw(drawn, 99)
+    with pytest.raises(LotteryError, match="已开奖"):
+        store.cancel(drawn, 99)
+
+
+def test_group_listing_and_summary(setup):
+    store, _, now = setup
+    ids = [store.create(99, f"r{n}", 1, 60, chat_id=-100) for n in range(3)]
+    store.cancel(ids[0], 99)
+    store.freeze(ids[1], 99)
+    store.draw(ids[1], 99)
+    assert store.group_summary(-100) == {"active": 1, "drawn": 1, "cancelled": 1}
+    page, more = store.group_raffles(-100, 0, 2)
+    assert ([r["id"] for r in page], more) == ([ids[2], ids[1]], True)
+    page, more = store.group_raffles(-100, 1, 2)
+    assert ([r["id"] for r in page], more) == ([ids[0]], False)
+    now[0] += 3600
+    assert store.group_raffles(-100, 0, 8)[0][0]["status"] == "FROZEN"  # freeze on read
+
+
+def test_groups_and_drafts(setup):
+    store, _, _ = setup
+    store.remember_group(-100, "甲群")
+    store.remember_group(-200, "乙群")
+    store.remember_group(-200, "乙群", active=False)
+    assert store.groups() == [(-100, "甲群")]
+    assert store.group_title(-300) == "-300"
+    store.save_draft(7, -100, {"step": "title"})
+    store.save_draft(7, -100, {"title": "奖", "step": None})
+    assert store.draft(7) == (-100, {"title": "奖", "step": None})
+    store.migrate_chat(-100, -1001)
+    assert store.groups() == [(-1001, "甲群")]
+    assert store.draft(7)[0] == -1001
+    store.drop_draft(7)
+    assert store.draft(7) is None

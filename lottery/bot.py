@@ -5,13 +5,12 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
-from telegram import BotCommand, ChatMember, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, ChatMember, Update
 from telegram.error import BadRequest, ChatMigrated, Forbidden, TelegramError
 from telegram.ext import (
     Application,
@@ -23,17 +22,22 @@ from telegram.ext import (
 )
 
 from lottery.core import LotteryError, Store, integer
+from lottery.menu import Menu
+from lottery.views import card, chunks, name_text, result_text, status_text
 
 LOG = logging.getLogger(__name__)
 MEMBER_STATUSES = {ChatMember.OWNER, ChatMember.ADMINISTRATOR, ChatMember.MEMBER}
 DEFAULT_TIMEZONE = "Asia/Shanghai"
-# chat_member carries leave/kick events; Telegram sends it only to bots that are group admins.
-ALLOWED_UPDATES = ["message", "callback_query", "chat_member"]
-AUTO_DRAW_SECONDS = 30  # how often raffles past their deadline are drawn and announced
+# chat_member carries leave/kick events and my_chat_member tells the bot it joined a group;
+# Telegram sends chat_member only to bots that are group admins.
+ALLOWED_UPDATES = ["message", "callback_query", "chat_member", "my_chat_member"]
+AUTO_DRAW_SECONDS = 30  # how often due raffles are drawn and announced
+CARD_REFRESH_SECONDS = 5  # joins arriving within this window share one card edit
 ADMIN_COMMANDS = {
     "new",
     "config",
     "rule",
+    "rules",
     "grant",
     "revoke",
     "weight",
@@ -62,28 +66,20 @@ USAGE = {
             "publish",
             "raffle",
             "result",
-            "myweight",
             "rules",
         )
     },
 }
 COUNTS = {name: 1 for name in USAGE}
 COUNTS.update({name: 3 for name in ("config", "rule", "grant", "revoke", "weight")})
-PUBLIC_HELP = """🎲 加权抽奖机器人
-/id — 查看自己的 Telegram 用户 ID
-/raffle 抽奖ID — 查看抽奖和报名按钮
-/rules 抽奖ID — 查看完整权重规则
-/myweight 抽奖ID — 私聊查询自己的权重
-/result 抽奖ID — 查询已保存的开奖结果
-
-抽奖按权重随机抽取，每人最多中奖一次。权重为 0 不参与抽取。
-仅限发布群的成员报名，截止前退群会取消报名。
-规则加成由管理员核验后授予；管理员可在截止前覆盖个人权重。
-截止后名单与权重不可修改，机器人会自动开奖并在发布群公布结果。"""
+PUBLIC_HELP = """🎁 抽奖机器人
+群管理员私聊我发送 /start，用按钮发起和管理抽奖。
+/raffle 抽奖ID — 查看抽奖
+/result 抽奖ID — 查看开奖结果
+/id — 查看自己的用户 ID"""
 ADMIN_HELP = """
 
-管理员命令（除发布和开奖外均在私聊使用）：
-请直接私聊机器人配置权重；如果发到群里，指令文字本身仍会被群成员看到。
+超级管理员命令（除发布和开奖外均在私聊使用）：
 /new 3 60 周末抽奖 — 创建活动，60 分钟后截止
 /config 1 1 100 — 默认权重 1，上限 100
 /rule 1 vip 2 — vip 规则加成 2
@@ -92,6 +88,7 @@ ADMIN_HELP = """
 /weight 1 123456789 10 — 覆盖该用户权重为 10
 /weight 1 123456789 0 — 排除该用户
 /weight 1 123456789 auto — 恢复规则计算
+/rules 1 — 查看权重规则（不对群友公开）
 /preview 1 — 预览名单及首轮概率
 /export 1 — 导出完整 JSON 及修改记录
 /publish 1 — 在目标群发布报名卡片，首次发布即绑定该群，仅限群成员报名
@@ -136,72 +133,6 @@ class Settings:
         return cls(token, admins, os.environ.get("DATABASE_PATH", "data/lottery.sqlite3"), timezone)
 
 
-def name_text(text):
-    return " ".join(text.split())[:128]
-
-
-def status_text(raffle):
-    return {"OPEN": "报名中", "FROZEN": "报名已截止", "DRAWN": "已开奖"}[raffle["status"]]
-
-
-def card(raffle, timezone):
-    deadline = datetime.fromtimestamp(raffle["deadline"], timezone)
-    offset = f"{deadline:%z}"  # per date, so daylight saving time shows correctly
-    rules = "、".join(f"{r['tag']} +{r['bonus']}" for r in raffle["rules"][:8]) or "暂无加成规则"
-    if len(raffle["rules"]) > 8:
-        rules += "（完整规则见 /rules）"
-    text = (
-        f"🎲 {raffle['title']}\n抽奖 ID：{raffle['id']}\n状态：{status_text(raffle)}\n"
-        f"中奖名额：{raffle['winner_count']}\n已报名：{len(raffle['entries'])} 人\n"
-        f"截止：{deadline:%Y-%m-%d %H:%M:%S}（UTC{offset[:3]}:{offset[3:]}）\n\n"
-        f"默认权重：{raffle['default_weight']}；上限：{raffle['weight_cap']}\n"
-        f"规则加成：{rules}\n"
-        "规则由管理员核验后授予，个人覆盖值优先；截止前可能调整。\n"
-        "权重越高，抽取机会越大；0 权重不参与，每人最多中奖一次。\n"
-        "按钮查询的是当前状态，上方报名人数为发布时数据。"
-    )
-    buttons = []
-    if raffle["status"] == "OPEN" and raffle["chat_id"] is not None:
-        text += "\n仅限发布群的成员报名，截止前退群会取消报名。"
-        buttons.append([InlineKeyboardButton("🎟 报名", callback_data=f"join:{raffle['id']}")])
-    elif raffle["status"] == "OPEN":
-        text += f"\n尚未在群里发布：管理员在目标群发送 /publish {raffle['id']} 后开放报名。"
-    buttons.append([InlineKeyboardButton("查看我的权重", callback_data=f"weight:{raffle['id']}")])
-    return text, InlineKeyboardMarkup(buttons)
-
-
-def personal_weight(raffle, user_id):
-    person = next((p for p in raffle["entries"] if p["user_id"] == user_id), None)
-    if person is None:
-        return "你尚未报名本场抽奖。"
-    total = sum(p["weight"] for p in raffle["entries"])
-    chance = person["weight"] / total * 100 if total else 0
-    source = "个人覆盖" if person["override"] is not None else "规则计算"
-    return (
-        f"权重：{person['weight']}（{source}）\n"
-        f"首轮概率：{chance:.2f}%\n状态：{status_text(raffle)}\n"
-        "多名中奖者的最终中奖概率不是首轮概率乘名额。"
-    )
-
-
-def result_text(result):
-    lines = [f"🎉 {result['title']}｜开奖结果", f"抽奖 ID：{result['raffle_id']}"]
-    for index, winner in enumerate(result["winners"], 1):
-        lines.append(f"{index}. {name_text(winner['display_name'])}（ID：{winner['user_id']}）")
-    if len(result["winners"]) < result["requested_count"]:
-        lines.append(
-            f"正权重人数不足：原定 {result['requested_count']} 名，"
-            f"实际抽出 {len(result['winners'])} 名。"
-        )
-    lines.extend(
-        [
-            "每人最多中奖一次。此结果已保存，重复开奖不会重新抽取。",
-            f"名单摘要：{result['snapshot_hash']}",
-        ]
-    )
-    return "\n".join(lines)
-
-
 async def group_member(bot, store, chat_id, user_id):
     """Ask Telegram whether user_id is in chat_id now, following a supergroup upgrade."""
     try:
@@ -217,15 +148,17 @@ def in_group(member):
     return member.status in MEMBER_STATUSES or getattr(member, "is_member", False)
 
 
-def chunks(text):
-    # Keep even non-BMP characters below Telegram's UTF-16 length limit.
-    return [text[i : i + 1500] for i in range(0, len(text), 1500)]
-
-
-async def reply(message, text, markup=None):
+async def reply(message, text, markup=None, html=False):
+    """Reply in as many messages as needed; returns the last one sent."""
     parts = chunks(text)
+    sent = None
     for index, part in enumerate(parts):
-        await message.reply_text(part, reply_markup=markup if index == len(parts) - 1 else None)
+        sent = await message.reply_text(
+            part,
+            reply_markup=markup if index == len(parts) - 1 else None,
+            parse_mode="HTML" if html else None,
+        )
+    return sent
 
 
 class BotHandlers:
@@ -240,14 +173,20 @@ class BotHandlers:
             return
         command = message.text.split()[0][1:].split("@")[0].lower()
         args = context.args
+        chat = update.effective_chat
+        if chat.type in ("group", "supergroup"):
+            # Groups that had the bot before menus existed show up in "我的群" this way.
+            await asyncio.to_thread(
+                self.store.remember_group, chat.id, getattr(chat, "title", None) or str(chat.id)
+            )
         if command in ADMIN_COMMANDS and user.id not in self.admin_ids:
             await reply(message, "此命令仅限配置的机器人管理员使用。")
             return
-        if command in PRIVATE_COMMANDS | {"myweight"} and update.effective_chat.type != "private":
+        if command in PRIVATE_COMMANDS and chat.type != "private":
             await reply(message, "请私聊机器人执行此命令。")
             return
         try:
-            if command in ("start", "help"):
+            if command == "help":
                 await reply(
                     message, PUBLIC_HELP + (ADMIN_HELP if user.id in self.admin_ids else "")
                 )
@@ -310,11 +249,10 @@ class BotHandlers:
                 return
             elif command == "draw":
                 result = await asyncio.to_thread(self.store.draw, rid, user.id)
-                await reply(message, result_text(result))
+                await reply(message, result_text(result, mention=True), html=True)
                 # Drawn in the bound group itself: no automatic announcement needed there.
-                await asyncio.to_thread(
-                    self.store.mark_announced, rid, user.id, update.effective_chat.id
-                )
+                if await asyncio.to_thread(self.store.mark_announced, rid, user.id, chat.id):
+                    await self.refresh_card(context.bot, rid)
                 return
             elif command == "export":
                 exported = await asyncio.to_thread(self.store.export, rid)
@@ -326,24 +264,22 @@ class BotHandlers:
                 )
                 return
             else:
-                if command == "publish" and update.effective_chat.type != "private":
-                    await asyncio.to_thread(self.store.bind, rid, user.id, update.effective_chat.id)
+                if command == "publish" and chat.type != "private":
+                    await asyncio.to_thread(self.store.bind, rid, user.id, chat.id)
                 raffle = await asyncio.to_thread(self.store.view, rid)
                 if command in ("publish", "raffle"):
                     if raffle["result"]:
-                        await reply(message, result_text(raffle["result"]))
+                        await reply(message, result_text(raffle["result"], mention=True), html=True)
                     else:
                         text, markup = card(raffle, self.timezone)
-                        await reply(message, text, markup)
+                        sent = await reply(message, text, markup)
+                        if command == "publish" and raffle["chat_id"] == chat.id:
+                            await asyncio.to_thread(self.store.set_card, rid, sent.message_id)
                 elif command == "result":
-                    await reply(
-                        message,
-                        result_text(raffle["result"])
-                        if raffle["result"]
-                        else "尚未开奖，请等待管理员执行开奖。",
-                    )
-                elif command == "myweight":
-                    await reply(message, personal_weight(raffle, user.id))
+                    if raffle["result"]:
+                        await reply(message, result_text(raffle["result"], mention=True), html=True)
+                    else:
+                        await reply(message, "尚未开奖，到开奖时间会自动公布。")
                 elif command == "rules":
                     await reply(
                         message,
@@ -367,6 +303,8 @@ class BotHandlers:
                     lines.append("展示前 30 人。完整名单和记录使用 /export。")
                     await reply(message, "\n".join(lines))
                 return
+            # A first bonus or personal weight must show up on the group card.
+            self.refresh_card_soon(context, rid)
             await reply(message, f"抽奖 {rid} 的配置已保存，可用 /preview {rid} 查看。")
         except LotteryError as exc:
             await reply(message, str(exc))
@@ -395,12 +333,12 @@ class BotHandlers:
                 added = await asyncio.to_thread(
                     self.store.join, rid, query.from_user.id, name_text(query.from_user.full_name)
                 )
-                text = (
-                    "报名成功！可点击“查看我的权重”查询。" if added else "你已报名，无需重复报名。"
-                )
+                text = "报名成功！" if added else "你已报名，无需重复报名。"
+                if added:
+                    await self.after_join(context, rid)
             else:
-                raffle = await asyncio.to_thread(self.store.view, rid)
-                text = personal_weight(raffle, query.from_user.id)
+                # Cards published before weights became private still carry this button.
+                text = "该功能已下线。"
         except (LotteryError, ValueError, OverflowError) as exc:
             text = str(exc) if isinstance(exc, LotteryError) else "无效的抽奖按钮。"
         try:
@@ -423,27 +361,72 @@ class BotHandlers:
             change.date.timestamp(),
         )
 
+    async def after_join(self, context, rid):
+        if await asyncio.to_thread(self.store.is_full, rid):
+            await self.auto_draw(context)  # full: draw now rather than on the next pass
+        else:
+            self.refresh_card_soon(context, rid)
+
     async def auto_draw(self, context):
-        """Draw raffles past their deadline and announce each result once in its group."""
+        """Draw raffles that are due (deadline passed or full); announce each result once."""
         for rid, chat_id in await asyncio.to_thread(self.store.pending_announcements):
-            try:
-                result = await asyncio.to_thread(self.store.draw, rid, 0)
-                for part in chunks(result_text(result)):
-                    await context.bot.send_message(chat_id, part)
-            except ChatMigrated as exc:
-                # The group became a supergroup; announce there on the next pass.
-                await asyncio.to_thread(self.store.migrate_chat, chat_id, exc.new_chat_id)
-                continue
-            except (Forbidden, BadRequest) as exc:
-                # The bot was removed or the chat is gone: stop retrying. The result stays
-                # saved and can still be read with /result.
-                LOG.warning("抽奖 %s 的开奖结果无法发到群 %s：%s", rid, chat_id, exc)
-                await asyncio.to_thread(self.store.mark_announced, rid, 0, chat_id, str(exc))
-                continue
-            except TelegramError as exc:
-                LOG.warning("抽奖 %s 的开奖公告发送失败，稍后重试：%s", rid, exc)
-                continue
-            await asyncio.to_thread(self.store.mark_announced, rid, 0, chat_id)
+            await self.announce(context.bot, rid, chat_id)
+
+    async def announce(self, bot, rid, chat_id):
+        """Draw if needed, post the result to the raffle's group and close its card."""
+        try:
+            result = await asyncio.to_thread(self.store.draw, rid, 0)
+            for part in chunks(result_text(result, mention=True)):
+                await bot.send_message(chat_id, part, parse_mode="HTML")
+        except ChatMigrated as exc:
+            # The group became a supergroup; announce there on the next pass.
+            await asyncio.to_thread(self.store.migrate_chat, chat_id, exc.new_chat_id)
+            return
+        except (Forbidden, BadRequest) as exc:
+            # The bot was removed or the chat is gone: stop retrying. The result stays
+            # saved and can still be read with /result.
+            LOG.warning("抽奖 %s 的开奖结果无法发到群 %s：%s", rid, chat_id, exc)
+            await asyncio.to_thread(self.store.mark_announced, rid, 0, chat_id, str(exc))
+            return
+        except TelegramError as exc:
+            LOG.warning("抽奖 %s 的开奖公告发送失败，稍后重试：%s", rid, exc)
+            return
+        await asyncio.to_thread(self.store.mark_announced, rid, 0, chat_id)
+        await self.refresh_card(bot, rid)
+
+    async def publish_card(self, bot, rid):
+        """Post the card to the raffle's group and remember it for later edits."""
+        raffle = await asyncio.to_thread(self.store.view, rid)
+        text, markup = card(raffle, self.timezone)
+        sent = await bot.send_message(raffle["chat_id"], text, reply_markup=markup)
+        await asyncio.to_thread(self.store.set_card, rid, sent.message_id)
+
+    async def refresh_card(self, bot, rid):
+        """Redraw the group card in place: participant count, status and button."""
+        raffle = await asyncio.to_thread(self.store.view, rid)
+        if raffle["card_message_id"] is None or raffle["chat_id"] is None:
+            return
+        text, markup = card(raffle, self.timezone)
+        try:
+            await bot.edit_message_text(
+                text,
+                chat_id=raffle["chat_id"],
+                message_id=raffle["card_message_id"],
+                reply_markup=markup,
+            )
+        except TelegramError as exc:
+            # Unchanged text, a deleted card or a lost group: the card is cosmetic.
+            LOG.info("抽奖 %s 的卡片未更新：%s", rid, exc)
+
+    def refresh_card_soon(self, context, rid):
+        # Joins come in bursts; a single edit a few seconds later covers all of them.
+        jobs = getattr(context, "job_queue", None)
+        if jobs is None or jobs.get_jobs_by_name(f"card:{rid}"):
+            return
+        jobs.run_once(self._refresh_job, CARD_REFRESH_SECONDS, data=rid, name=f"card:{rid}")
+
+    async def _refresh_job(self, context):
+        await self.refresh_card(context.bot, context.job.data)
 
     async def migrate(self, update, context):
         # Telegram sends one service message in the old group and one in the new supergroup.
@@ -499,11 +482,11 @@ async def on_error(update, context):
 async def register_commands(app):
     await app.bot.set_my_commands(
         [
+            BotCommand("start", "打开菜单"),
             BotCommand("help", "使用说明"),
-            BotCommand("id", "查看我的用户 ID"),
-            BotCommand("raffle", "查看抽奖并报名"),
-            BotCommand("myweight", "查看我的权重"),
+            BotCommand("raffle", "查看抽奖"),
             BotCommand("result", "查看开奖结果"),
+            BotCommand("id", "查看我的用户 ID"),
         ]
     )
 
@@ -517,13 +500,18 @@ def build_application(settings):
         .post_init(register_commands)
         .build()
     )
-    commands = sorted(
-        ADMIN_COMMANDS | {"start", "help", "id", "raffle", "result", "myweight", "rules"}
-    )
+    menu = Menu(handlers)
+    commands = sorted(ADMIN_COMMANDS | {"help", "id", "raffle", "result"})
+    app.add_handler(CommandHandler("start", menu.start))
     app.add_handler(CommandHandler(commands, handlers.command))
     app.add_handler(CallbackQueryHandler(handlers.callback, pattern=r"^(join|weight):[0-9]{1,19}$"))
+    app.add_handler(CallbackQueryHandler(menu.callback, pattern=r"^m:"))
     app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, handlers.migrate))
+    app.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, menu.text)
+    )
     app.add_handler(ChatMemberHandler(handlers.member_changed, ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(ChatMemberHandler(menu.bot_membership, ChatMemberHandler.MY_CHAT_MEMBER))
     app.job_queue.run_repeating(
         handlers.auto_draw, interval=AUTO_DRAW_SECONDS, first=AUTO_DRAW_SECONDS
     )

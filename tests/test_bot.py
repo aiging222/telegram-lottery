@@ -16,13 +16,11 @@ from lottery.bot import (
     Settings,
     TokenFilter,
     build_application,
-    card,
     main,
     on_error,
-    personal_weight,
-    result_text,
 )
 from lottery.core import LotteryError, Store
+from lottery.views import card, chunks, result_text
 
 TOKEN = "123456:SECRET-token"
 USER = {"id": 123, "is_bot": False, "first_name": "Alice"}
@@ -39,16 +37,20 @@ def setup(tmp_path):
 
 def command_update(text, user_id=99, chat_type="private", chat_id=GROUP["id"]):
     message = SimpleNamespace(
-        text=text, sender_chat=None, reply_text=AsyncMock(), reply_document=AsyncMock()
+        text=text,
+        sender_chat=None,
+        reply_text=AsyncMock(return_value=SimpleNamespace(message_id=77)),
+        reply_document=AsyncMock(),
     )
     update = SimpleNamespace(
         effective_message=message,
         effective_user=SimpleNamespace(id=user_id, is_bot=False),
         effective_chat=SimpleNamespace(
-            type=chat_type, id=user_id if chat_type == "private" else chat_id
+            type=chat_type, id=user_id if chat_type == "private" else chat_id, title="测试群"
         ),
     )
-    return update, SimpleNamespace(args=text.split()[1:])
+    bot = SimpleNamespace(edit_message_text=AsyncMock(), send_message=AsyncMock())
+    return update, SimpleNamespace(args=text.split()[1:], bot=bot)
 
 
 def run_command(handlers, text, user_id=99, chat_type="private", chat_id=GROUP["id"]):
@@ -193,29 +195,56 @@ def test_publish_binds_first_group_only(setup):
     store, rid, handlers = setup
     unbound = run_command(handlers, f"/raffle {rid}")
     assert "尚未在群里发布" in unbound.reply_text.call_args.args[0]
-    assert all(
-        not b.callback_data.startswith("join:")
-        for row in unbound.reply_text.call_args.kwargs["reply_markup"].inline_keyboard
-        for b in row
-    )
+    assert unbound.reply_text.call_args.kwargs["reply_markup"] is None
     run_command(handlers, f"/publish {rid}", chat_type="supergroup")
+    assert store.view(rid)["card_message_id"] == 77
     other = run_command(handlers, f"/publish {rid}", chat_type="supergroup", chat_id=-200)
     assert "其他群" in other.reply_text.call_args.args[0]
     assert store.view(rid)["chat_id"] == GROUP["id"]
 
 
-def test_personal_weight_zero_and_result_display(setup):
+def test_closed_card_and_short_result(setup):
     store, rid, _ = setup
     store.join(rid, 123, "Alice")
     store.override(rid, 99, 123, 0)
-    assert "0.00%" in personal_weight(store.view(rid), 123)
     store.freeze(rid, 99)
     text, markup = card(store.view(rid), SHANGHAI)
-    assert "状态：报名已截止" in text
-    assert all(
-        not b.callback_data.startswith("join:") for row in markup.inline_keyboard for b in row
-    )
+    assert text.endswith("报名已截止")
+    assert markup is None
     assert "实际抽出 0 名" in result_text(store.draw(rid, 99))
+
+
+def test_card_keeps_weights_private_but_says_the_raffle_is_weighted(setup):
+    store, rid, _ = setup
+    store.bind(rid, 99, GROUP["id"])
+    store.join(rid, 123, "Alice")
+    plain, markup = card(store.view(rid), SHANGHAI)
+    assert "加成" not in plain
+    assert [b.text for row in markup.inline_keyboard for b in row] == ["🎟 参与抽奖"]
+    store.rule(rid, 99, "vip", 5)
+    store.grant(rid, 99, 123, "vip")
+    weighted, _ = card(store.view(rid), SHANGHAI)
+    assert "本场设有中奖加成" in weighted
+    assert "vip" not in weighted
+    assert "权重" not in weighted
+
+
+def test_result_mentions_winners_and_escapes_names(setup):
+    store, rid, _ = setup
+    store.join(rid, 123, "<b>Al & ice</b>")
+    store.freeze(rid, 99)
+    result = store.draw(rid, 99)
+    html = result_text(result, mention=True)
+    assert '<a href="tg://user?id=123">&lt;b&gt;Al &amp; ice&lt;/b&gt;</a>' in html
+    assert "<b>Al & ice</b>（ID：123）" in result_text(result)
+
+
+def test_long_messages_split_at_line_breaks():
+    lines = [f'<a href="tg://user?id={n}">name {n}</a>' for n in range(200)]
+    parts = chunks("\n".join(lines))
+    assert len(parts) > 1
+    assert all(len(part) <= 1500 for part in parts)
+    assert "\n".join(parts).split("\n") == lines
 
 
 def test_build_application_offline(tmp_path, monkeypatch):
@@ -227,9 +256,9 @@ def test_build_application_offline(tmp_path, monkeypatch):
         "123456:offline-test-token", frozenset({99}), str(tmp_path / "test.sqlite3"), SHANGHAI
     )
     app = build_application(settings)
-    assert len(app.handlers[0]) == 4
+    assert len(app.handlers[0]) == 8
     assert app.concurrent_updates == 1
-    assert "chat_member" in ALLOWED_UPDATES
+    assert {"chat_member", "my_chat_member"} <= set(ALLOWED_UPDATES)
     assert [job.callback.__name__ for job in app.job_queue.jobs()] == ["auto_draw"]
 
 
@@ -261,18 +290,18 @@ def test_timezone_setting(monkeypatch, tmp_path):
 @pytest.mark.parametrize(
     "clock, zone, expected",
     [
-        (1_800_000_000, "Asia/Shanghai", "2027-01-15 17:00:00（UTC+08:00）"),
-        (1_800_000_000, "UTC", "2027-01-15 09:00:00（UTC+00:00）"),
-        (1_800_000_000, "Asia/Kolkata", "2027-01-15 14:30:00（UTC+05:30）"),
-        (1_800_000_000, "America/New_York", "2027-01-15 04:00:00（UTC-05:00）"),
-        (1_783_000_000, "America/New_York", "2026-07-02 10:46:40（UTC-04:00）"),  # DST
+        (1_800_000_000, "Asia/Shanghai", "2027-01-15 17:00（UTC+08:00）"),
+        (1_800_000_000, "UTC", "2027-01-15 09:00（UTC+00:00）"),
+        (1_800_000_000, "Asia/Kolkata", "2027-01-15 14:30（UTC+05:30）"),
+        (1_800_000_000, "America/New_York", "2027-01-15 04:00（UTC-05:00）"),
+        (1_783_000_000, "America/New_York", "2026-07-02 10:46（UTC-04:00）"),  # DST
     ],
 )
 def test_card_shows_deadline_in_configured_timezone(tmp_path, clock, zone, expected):
     store = Store(tmp_path / "tz.sqlite3", clock=lambda: clock)
     rid = store.create(99, "时区", 1, 60)
     text, _ = card(store.view(rid), ZoneInfo(zone))
-    assert f"截止：{expected}" in text
+    assert f"开奖时间：{expected}" in text
 
 
 def test_delivery_failure_does_not_reroll(setup):
@@ -301,7 +330,7 @@ def test_delivery_failure_does_not_reroll(setup):
         "/export 1",
         "/freeze 1",
         "/raffles",
-        "/myweight 1",
+        "/rules 1",
     ],
 )
 def test_private_operations_never_reply_with_sensitive_data_in_group(setup, text):
@@ -313,17 +342,31 @@ def test_private_operations_never_reply_with_sensitive_data_in_group(setup, text
     assert len(store.export(1)["audit"]) == 1
 
 
-def test_weight_callback_only_displays_personal_popup(setup):
+def test_old_weight_buttons_no_longer_reveal_weights(setup):
     store, rid, handlers = setup
     store.join(rid, 123, "Alice")
     store.override(rid, 99, 123, 10)
     query = SimpleNamespace(
         data=f"weight:{rid}", answer=AsyncMock(), from_user=SimpleNamespace(id=123, is_bot=False)
     )
-    update = SimpleNamespace(callback_query=query)
-    asyncio.run(handlers.callback(update, None))
-    assert "权重：10" in query.answer.call_args.args[0]
-    assert query.answer.call_args.kwargs == {"show_alert": True}
+    asyncio.run(handlers.callback(SimpleNamespace(callback_query=query), None))
+    assert query.answer.call_args.args[0] == "该功能已下线。"
+
+
+def test_rules_are_for_super_admins_only(setup):
+    _, rid, handlers = setup
+    message = run_command(handlers, f"/rules {rid}", user_id=123)
+    assert "仅限" in message.reply_text.call_args.args[0]
+
+
+def test_weight_change_refreshes_published_card(setup):
+    store, rid, handlers = setup
+    run_command(handlers, f"/publish {rid}", chat_type="supergroup")
+    store.rule(rid, 99, "vip", 2)
+    bot = SimpleNamespace(edit_message_text=AsyncMock())
+    asyncio.run(handlers.refresh_card(bot, rid))
+    assert bot.edit_message_text.await_args.kwargs["message_id"] == 77
+    assert "本场设有中奖加成" in bot.edit_message_text.await_args.args[0]
 
 
 def test_anonymous_sender_cannot_execute_management_command(setup):
