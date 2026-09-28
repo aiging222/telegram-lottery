@@ -3,6 +3,7 @@ import logging
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from zoneinfo import ZoneInfo
 
 import pytest
 from telegram import ChatMember, Update
@@ -24,13 +25,14 @@ from lottery.core import LotteryError, Store
 TOKEN = "123456:SECRET-token"
 USER = {"id": 123, "is_bot": False, "first_name": "Alice"}
 GROUP = {"id": -100, "type": "supergroup"}
+SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 @pytest.fixture
 def setup(tmp_path):
     store = Store(tmp_path / "test.sqlite3")
     rid = store.create(99, "测试抽奖", 2, 60)
-    return store, rid, BotHandlers(store, {99})
+    return store, rid, BotHandlers(store, {99}, SHANGHAI)
 
 
 def command_update(text, user_id=99, chat_type="private", chat_id=GROUP["id"]):
@@ -206,7 +208,7 @@ def test_personal_weight_zero_and_result_display(setup):
     store.override(rid, 99, 123, 0)
     assert "0.00%" in personal_weight(store.view(rid), 123)
     store.freeze(rid, 99)
-    text, markup = card(store.view(rid))
+    text, markup = card(store.view(rid), SHANGHAI)
     assert "已冻结" in text
     assert all(
         not b.callback_data.startswith("join:") for row in markup.inline_keyboard for b in row
@@ -219,9 +221,10 @@ def test_build_application_offline(tmp_path, monkeypatch):
     for name in ("ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY"):
         monkeypatch.delenv(name, raising=False)
         monkeypatch.delenv(name.lower(), raising=False)
-    app = build_application(
-        Settings("123456:offline-test-token", frozenset({99}), str(tmp_path / "test.sqlite3"))
+    settings = Settings(
+        "123456:offline-test-token", frozenset({99}), str(tmp_path / "test.sqlite3"), SHANGHAI
     )
+    app = build_application(settings)
     assert len(app.handlers[0]) == 3
     assert app.concurrent_updates == 1
 
@@ -235,6 +238,37 @@ def test_missing_configuration_fails_closed(monkeypatch, tmp_path):
     monkeypatch.setenv("ADMIN_USER_IDS", "")
     with pytest.raises(LotteryError, match="ADMIN_USER_IDS"):
         Settings.from_env()
+
+
+def test_timezone_setting(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123456:test")
+    monkeypatch.setenv("ADMIN_USER_IDS", "99")
+    monkeypatch.delenv("TIMEZONE", raising=False)
+    assert Settings.from_env().timezone == SHANGHAI
+    monkeypatch.setenv("TIMEZONE", "America/New_York")
+    assert Settings.from_env().timezone == ZoneInfo("America/New_York")
+    for bad in ("Mars/Olympus", "../etc/passwd"):
+        monkeypatch.setenv("TIMEZONE", bad)
+        with pytest.raises(LotteryError, match="TIMEZONE"):
+            Settings.from_env()
+
+
+@pytest.mark.parametrize(
+    "clock, zone, expected",
+    [
+        (1_800_000_000, "Asia/Shanghai", "2027-01-15 17:00:00（UTC+08:00）"),
+        (1_800_000_000, "UTC", "2027-01-15 09:00:00（UTC+00:00）"),
+        (1_800_000_000, "Asia/Kolkata", "2027-01-15 14:30:00（UTC+05:30）"),
+        (1_800_000_000, "America/New_York", "2027-01-15 04:00:00（UTC-05:00）"),
+        (1_783_000_000, "America/New_York", "2026-07-02 10:46:40（UTC-04:00）"),  # DST
+    ],
+)
+def test_card_shows_deadline_in_configured_timezone(tmp_path, clock, zone, expected):
+    store = Store(tmp_path / "tz.sqlite3", clock=lambda: clock)
+    rid = store.create(99, "时区", 1, 60)
+    text, _ = card(store.view(rid), ZoneInfo(zone))
+    assert f"截止：{expected}" in text
 
 
 def test_delivery_failure_does_not_reroll(setup):

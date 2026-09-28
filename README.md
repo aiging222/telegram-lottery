@@ -32,12 +32,14 @@ uv sync
 TELEGRAM_BOT_TOKEN=填写你的机器人令牌
 ADMIN_USER_IDS=填写你的Telegram数字用户ID
 DATABASE_PATH=data/lottery.sqlite3
+TIMEZONE=Asia/Shanghai
 ```
 
 - 通过 Telegram 官方 [@BotFather](https://t.me/BotFather) 创建机器人并获取令牌。令牌仅填写在本地 `.env`，不要提交到代码仓库。
 - `ADMIN_USER_IDS` 是用户 ID，不是用户名、群 ID 或机器人的 ID；多个管理员用英文逗号分隔。
 - 如果尚不知道自己的 ID，可临时将 `ADMIN_USER_IDS` 设为 `9223372036854775807`，启动后私聊机器人发送 `/id`，再将返回的真实 ID 填入配置并重启。这个临时值仅用于启动期间不授予实际用户管理权限；正式使用前必须替换。
 - 在本目录运行；相对数据库路径以运行目录为基准。
+- `TIMEZONE` 填 IANA 时区名（如 `Asia/Shanghai`、`America/New_York`），只影响报名卡片上截止时间的显示，并会自动处理夏令时；不填时默认 `Asia/Shanghai`。截止判断本身与时区无关。
 
 ```bash
 python -m lottery.bot
@@ -169,7 +171,7 @@ ruff format --check .
 
 使用 uv 时无需单独安装，直接执行 `uv run pytest -q`、`uv run ruff check .`、`uv run ruff format --check .`。
 
-测试覆盖抽取区间、无重复中奖、零权重、覆盖恢复、规则叠加、截止边界、权限、群成员校验与群绑定、并发报名/开奖、重启恢复及公告失败后的重试。Telegram 收发通过模拟对象测试；真实机器人联调需要本地填写令牌后执行。
+测试覆盖抽取区间、无重复中奖、零权重、覆盖恢复、规则叠加、截止边界、权限、群成员校验与群绑定、时区显示、并发报名/开奖、重启恢复及公告失败后的重试。Telegram 收发通过模拟对象测试；真实机器人联调需要本地填写令牌后执行。
 
 接口实现参考 [Telegram Bot API](https://core.telegram.org/bots/api) 和 [python-telegram-bot 官方文档](https://docs.python-telegram-bot.org/en/stable/)。生产运行依赖已锁定在 `requirements.lock`（pip 使用），完整依赖另锁定在 `uv.lock`（uv 使用），两者都由 `pyproject.toml` 生成。修改依赖后需重新生成两份锁文件：
 

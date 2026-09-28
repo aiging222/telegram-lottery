@@ -11,6 +11,8 @@ dependencies = [
     # socks: httpx needs socksio whenever ALL_PROXY points at a socks5:// proxy.
     "python-telegram-bot[socks]>=22.5,<23",
     "python-dotenv>=1,<2",
+    # zoneinfo falls back to this where the OS has no time zone database (Windows, Alpine).
+    "tzdata",
 ]
 
 # pip: `pip install -e '.[dev]'`. uv installs the matching group below by default,

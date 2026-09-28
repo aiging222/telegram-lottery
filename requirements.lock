@@ -24,3 +24,5 @@ socksio==1.0.0
     # via httpx
 typing-extensions==4.16.0
     # via anyio
+tzdata==2026.4
+    # via telegram-weighted-lottery (pyproject.toml)

@@ -5,9 +5,10 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 from telegram import BotCommand, ChatMember, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -18,6 +19,7 @@ from lottery.core import LotteryError, Store, integer
 
 LOG = logging.getLogger(__name__)
 MEMBER_STATUSES = {ChatMember.OWNER, ChatMember.ADMINISTRATOR, ChatMember.MEMBER}
+DEFAULT_TIMEZONE = "Asia/Shanghai"
 ADMIN_COMMANDS = {
     "new",
     "config",
@@ -95,6 +97,7 @@ class Settings:
     token: str
     admin_ids: frozenset[int]
     database_path: str
+    timezone: ZoneInfo
 
     @classmethod
     def from_env(cls):
@@ -111,7 +114,14 @@ class Settings:
                 integer(uid, "管理员 ID", 1, 2**63 - 1)
         except ValueError:
             raise LotteryError("ADMIN_USER_IDS 必须为逗号分隔的正整数用户 ID。") from None
-        return cls(token, admins, os.environ.get("DATABASE_PATH", "data/lottery.sqlite3"))
+        zone = os.environ.get("TIMEZONE", "").strip() or DEFAULT_TIMEZONE
+        try:
+            timezone = ZoneInfo(zone)
+        except (ZoneInfoNotFoundError, ValueError):
+            raise LotteryError(
+                f"TIMEZONE 无效：{zone}。请填写 IANA 时区名，例如 Asia/Shanghai。"
+            ) from None
+        return cls(token, admins, os.environ.get("DATABASE_PATH", "data/lottery.sqlite3"), timezone)
 
 
 def name_text(text):
@@ -122,15 +132,16 @@ def status_text(raffle):
     return {"OPEN": "报名中", "FROZEN": "已冻结，等待开奖", "DRAWN": "已开奖"}[raffle["status"]]
 
 
-def card(raffle):
-    deadline = datetime.fromtimestamp(raffle["deadline"], timezone(timedelta(hours=8)))
+def card(raffle, timezone):
+    deadline = datetime.fromtimestamp(raffle["deadline"], timezone)
+    offset = f"{deadline:%z}"  # per date, so daylight saving time shows correctly
     rules = "、".join(f"{r['tag']} +{r['bonus']}" for r in raffle["rules"][:8]) or "暂无加成规则"
     if len(raffle["rules"]) > 8:
         rules += "（完整规则见 /rules）"
     text = (
         f"🎲 {raffle['title']}\n抽奖 ID：{raffle['id']}\n状态：{status_text(raffle)}\n"
         f"中奖名额：{raffle['winner_count']}\n已报名：{len(raffle['entries'])} 人\n"
-        f"截止：{deadline:%Y-%m-%d %H:%M:%S}（UTC+8）\n\n"
+        f"截止：{deadline:%Y-%m-%d %H:%M:%S}（UTC{offset[:3]}:{offset[3:]}）\n\n"
         f"默认权重：{raffle['default_weight']}；上限：{raffle['weight_cap']}\n"
         f"规则加成：{rules}\n"
         "规则由管理员核验后授予，个人覆盖值优先；截止前可能调整。\n"
@@ -198,9 +209,10 @@ async def reply(message, text, markup=None):
 
 
 class BotHandlers:
-    def __init__(self, store, admin_ids):
+    def __init__(self, store, admin_ids, timezone):
         self.store = store
         self.admin_ids = admin_ids
+        self.timezone = timezone
 
     async def command(self, update, context):
         message, user = update.effective_message, update.effective_user
@@ -293,7 +305,7 @@ class BotHandlers:
                     if raffle["result"]:
                         await reply(message, result_text(raffle["result"]))
                     else:
-                        text, markup = card(raffle)
+                        text, markup = card(raffle, self.timezone)
                         await reply(message, text, markup)
                 elif command == "result":
                     await reply(
@@ -434,7 +446,7 @@ async def register_commands(app):
 
 
 def build_application(settings):
-    handlers = BotHandlers(Store(settings.database_path), settings.admin_ids)
+    handlers = BotHandlers(Store(settings.database_path), settings.admin_ids, settings.timezone)
     app = (
         Application.builder()
         .token(settings.token)
