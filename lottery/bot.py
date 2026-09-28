@@ -38,7 +38,7 @@ DEFAULT_TIMEZONE = "Asia/Shanghai"
 # chat_member carries leave/kick events and my_chat_member tells the bot it joined a group;
 # Telegram sends chat_member only to bots that are group admins.
 ALLOWED_UPDATES = ["message", "callback_query", "chat_member", "my_chat_member"]
-AUTO_DRAW_SECONDS = 30  # how often due raffles are drawn and announced
+AUTO_DRAW_SECONDS = 30  # how often due raffles are drawn and old messages deleted
 CARD_REFRESH_SECONDS = 5  # joins arriving within this window share one card edit
 JOINED_REACTION = "🎉"  # a keyword join is confirmed quietly, with a reaction
 ADMIN_COMMANDS = {
@@ -190,10 +190,10 @@ class BotHandlers:
                 self.store.remember_group, chat.id, getattr(chat, "title", None) or str(chat.id)
             )
         if command in ADMIN_COMMANDS and user.id not in self.admin_ids:
-            await reply(message, "此命令仅限配置的机器人管理员使用。")
+            await self.notice(context.bot, message, "此命令仅限配置的机器人管理员使用。")
             return
         if command in PRIVATE_COMMANDS and chat.type != "private":
-            await reply(message, "请私聊机器人执行此命令。")
+            await self.notice(context.bot, message, "请私聊机器人执行此命令。")
             return
         try:
             if command == "help":
@@ -259,10 +259,11 @@ class BotHandlers:
                 return
             elif command == "draw":
                 result = await asyncio.to_thread(self.store.draw, rid, user.id)
-                await reply(message, result_text(result, mention=True), html=True)
+                sent = await reply(message, result_text(result, mention=True), html=True)
                 # Drawn in the bound group itself: no automatic announcement needed there.
                 if await asyncio.to_thread(self.store.mark_announced, rid, user.id, chat.id):
                     await self.refresh_card(context.bot, rid)
+                    await self.pin_result(context.bot, chat.id, sent.message_id)
                 return
             elif command == "export":
                 exported = await asyncio.to_thread(self.store.export, rid)
@@ -282,7 +283,7 @@ class BotHandlers:
                         text, markup = card(raffle, self.timezone)
                         sent = await reply(message, text, markup)
                         if command == "publish" and raffle["chat_id"] == chat.id:
-                            await asyncio.to_thread(self.store.set_card, rid, sent.message_id)
+                            await self.card_posted(context.bot, raffle, sent.message_id)
                 elif command == "result":
                     if raffle["result"]:
                         await reply(message, result_text(raffle["result"], mention=True), html=True)
@@ -314,9 +315,11 @@ class BotHandlers:
             self.refresh_card_soon(context, rid)
             await reply(message, f"抽奖 {rid} 的配置已保存，可用 /preview {rid} 查看。")
         except LotteryError as exc:
-            await reply(message, str(exc))
+            await self.notice(context.bot, message, str(exc))
         except (ValueError, OverflowError):
-            await reply(message, "数字参数格式错误。用法：" + USAGE.get(command, "/help"))
+            await self.notice(
+                context.bot, message, "数字参数格式错误。用法：" + USAGE.get(command, "/help")
+            )
 
     async def callback(self, update, context):
         query = update.callback_query
@@ -364,8 +367,11 @@ class BotHandlers:
         text = message.text.strip()
         if len(text) > MAX_KEYWORD:
             return
+        rids = await asyncio.to_thread(self.store.keyword_raffles, message.chat.id, text)
+        if not rids:
+            return
         joined = False
-        for rid in await asyncio.to_thread(self.store.keyword_raffles, message.chat.id, text):
+        for rid in rids:
             try:
                 added = await asyncio.to_thread(
                     self.store.join, rid, user.id, name_text(user.full_name)
@@ -375,11 +381,13 @@ class BotHandlers:
             if added:
                 joined = True
                 await self.after_join(context, rid)
-        if joined:
+        settings = await asyncio.to_thread(self.store.group_settings, message.chat.id)
+        if joined and settings["delete_keyword"] != 0:
             try:
                 await message.set_reaction(JOINED_REACTION)
             except TelegramError as exc:
                 LOG.info("报名成功的表情回应失败：%s", exc)
+        await self.tidy(context.bot, message.chat.id, [message.message_id], "delete_keyword")
 
     async def member_changed(self, update, context):
         change = update.chat_member
@@ -409,8 +417,10 @@ class BotHandlers:
         """Draw if needed, post the result to the raffle's group and close its card."""
         try:
             result = await asyncio.to_thread(self.store.draw, rid, 0)
-            for part in chunks(result_text(result, mention=True)):
+            sent = [
                 await bot.send_message(chat_id, part, parse_mode="HTML")
+                for part in chunks(result_text(result, mention=True))
+            ]
         except ChatMigrated as exc:
             # The group became a supergroup; announce there on the next pass.
             await asyncio.to_thread(self.store.migrate_chat, chat_id, exc.new_chat_id)
@@ -426,13 +436,83 @@ class BotHandlers:
             return
         await asyncio.to_thread(self.store.mark_announced, rid, 0, chat_id)
         await self.refresh_card(bot, rid)
+        await self.pin_result(bot, chat_id, sent[0].message_id)
 
     async def publish_card(self, bot, rid):
         """Post the card to the raffle's group and remember it for later edits."""
         raffle = await asyncio.to_thread(self.store.view, rid)
         text, markup = card(raffle, self.timezone)
         sent = await bot.send_message(raffle["chat_id"], text, reply_markup=markup)
-        await asyncio.to_thread(self.store.set_card, rid, sent.message_id)
+        await self.card_posted(bot, raffle, sent.message_id)
+
+    async def card_posted(self, bot, raffle, message_id):
+        """Track the newest card of a raffle and pin it in place of the one before."""
+        await asyncio.to_thread(self.store.set_card, raffle["id"], message_id)
+        chat_id = raffle["chat_id"]
+        if not (await asyncio.to_thread(self.store.group_settings, chat_id))["pin_card"]:
+            return
+        if raffle["card_message_id"] not in (None, message_id):
+            await self.unpin(bot, chat_id, raffle["card_message_id"])
+        await self.pin(bot, chat_id, message_id)
+
+    async def pin_result(self, bot, chat_id, message_id):
+        """Pin a result announcement; only the group's latest result stays pinned."""
+        if not (await asyncio.to_thread(self.store.group_settings, chat_id))["pin_result"]:
+            return
+        await self.pin(bot, chat_id, message_id)
+        before = await asyncio.to_thread(self.store.swap_pinned_result, chat_id, message_id)
+        if before is not None and before != message_id:
+            await self.unpin(bot, chat_id, before)
+
+    async def pin(self, bot, chat_id, message_id):
+        # Pinning is a courtesy: without the right, the raffle works all the same.
+        try:
+            await bot.pin_chat_message(chat_id, message_id, disable_notification=True)
+        except TelegramError as exc:
+            LOG.info("群 %s 置顶消息失败：%s", chat_id, exc)
+
+    async def unpin(self, bot, chat_id, message_id):
+        try:
+            await bot.unpin_chat_message(chat_id, message_id=message_id)
+        except TelegramError as exc:
+            LOG.info("群 %s 取消置顶失败：%s", chat_id, exc)
+
+    # Tidying up: group messages are deleted now or later, as each group's settings say.
+
+    async def notice(self, bot, message, text, markup=None):
+        """Answer a command; in a group both the command and the answer are tidied away."""
+        sent = await reply(message, text, markup)
+        if message.chat.type in ("group", "supergroup"):
+            ids = [message.message_id, sent.message_id]
+            await self.tidy(bot, message.chat.id, ids, "delete_notices")
+
+    async def tidy(self, bot, chat_id, message_ids, setting):
+        delay = (await asyncio.to_thread(self.store.group_settings, chat_id))[setting]
+        if delay is None:
+            return
+        if delay == 0:
+            await self.delete(bot, chat_id, message_ids)
+            return
+        due = self.store.clock() + delay
+        await asyncio.to_thread(self.store.schedule_deletions, chat_id, message_ids, due)
+
+    async def delete(self, bot, chat_id, message_ids):
+        """Delete messages; False only when it is worth trying again later."""
+        try:
+            await bot.delete_messages(chat_id, message_ids)
+        except (Forbidden, BadRequest) as exc:
+            # No right to delete, or the messages are gone or too old: give up on them.
+            LOG.info("群 %s 删除消息失败：%s", chat_id, exc)
+        except TelegramError as exc:
+            LOG.warning("群 %s 删除消息失败，稍后重试：%s", chat_id, exc)
+            return False
+        return True
+
+    async def cleanup(self, context):
+        """Delete the group messages whose time has come."""
+        for chat_id, ids in (await asyncio.to_thread(self.store.due_deletions)).items():
+            if await self.delete(context.bot, chat_id, ids):
+                await asyncio.to_thread(self.store.drop_deletions, chat_id, ids)
 
     async def refresh_card(self, bot, rid):
         """Redraw the group card in place: participant count, status and button."""
@@ -450,6 +530,10 @@ class BotHandlers:
         except TelegramError as exc:
             # Unchanged text, a deleted card or a lost group: the card is cosmetic.
             LOG.info("抽奖 %s 的卡片未更新：%s", rid, exc)
+        if raffle["status"] in ("DRAWN", "CANCELLED"):
+            settings = await asyncio.to_thread(self.store.group_settings, raffle["chat_id"])
+            if settings["pin_card"]:
+                await self.unpin(bot, raffle["chat_id"], raffle["card_message_id"])
 
     def refresh_card_soon(self, context, rid):
         # Joins come in bursts; a single edit a few seconds later covers all of them.
@@ -550,9 +634,8 @@ def build_application(settings):
     )
     app.add_handler(ChatMemberHandler(handlers.member_changed, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(ChatMemberHandler(menu.bot_membership, ChatMemberHandler.MY_CHAT_MEMBER))
-    app.job_queue.run_repeating(
-        handlers.auto_draw, interval=AUTO_DRAW_SECONDS, first=AUTO_DRAW_SECONDS
-    )
+    for job in (handlers.auto_draw, handlers.cleanup):
+        app.job_queue.run_repeating(job, interval=AUTO_DRAW_SECONDS, first=AUTO_DRAW_SECONDS)
     app.add_error_handler(on_error)
     return app
 

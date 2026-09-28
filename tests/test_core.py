@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from lottery.core import MIGRATIONS, LotteryError, Store, weighted_draw
+from lottery.core import GROUP_DEFAULTS, MIGRATIONS, LotteryError, Store, weighted_draw
 
 
 @pytest.fixture
@@ -488,3 +488,40 @@ def test_keyword_raffles(setup):
     assert store.keyword_raffles(-100, "hell") == []
     now[0] += 3600
     assert store.keyword_raffles(-100, "hello") == []
+
+
+def test_group_settings(setup):
+    store, _, _ = setup
+    store.remember_group(-100, "甲群")
+    assert store.group_settings(-100) == GROUP_DEFAULTS
+    assert store.group_settings(-999) == GROUP_DEFAULTS  # unknown groups get the defaults
+    store.set_group_setting(-100, "delete_keyword", None)
+    store.remember_group(-100, "甲群改名")  # renaming keeps the settings
+    assert store.group_settings(-100)["delete_keyword"] is None
+    store.migrate_chat(-100, -1001)
+    assert store.group_settings(-1001)["delete_keyword"] is None
+    with pytest.raises(LotteryError):
+        store.set_group_setting(-1001, "colour", "red")
+    with pytest.raises(LotteryError):
+        store.set_group_setting(-999, "pin_card", False)
+
+
+def test_pinned_result_swaps(setup):
+    store, _, _ = setup
+    store.remember_group(-100, "甲群")
+    assert store.swap_pinned_result(-100, 5) is None
+    assert store.swap_pinned_result(-100, 9) == 5
+
+
+def test_scheduled_deletions(setup):
+    store, _, now = setup
+    store.schedule_deletions(-100, [1, 2], now[0] + 60)
+    store.schedule_deletions(-200, range(150), now[0])
+    assert store.due_deletions() == {-200: list(range(100))}  # Telegram's batch size
+    store.drop_deletions(-200, range(150))
+    now[0] += 60
+    assert store.due_deletions() == {-100: [1, 2]}
+    now[0] += 48 * 3600  # too old to delete: dropped without trying
+    assert store.due_deletions() == {}
+    with store.transaction() as db:
+        assert db.execute("SELECT COUNT(*) FROM deletions").fetchone()[0] == 0

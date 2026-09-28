@@ -40,6 +40,13 @@ CONFIRM = {
     "freeze": "确定截止报名？截止后不能再报名。",
     "cancel": "确定取消这场抽奖？取消后不能恢复。",
 }
+# Group settings: button label and the values one press cycles through (first = default).
+SETTINGS = {
+    "pin_card": ("📌 置顶报名卡片", (True, False)),
+    "pin_result": ("📌 置顶开奖公告", (True, False)),
+    "delete_keyword": ("🧹 删除口令消息", (60, 0, 300, None)),
+    "delete_notices": ("🗑 删除机器人通知", (600, 60, 3600, None)),
+}
 NOT_MANAGER = "只有该群的管理员可以管理抽奖。"
 NOT_SUPER = "只有超级管理员可以设置中奖加成。"
 EXPIRED = "操作已过期，请重新开始。"
@@ -74,6 +81,16 @@ def parse_deadline(text, now, timezone):
             continue
         return moment.timestamp()
     raise LotteryError("看不懂这个时间，请按 2026-10-05 20:00 或 2小时 这样输入。")
+
+
+def setting_text(value):
+    if value is True or value is False:
+        return "开" if value else "关"
+    if value is None:
+        return "不删"
+    if value == 0:
+        return "立即"
+    return f"{value // 3600}小时后" if value >= 3600 else f"{value // 60}分钟后"
 
 
 def number(text, name, low, high):
@@ -127,14 +144,18 @@ class Menu:
         url = f"https://t.me/{bot.username}?startgroup=menu&admin=delete_messages+pin_messages"
         return InlineKeyboardButton("➕ 添加到群组", url=url)
 
-    async def welcome(self, bot, chat_id, text):
-        """Post a message in the group whose button opens that group's menu in private."""
+    async def welcome(self, bot, chat_id, text, trigger=None):
+        """Post a message in the group whose button opens that group's menu in private.
+        It is tidied away later, together with the /start that asked for it."""
         link = f"https://t.me/{bot.username}?start=g{chat_id}"
         markup = InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ 管理抽奖", url=link)]])
         try:
-            await bot.send_message(chat_id, text, reply_markup=markup)
+            sent = await bot.send_message(chat_id, text, reply_markup=markup)
         except TelegramError as exc:
             LOG.warning("群 %s 的欢迎消息发送失败：%s", chat_id, exc)
+            return
+        ids = [sent.message_id] if trigger is None else [trigger, sent.message_id]
+        await self.handlers.tidy(bot, chat_id, ids, "delete_notices")
 
     async def start(self, update, context):
         message, user, chat = update.effective_message, update.effective_user, update.effective_chat
@@ -142,7 +163,12 @@ class Menu:
             return
         if chat.type != "private":
             await asyncio.to_thread(self.store.remember_group, chat.id, chat.title or str(chat.id))
-            await self.welcome(context.bot, chat.id, "点击下面按钮管理本群抽奖（仅限群管理员）。")
+            await self.welcome(
+                context.bot,
+                chat.id,
+                "点击下面按钮管理本群抽奖（仅限群管理员）。",
+                message.message_id,
+            )
             return
         self._asking.pop(user.id, None)
         payload = context.args[0] if context.args else ""
@@ -227,6 +253,12 @@ class Menu:
             return await self.act(bot, user_id, args[0], int(args[1]))
         if action == "repost":
             return await self.repost(bot, user_id, int(args[0]))
+        if action in ("set", "sv"):
+            chat_id = int(args[0])
+            await self.require(bot, user_id, chat_id)
+            if action == "sv":
+                await self.cycle_setting(chat_id, args[1])
+            return await self.settings(bot, chat_id)
         if action in ("w", "wu", "ws", "wid", "wc", "export"):
             self.require_super(user_id)
             return await self.weight_action(bot, user_id, action, args)
@@ -258,7 +290,7 @@ class Menu:
                 button("➕ 发起抽奖", f"m:new:{chat_id}"),
                 button("📜 抽奖记录", f"m:list:{chat_id}:0"),
             ),
-            (button("🔄 切换群", "m:groups"),),
+            (button("⚙️ 抽奖设置", f"m:set:{chat_id}"), button("🔄 切换群", "m:groups")),
         )
 
     # Creation wizard. The draft survives restarts. Every question shows what is filled in so
@@ -495,6 +527,44 @@ class Menu:
             return "已创建，但没能发到群里。请确认我在群里并能发言，再到抽奖记录里重新发布。", back
         return "✅ 已发布到群。", back
 
+    # Group settings
+
+    async def settings(self, bot, chat_id):
+        title = await asyncio.to_thread(self.store.group_title, chat_id)
+        values = await asyncio.to_thread(self.store.group_settings, chat_id)
+        lines = [f"⚙️ {title} · 抽奖设置"]
+        try:
+            me = await bot.get_chat_member(chat_id, bot.id)
+        except TelegramError as exc:
+            LOG.warning("无法查询机器人在群 %s 的权限：%s", chat_id, exc)
+            lines.append("暂时查不到机器人在群里的权限。")
+        else:
+            admin = me.status == ChatMember.ADMINISTRATOR
+            rights = {
+                "置顶消息": admin and getattr(me, "can_pin_messages", False),
+                "删除消息": admin and getattr(me, "can_delete_messages", False),
+            }
+            lines.append(
+                "机器人权限：" + " · ".join(f"{k} {'✅' if v else '❌'}" for k, v in rights.items())
+            )
+            if not all(rights.values()):
+                lines.append("缺少的权限请群主在群管理员设置里给机器人打开，否则对应功能不生效。")
+        rows = [
+            (button(f"{label}：{setting_text(values[key])}", f"m:sv:{chat_id}:{key}"),)
+            for key, (label, _) in SETTINGS.items()
+        ]
+        return "\n".join(lines), keyboard(*rows, (button("⬅️ 返回", f"m:g:{chat_id}"),))
+
+    async def cycle_setting(self, chat_id, key):
+        choices = SETTINGS[key][1]
+        current = (await asyncio.to_thread(self.store.group_settings, chat_id))[key]
+        after = (
+            choices[(choices.index(current) + 1) % len(choices)]
+            if current in choices
+            else choices[0]
+        )
+        await asyncio.to_thread(self.store.set_group_setting, chat_id, key, after)
+
     # Records
 
     async def records(self, chat_id, page):
@@ -579,9 +649,11 @@ class Menu:
             if await asyncio.to_thread(self.store.cancel, rid, user_id):
                 await self.handlers.refresh_card(bot, rid)
                 try:
-                    await bot.send_message(chat_id, f"「{raffle['title']}」抽奖已取消。")
+                    sent = await bot.send_message(chat_id, f"「{raffle['title']}」抽奖已取消。")
                 except TelegramError as exc:
                     LOG.warning("抽奖 %s 的取消通知发送失败：%s", rid, exc)
+                else:
+                    await self.handlers.tidy(bot, chat_id, [sent.message_id], "delete_notices")
         else:
             raise ValueError(action)
         return await self.detail(bot, user_id, rid)

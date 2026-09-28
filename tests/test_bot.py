@@ -35,9 +35,29 @@ def setup(tmp_path):
     return store, rid, BotHandlers(store, {99}, SHANGHAI)
 
 
+def fake_bot(**methods):
+    """A bot whose API calls all succeed; tests replace or inspect the ones they need."""
+    names = (
+        "send_message",
+        "edit_message_text",
+        "pin_chat_message",
+        "unpin_chat_message",
+        "delete_messages",
+        "get_chat_member",
+    )
+    bot = SimpleNamespace(**{name: AsyncMock() for name in names})
+    bot.send_message.return_value = SimpleNamespace(message_id=88)
+    return SimpleNamespace(**vars(bot) | methods)
+
+
 def command_update(text, user_id=99, chat_type="private", chat_id=GROUP["id"]):
+    chat = SimpleNamespace(
+        type=chat_type, id=user_id if chat_type == "private" else chat_id, title="测试群"
+    )
     message = SimpleNamespace(
         text=text,
+        chat=chat,
+        message_id=10,
         sender_chat=None,
         reply_text=AsyncMock(return_value=SimpleNamespace(message_id=77)),
         reply_document=AsyncMock(),
@@ -45,12 +65,9 @@ def command_update(text, user_id=99, chat_type="private", chat_id=GROUP["id"]):
     update = SimpleNamespace(
         effective_message=message,
         effective_user=SimpleNamespace(id=user_id, is_bot=False),
-        effective_chat=SimpleNamespace(
-            type=chat_type, id=user_id if chat_type == "private" else chat_id, title="测试群"
-        ),
+        effective_chat=chat,
     )
-    bot = SimpleNamespace(edit_message_text=AsyncMock(), send_message=AsyncMock())
-    return update, SimpleNamespace(args=text.split()[1:], bot=bot)
+    return update, SimpleNamespace(args=text.split()[1:], bot=fake_bot())
 
 
 def run_command(handlers, text, user_id=99, chat_type="private", chat_id=GROUP["id"]):
@@ -69,7 +86,7 @@ def join_click(handlers, rid, get_chat_member, answer=None):
         answer=answer or AsyncMock(),
         from_user=SimpleNamespace(id=123, full_name="Alice", is_bot=False),
     )
-    context = SimpleNamespace(bot=SimpleNamespace(get_chat_member=get_chat_member))
+    context = SimpleNamespace(bot=fake_bot(get_chat_member=get_chat_member))
     asyncio.run(handlers.callback(SimpleNamespace(callback_query=query), context))
     return query.answer.call_args.args[0]
 
@@ -259,7 +276,7 @@ def test_build_application_offline(tmp_path, monkeypatch):
     assert len(app.handlers[0]) == 10
     assert app.concurrent_updates == 1
     assert {"chat_member", "my_chat_member"} <= set(ALLOWED_UPDATES)
-    assert [job.callback.__name__ for job in app.job_queue.jobs()] == ["auto_draw"]
+    assert [job.callback.__name__ for job in app.job_queue.jobs()] == ["auto_draw", "cleanup"]
 
 
 def test_missing_configuration_fails_closed(monkeypatch, tmp_path):
@@ -363,7 +380,7 @@ def test_weight_change_refreshes_published_card(setup):
     store, rid, handlers = setup
     run_command(handlers, f"/publish {rid}", chat_type="supergroup")
     store.rule(rid, 99, "vip", 2)
-    bot = SimpleNamespace(edit_message_text=AsyncMock())
+    bot = fake_bot()
     asyncio.run(handlers.refresh_card(bot, rid))
     assert bot.edit_message_text.await_args.kwargs["message_id"] == 77
     assert "本场设有中奖加成" in bot.edit_message_text.await_args.args[0]
@@ -394,7 +411,7 @@ def test_stale_button_answer_failure_keeps_join_and_stays_silent(setup):
 
 
 def telegram_update(payload):
-    bot = SimpleNamespace(answer_callback_query=AsyncMock(), send_message=AsyncMock())
+    bot = fake_bot(answer_callback_query=AsyncMock())
     update = Update.de_json({"update_id": 1, **payload}, None)
     for obj in (update.callback_query, update.effective_message):
         if obj is not None:
@@ -529,7 +546,7 @@ def due(tmp_path):
 
 
 def run_auto_draw(handlers, send=None):
-    bot = SimpleNamespace(send_message=send or AsyncMock())
+    bot = fake_bot(**({"send_message": send} if send else {}))
     asyncio.run(handlers.auto_draw(SimpleNamespace(bot=bot)))
     return bot.send_message
 
@@ -590,3 +607,11 @@ def test_result_names_each_winners_prize():
     }
     assert "1. A（ID：1） — iPhone" in result_text(result)
     assert '2. <a href="tg://user?id=2">B</a> — &lt;1usdt&gt;' in result_text(result, mention=True)
+
+
+def test_command_errors_in_groups_are_deleted_later(due):
+    store, _, now, handlers = due
+    run_command(handlers, "/new 1 60 x", user_id=123, chat_type="supergroup")  # not an admin
+    run_command(handlers, "/new 1 60 x", user_id=123)  # private chats are left alone
+    now[0] += 600
+    assert store.due_deletions() == {GROUP["id"]: [10, 77]}

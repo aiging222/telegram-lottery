@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from telegram import ChatMember
-from telegram.error import Forbidden
+from telegram.error import Forbidden, TimedOut
 
 from lottery.bot import BotHandlers
 from lottery.core import LotteryError, Store
@@ -32,11 +32,15 @@ def env(tmp_path):
         return SimpleNamespace(status=statuses.get((chat_id, user_id), ChatMember.LEFT))
 
     bot = SimpleNamespace(
+        id=4242,
         username="lottery_test_bot",
         get_chat_member=AsyncMock(side_effect=get_chat_member),
         send_message=AsyncMock(return_value=SimpleNamespace(message_id=500)),
         edit_message_text=AsyncMock(),
         send_document=AsyncMock(),
+        pin_chat_message=AsyncMock(),
+        unpin_chat_message=AsyncMock(),
+        delete_messages=AsyncMock(),
     )
     return SimpleNamespace(
         store=store, menu=Menu(handlers), handlers=handlers, bot=bot, now=now, statuses=statuses
@@ -74,7 +78,7 @@ def type_text(env, user_id, text):
 
 
 def start(env, user_id, *args, chat_type="private"):
-    message = SimpleNamespace(reply_text=AsyncMock())
+    message = SimpleNamespace(message_id=11, reply_text=AsyncMock())
     chat_id = user_id if chat_type == "private" else GROUP
     update = SimpleNamespace(
         effective_message=message,
@@ -255,7 +259,11 @@ def test_cancel_command_leaves_the_wizard(env):
 def say(env, user_id, text, chat_id=GROUP):
     """A group message, as the keyword handler sees it."""
     message = SimpleNamespace(
-        text=text, chat=SimpleNamespace(id=chat_id), sender_chat=None, set_reaction=AsyncMock()
+        text=text,
+        chat=SimpleNamespace(id=chat_id),
+        message_id=12,
+        sender_chat=None,
+        set_reaction=AsyncMock(),
     )
     user = SimpleNamespace(id=user_id, full_name=f"user{user_id}", is_bot=False)
     update = SimpleNamespace(effective_message=message, effective_user=user)
@@ -530,3 +538,137 @@ def test_group_admins_get_no_bonus_switch(env):
     _, buttons = shown(press(env, OWNER, "m:pub"))
     assert "⚖️ 设置加成" not in buttons
     assert "加成" not in env.bot.send_message.await_args.args[1]
+
+
+def test_settings_page(env):
+    env.bot.get_chat_member = AsyncMock(
+        return_value=SimpleNamespace(
+            status=ChatMember.ADMINISTRATOR, can_pin_messages=True, can_delete_messages=False
+        )
+    )
+    _, buttons = shown(press(env, ADMIN, f"m:g:{GROUP}"))
+    assert buttons["⚙️ 抽奖设置"] == f"m:set:{GROUP}"
+    text, buttons = shown(press(env, ADMIN, f"m:set:{GROUP}"))
+    assert text.startswith("⚙️ 测试群 · 抽奖设置\n机器人权限：置顶消息 ✅ · 删除消息 ❌\n缺少的权限")
+    assert env.bot.get_chat_member.await_args.args == (GROUP, 4242)
+    assert list(buttons) == [
+        "📌 置顶报名卡片：开",
+        "📌 置顶开奖公告：开",
+        "🧹 删除口令消息：1分钟后",
+        "🗑 删除机器人通知：10分钟后",
+        "⬅️ 返回",
+    ]
+    seen = []
+    for _ in range(4):
+        _, buttons = shown(press(env, ADMIN, f"m:sv:{GROUP}:delete_keyword"))
+        seen.append(next(label for label in buttons if label.startswith("🧹")))
+    assert seen == [
+        "🧹 删除口令消息：立即",
+        "🧹 删除口令消息：5分钟后",
+        "🧹 删除口令消息：不删",
+        "🧹 删除口令消息：1分钟后",
+    ]
+    _, buttons = shown(press(env, ADMIN, f"m:sv:{GROUP}:pin_card"))
+    assert "📌 置顶报名卡片：关" in buttons
+    assert not env.store.group_settings(GROUP)["pin_card"]
+
+
+def test_only_group_admins_change_settings(env):
+    query = press(env, MEMBER, f"m:sv:{GROUP}:pin_card")
+    assert query.answer.await_args.args[0] == NOT_MANAGER
+    assert env.store.group_settings(GROUP)["pin_card"]
+
+
+def sends(env, *ids):
+    env.bot.send_message = AsyncMock(side_effect=[SimpleNamespace(message_id=n) for n in ids])
+
+
+def pins(env):
+    return [call.args[1] for call in env.bot.pin_chat_message.await_args_list]
+
+
+def unpins(env):
+    return [call.kwargs["message_id"] for call in env.bot.unpin_chat_message.await_args_list]
+
+
+def test_cards_and_results_are_pinned(env):
+    sends(env, 500, 501, 502, 503)
+    fill_wizard(env, OWNER)
+    press(env, OWNER, "m:pub")  # card 500
+    assert env.bot.pin_chat_message.await_args.kwargs == {"disable_notification": True}
+    env.store.join(1, 1, "Alice")
+    press(env, OWNER, "m:do:draw:1")  # result 501
+    assert (pins(env), unpins(env)) == ([500, 501], [500])  # card off, result on
+    rid = env.store.create(OWNER, "第二场", 1, 60, chat_id=GROUP)
+    asyncio.run(env.handlers.publish_card(env.bot, rid))  # card 502
+    press(env, OWNER, f"m:do:draw:{rid}")  # result 503 replaces 501
+    assert (pins(env), unpins(env)) == ([500, 501, 502, 503], [500, 502, 501])
+
+
+def test_reposting_moves_the_pin(env):
+    sends(env, 500, 501)
+    rid = env.store.create(OWNER, "耳机", 1, 60, chat_id=GROUP)
+    asyncio.run(env.handlers.publish_card(env.bot, rid))
+    press(env, OWNER, f"m:repost:{rid}")
+    assert (pins(env), unpins(env)) == ([500, 501], [500])
+
+
+def test_nothing_is_pinned_when_switched_off(env):
+    env.store.set_group_setting(GROUP, "pin_card", False)
+    env.store.set_group_setting(GROUP, "pin_result", False)
+    rid = env.store.create(OWNER, "耳机", 1, 60, chat_id=GROUP)
+    asyncio.run(env.handlers.publish_card(env.bot, rid))
+    env.store.join(rid, 1, "Alice")
+    press(env, OWNER, f"m:do:draw:{rid}")
+    env.bot.pin_chat_message.assert_not_awaited()
+    env.bot.unpin_chat_message.assert_not_awaited()
+
+
+def run_cleanup(env):
+    asyncio.run(env.handlers.cleanup(SimpleNamespace(bot=env.bot)))
+
+
+def test_keyword_messages_are_deleted_later(env):
+    env.store.create(OWNER, "口令", 1, 60, chat_id=GROUP, keyword="hello")
+    say(env, 1, "hello")
+    run_cleanup(env)
+    env.bot.delete_messages.assert_not_awaited()
+    env.now[0] += 60
+    run_cleanup(env)
+    assert env.bot.delete_messages.await_args.args == (GROUP, [12])
+    assert env.store.due_deletions() == {}
+    say(env, 2, "no keyword here")
+    env.now[0] += 60
+    assert env.store.due_deletions() == {}  # other chatter is left alone
+
+
+def test_keyword_messages_deleted_at_once_or_kept(env):
+    env.store.create(OWNER, "口令", 2, 60, chat_id=GROUP, keyword="hello")
+    env.store.set_group_setting(GROUP, "delete_keyword", 0)
+    message = say(env, 1, "hello")
+    message.set_reaction.assert_not_awaited()  # it is gone before anyone sees a reaction
+    assert env.bot.delete_messages.await_args.args == (GROUP, [12])
+    env.store.set_group_setting(GROUP, "delete_keyword", None)
+    say(env, 2, "hello")
+    env.now[0] += 3600
+    assert env.store.due_deletions() == {}
+    assert env.bot.delete_messages.await_count == 1
+
+
+def test_group_notices_are_deleted_later(env):
+    start(env, MEMBER, chat_type="supergroup")  # the /start (11) and the welcome (500)
+    rid = env.store.create(OWNER, "耳机", 1, 60, chat_id=GROUP)
+    sends(env, 501)
+    press(env, OWNER, f"m:do:cancel:{rid}")  # the cancel notice (501)
+    env.now[0] += 600
+    assert env.store.due_deletions() == {GROUP: [11, 500, 501]}
+
+
+def test_failed_deletions_are_retried_only_when_worth_it(env):
+    env.store.schedule_deletions(GROUP, [1], env.now[0])
+    env.bot.delete_messages.side_effect = TimedOut()
+    run_cleanup(env)
+    assert env.store.due_deletions() == {GROUP: [1]}  # a network hiccup: try again
+    env.bot.delete_messages.side_effect = Forbidden("not enough rights")
+    run_cleanup(env)
+    assert env.store.due_deletions() == {}  # no right to delete: give up

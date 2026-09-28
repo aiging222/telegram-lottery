@@ -160,7 +160,24 @@ MIGRATIONS = [
     ALTER TABLE raffles ADD COLUMN prizes TEXT;
     ALTER TABLE raffles ADD COLUMN keyword TEXT
     """,
+    # 8: per-group settings (JSON over GROUP_DEFAULTS), the result the bot last pinned in
+    # each group, and group messages waiting to be deleted.
+    """
+    ALTER TABLE groups ADD COLUMN settings TEXT;
+    ALTER TABLE groups ADD COLUMN pinned_result INTEGER;
+    CREATE TABLE IF NOT EXISTS deletions (
+        chat_id INTEGER NOT NULL,
+        message_id INTEGER NOT NULL,
+        due_at REAL NOT NULL,
+        PRIMARY KEY (chat_id, message_id)
+    );
+    CREATE INDEX IF NOT EXISTS deletions_by_due ON deletions(due_at)
+    """,
 ]
+# Deletion delays are seconds after posting: 0 deletes at once, None keeps the message.
+GROUP_DEFAULTS = {"pin_card": True, "pin_result": True, "delete_keyword": 60, "delete_notices": 600}
+# Telegram lets bots delete group messages for 48 hours; older ones are given up on.
+DELETE_WINDOW = 47 * 3600
 MAX_PRIZES = 10
 MAX_KEYWORD = 32
 
@@ -718,7 +735,8 @@ class Store:
     def remember_group(self, chat_id, title, active=True):
         with self.transaction() as db:
             db.execute(
-                "INSERT INTO groups VALUES(?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET "
+                "INSERT INTO groups(chat_id,title,active,updated_at) VALUES(?,?,?,?) "
+                "ON CONFLICT(chat_id) DO UPDATE SET "
                 "title=excluded.title,active=excluded.active,updated_at=excluded.updated_at",
                 (chat_id, title, int(active), self.clock()),
             )
@@ -732,6 +750,62 @@ class Store:
                     "SELECT chat_id,title FROM groups WHERE active=1 ORDER BY title"
                 )
             ]
+
+    def group_settings(self, chat_id):
+        with self.transaction() as db:
+            row = db.execute("SELECT settings FROM groups WHERE chat_id=?", (chat_id,)).fetchone()
+        stored = json.loads(row["settings"]) if row and row["settings"] else {}
+        return {key: stored.get(key, value) for key, value in GROUP_DEFAULTS.items()}
+
+    def set_group_setting(self, chat_id, key, value):
+        if key not in GROUP_DEFAULTS:
+            raise LotteryError("没有这个设置。")
+        with self.transaction() as db:
+            row = db.execute("SELECT settings FROM groups WHERE chat_id=?", (chat_id,)).fetchone()
+            if row is None:
+                raise LotteryError("机器人还不在这个群里。")
+            stored = json.loads(row["settings"]) if row["settings"] else {}
+            stored[key] = value
+            db.execute("UPDATE groups SET settings=? WHERE chat_id=?", (encode(stored), chat_id))
+
+    def swap_pinned_result(self, chat_id, message_id):
+        """Remember the result just pinned in chat_id; returns the one pinned before."""
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT pinned_result FROM groups WHERE chat_id=?", (chat_id,)
+            ).fetchone()
+            db.execute("UPDATE groups SET pinned_result=? WHERE chat_id=?", (message_id, chat_id))
+        return row["pinned_result"] if row else None
+
+    def schedule_deletions(self, chat_id, message_ids, due_at):
+        with self.transaction() as db:
+            db.executemany(
+                "INSERT OR REPLACE INTO deletions VALUES(?,?,?)",
+                [(chat_id, message_id, due_at) for message_id in message_ids],
+            )
+
+    def due_deletions(self, limit=100):
+        """Messages due for deletion as {chat_id: [message_id, ...]}, at most `limit` per
+        chat (Telegram's batch size). Entries too old to delete any more are dropped."""
+        now = self.clock()
+        with self.transaction() as db:
+            db.execute("DELETE FROM deletions WHERE due_at<?", (now - DELETE_WINDOW,))
+            due = {}
+            for row in db.execute(
+                "SELECT chat_id,message_id FROM deletions WHERE due_at<=? ORDER BY due_at",
+                (now,),
+            ):
+                ids = due.setdefault(row["chat_id"], [])
+                if len(ids) < limit:
+                    ids.append(row["message_id"])
+            return due
+
+    def drop_deletions(self, chat_id, message_ids):
+        with self.transaction() as db:
+            db.executemany(
+                "DELETE FROM deletions WHERE chat_id=? AND message_id=?",
+                [(chat_id, message_id) for message_id in message_ids],
+            )
 
     def group_title(self, chat_id):
         with self.transaction() as db:
