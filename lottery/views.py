@@ -92,7 +92,6 @@ def result_text(result, mention=False):
             f"有效参与人数不足：原定 {result['requested_count']} 名，"
             f"实际抽出 {len(result['winners'])} 名。"
         )
-    lines.append(f"名单摘要：{result['snapshot_hash']}")
     return "\n".join(lines)
 
 

@@ -606,6 +606,7 @@ def test_result_names_each_winners_prize():
         "snapshot_hash": "h",
     }
     assert "1. A（ID：1） — iPhone" in result_text(result)
+    assert "摘要" not in result_text(result, mention=True)  # the digest stays in /export
     assert '2. <a href="tg://user?id=2">B</a> — &lt;1usdt&gt;' in result_text(result, mention=True)
 
 
