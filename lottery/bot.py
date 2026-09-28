@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 from telegram import BotCommand, ChatMember, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import ChatMigrated, TelegramError
+from telegram.error import BadRequest, ChatMigrated, Forbidden, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -29,6 +29,7 @@ MEMBER_STATUSES = {ChatMember.OWNER, ChatMember.ADMINISTRATOR, ChatMember.MEMBER
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 # chat_member carries leave/kick events; Telegram sends it only to bots that are group admins.
 ALLOWED_UPDATES = ["message", "callback_query", "chat_member"]
+AUTO_DRAW_SECONDS = 30  # how often raffles past their deadline are drawn and announced
 ADMIN_COMMANDS = {
     "new",
     "config",
@@ -78,7 +79,7 @@ PUBLIC_HELP = """🎲 加权抽奖机器人
 抽奖按权重随机抽取，每人最多中奖一次。权重为 0 不参与抽取。
 仅限发布群的成员报名，截止前退群会取消报名。
 规则加成由管理员核验后授予；管理员可在截止前覆盖个人权重。
-截止后名单与权重不可修改，由管理员执行开奖。"""
+截止后名单与权重不可修改，机器人会自动开奖并在发布群公布结果。"""
 ADMIN_HELP = """
 
 管理员命令（除发布和开奖外均在私聊使用）：
@@ -95,8 +96,9 @@ ADMIN_HELP = """
 /export 1 — 导出完整 JSON 及修改记录
 /publish 1 — 在目标群发布报名卡片，首次发布即绑定该群，仅限群成员报名
 （机器人需为群管理员，才能可靠查询成员身份并收到退群通知）
-/freeze 1 — 提前截止，冻结后不可撤销
-/draw 1 — 截止或冻结后开奖，并在当前聊天公布
+/freeze 1 — 提前截止报名，不可撤销
+/draw 1 — 报名截止后立即开奖，并在当前聊天公布
+（到截止时间会自动开奖并公布到发布群，不必手动执行）
 /raffles — 最近 20 场抽奖
 
 示例里的 1 是抽奖 ID，创建后请替换为实际 ID。"""
@@ -139,7 +141,7 @@ def name_text(text):
 
 
 def status_text(raffle):
-    return {"OPEN": "报名中", "FROZEN": "已冻结，等待开奖", "DRAWN": "已开奖"}[raffle["status"]]
+    return {"OPEN": "报名中", "FROZEN": "报名已截止", "DRAWN": "已开奖"}[raffle["status"]]
 
 
 def card(raffle, timezone):
@@ -215,11 +217,15 @@ def in_group(member):
     return member.status in MEMBER_STATUSES or getattr(member, "is_member", False)
 
 
-async def reply(message, text, markup=None):
+def chunks(text):
     # Keep even non-BMP characters below Telegram's UTF-16 length limit.
-    chunks = [text[i : i + 1500] for i in range(0, len(text), 1500)]
-    for index, chunk in enumerate(chunks):
-        await message.reply_text(chunk, reply_markup=markup if index == len(chunks) - 1 else None)
+    return [text[i : i + 1500] for i in range(0, len(text), 1500)]
+
+
+async def reply(message, text, markup=None):
+    parts = chunks(text)
+    for index, part in enumerate(parts):
+        await message.reply_text(part, reply_markup=markup if index == len(parts) - 1 else None)
 
 
 class BotHandlers:
@@ -291,16 +297,24 @@ class BotHandlers:
                 await asyncio.to_thread(self.store.override, rid, user.id, int(args[1]), value)
             elif command == "freeze":
                 frozen = await asyncio.to_thread(self.store.freeze, rid, user.id)
-                text = (
-                    f"抽奖 {rid} 已开奖，可使用 /result {rid} 查看已保存结果。"
-                    if frozen["status"] == "DRAWN"
-                    else f"抽奖 {rid} 已冻结，可使用 /draw {rid} 开奖。"
-                )
+                if frozen["status"] == "DRAWN":
+                    text = f"抽奖 {rid} 已开奖，可使用 /result {rid} 查看已保存结果。"
+                elif frozen["chat_id"] is not None:
+                    text = (
+                        f"抽奖 {rid} 报名已截止，到原定截止时间会自动开奖并公布到发布群；"
+                        f"也可以现在用 /draw {rid} 立即开奖。"
+                    )
+                else:
+                    text = f"抽奖 {rid} 报名已截止。它还没有发布到群，不会自动开奖，请用 /draw {rid} 开奖。"
                 await reply(message, text)
                 return
             elif command == "draw":
                 result = await asyncio.to_thread(self.store.draw, rid, user.id)
                 await reply(message, result_text(result))
+                # Drawn in the bound group itself: no automatic announcement needed there.
+                await asyncio.to_thread(
+                    self.store.mark_announced, rid, user.id, update.effective_chat.id
+                )
                 return
             elif command == "export":
                 exported = await asyncio.to_thread(self.store.export, rid)
@@ -409,6 +423,28 @@ class BotHandlers:
             change.date.timestamp(),
         )
 
+    async def auto_draw(self, context):
+        """Draw raffles past their deadline and announce each result once in its group."""
+        for rid, chat_id in await asyncio.to_thread(self.store.pending_announcements):
+            try:
+                result = await asyncio.to_thread(self.store.draw, rid, 0)
+                for part in chunks(result_text(result)):
+                    await context.bot.send_message(chat_id, part)
+            except ChatMigrated as exc:
+                # The group became a supergroup; announce there on the next pass.
+                await asyncio.to_thread(self.store.migrate_chat, chat_id, exc.new_chat_id)
+                continue
+            except (Forbidden, BadRequest) as exc:
+                # The bot was removed or the chat is gone: stop retrying. The result stays
+                # saved and can still be read with /result.
+                LOG.warning("抽奖 %s 的开奖结果无法发到群 %s：%s", rid, chat_id, exc)
+                await asyncio.to_thread(self.store.mark_announced, rid, 0, chat_id, str(exc))
+                continue
+            except TelegramError as exc:
+                LOG.warning("抽奖 %s 的开奖公告发送失败，稍后重试：%s", rid, exc)
+                continue
+            await asyncio.to_thread(self.store.mark_announced, rid, 0, chat_id)
+
     async def migrate(self, update, context):
         # Telegram sends one service message in the old group and one in the new supergroup.
         message = update.effective_message
@@ -488,6 +524,9 @@ def build_application(settings):
     app.add_handler(CallbackQueryHandler(handlers.callback, pattern=r"^(join|weight):[0-9]{1,19}$"))
     app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, handlers.migrate))
     app.add_handler(ChatMemberHandler(handlers.member_changed, ChatMemberHandler.CHAT_MEMBER))
+    app.job_queue.run_repeating(
+        handlers.auto_draw, interval=AUTO_DRAW_SECONDS, first=AUTO_DRAW_SECONDS
+    )
     app.add_error_handler(on_error)
     return app
 

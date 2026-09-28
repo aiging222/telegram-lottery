@@ -103,6 +103,13 @@ MIGRATIONS = [
     "ALTER TABLE raffles ADD COLUMN chat_id INTEGER",
     # 3: export and audit lookups filter by raffle.
     "CREATE INDEX IF NOT EXISTS audit_by_raffle ON audit(raffle_id)",
+    # 4: automatic draws announce each result in the bound group once. Raffles already
+    # drawn or past their deadline were handled by hand before this, so skip them.
+    """
+    ALTER TABLE raffles ADD COLUMN announced_at REAL;
+    UPDATE raffles SET announced_at = 0
+    WHERE result IS NOT NULL OR deadline <= CAST(strftime('%s', 'now') AS REAL)
+    """,
 ]
 
 
@@ -156,7 +163,7 @@ class Store:
     def _editable(self, db, raffle_id):
         raffle = self._get(db, raffle_id)
         if not self._open(raffle):
-            raise LotteryError("本场抽奖已截止或冻结，不能报名或修改权重。")
+            raise LotteryError("本场抽奖报名已截止，不能报名或修改权重。")
         return raffle
 
     def bind(self, raffle_id, actor, chat_id):
@@ -449,7 +456,7 @@ class Store:
             if raffle["result"]:
                 return json.loads(raffle["result"])
             if self._open(raffle):
-                raise LotteryError("尚未到截止时间。如需提前开奖，请先 /freeze 冻结名单。")
+                raise LotteryError("尚未到截止时间。如需提前开奖，请先 /freeze 截止报名。")
             raffle = self._freeze(db, raffle, actor)
             snapshot = json.loads(raffle["snapshot"])
             winners = weighted_draw(snapshot["entries"], raffle["winner_count"])
@@ -466,6 +473,31 @@ class Store:
             )
             self.audit(db, raffle_id, actor, "draw", result)
             return result
+
+    def pending_announcements(self):
+        """Group-bound raffles whose result is due in their group: past deadline, or drawn."""
+        with self.transaction() as db:
+            return [
+                (row["id"], row["chat_id"])
+                for row in db.execute(
+                    "SELECT id,chat_id FROM raffles WHERE chat_id IS NOT NULL "
+                    "AND announced_at IS NULL AND (result IS NOT NULL OR deadline<=?) "
+                    "ORDER BY deadline",
+                    (self.clock(),),
+                )
+            ]
+
+    def mark_announced(self, raffle_id, actor, chat_id, error=None):
+        """Record that the result reached its group (or never can); False if nothing was due."""
+        with self.transaction() as db:
+            cursor = db.execute(
+                "UPDATE raffles SET announced_at=? WHERE id=? AND chat_id=? "
+                "AND result IS NOT NULL AND announced_at IS NULL",
+                (self.clock(), raffle_id, chat_id),
+            )
+            if cursor.rowcount:
+                self.audit(db, raffle_id, actor, "announce", {"chat_id": chat_id, "error": error})
+            return cursor.rowcount == 1
 
     def recent(self):
         with self.transaction() as db:

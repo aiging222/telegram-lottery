@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from telegram import ChatMember, Update
-from telegram.error import BadRequest, ChatMigrated, Forbidden
+from telegram.error import BadRequest, ChatMigrated, Forbidden, TimedOut
 
 from lottery.bot import (
     ALLOWED_UPDATES,
@@ -123,7 +123,7 @@ def test_callback_registration_and_deadline(setup):
     assert "成功" in join_click(handlers, rid, member(ChatMember.MEMBER))
     assert "无需重复" in join_click(handlers, rid, member(ChatMember.MEMBER))
     store.freeze(rid, 99)
-    assert "冻结" in join_click(handlers, rid, member(ChatMember.MEMBER))
+    assert "报名已截止" in join_click(handlers, rid, member(ChatMember.MEMBER))
 
 
 def test_join_requires_group_binding(setup):
@@ -211,7 +211,7 @@ def test_personal_weight_zero_and_result_display(setup):
     assert "0.00%" in personal_weight(store.view(rid), 123)
     store.freeze(rid, 99)
     text, markup = card(store.view(rid), SHANGHAI)
-    assert "已冻结" in text
+    assert "状态：报名已截止" in text
     assert all(
         not b.callback_data.startswith("join:") for row in markup.inline_keyboard for b in row
     )
@@ -230,6 +230,7 @@ def test_build_application_offline(tmp_path, monkeypatch):
     assert len(app.handlers[0]) == 4
     assert app.concurrent_updates == 1
     assert "chat_member" in ALLOWED_UPDATES
+    assert [job.callback.__name__ for job in app.job_queue.jobs()] == ["auto_draw"]
 
 
 def test_missing_configuration_fails_closed(monkeypatch, tmp_path):
@@ -472,3 +473,62 @@ def test_raffles_lists_current_status(setup):
     _, rid, handlers = setup
     text = run_command(handlers, "/raffles").reply_text.call_args.args[0]
     assert f"{rid}｜测试抽奖｜报名中" in text
+
+
+@pytest.fixture
+def due(tmp_path):
+    now = [1_800_000_000.0]
+    store = Store(tmp_path / "auto.sqlite3", clock=lambda: now[0])
+    rid = store.create(99, "自动开奖", 1, 60)
+    store.bind(rid, 99, GROUP["id"])
+    store.join(rid, 123, "Alice")
+    return store, rid, now, BotHandlers(store, {99}, SHANGHAI)
+
+
+def run_auto_draw(handlers, send=None):
+    bot = SimpleNamespace(send_message=send or AsyncMock())
+    asyncio.run(handlers.auto_draw(SimpleNamespace(bot=bot)))
+    return bot.send_message
+
+
+def test_auto_draw_announces_once_after_deadline(due):
+    store, rid, now, handlers = due
+    run_auto_draw(handlers).assert_not_awaited()
+    now[0] += 3600
+    send = run_auto_draw(handlers)
+    assert send.await_args.args[0] == GROUP["id"]
+    assert "Alice" in send.await_args.args[1]
+    assert store.view(rid)["status"] == "DRAWN"
+    run_auto_draw(handlers).assert_not_awaited()
+
+
+def test_auto_draw_retries_after_network_error(due):
+    _, _, now, handlers = due
+    now[0] += 3600
+    run_auto_draw(handlers, AsyncMock(side_effect=TimedOut()))
+    assert run_auto_draw(handlers).await_count == 1
+
+
+def test_auto_draw_stops_when_bot_cannot_post(due):
+    store, rid, now, handlers = due
+    now[0] += 3600
+    run_auto_draw(handlers, AsyncMock(side_effect=Forbidden("bot was kicked")))
+    run_auto_draw(handlers).assert_not_awaited()
+    assert store.view(rid)["result"]["winners"][0]["user_id"] == 123
+    assert store.export(rid)["audit"][-1]["action"] == "announce"
+
+
+def test_auto_draw_follows_supergroup_upgrade(due):
+    _, _, now, handlers = due
+    now[0] += 3600
+    run_auto_draw(handlers, AsyncMock(side_effect=ChatMigrated(-1001)))
+    assert run_auto_draw(handlers).await_args.args[0] == -1001
+
+
+@pytest.mark.parametrize("chat_type, group_posts", [("supergroup", 0), ("private", 1)])
+def test_early_manual_draw_reaches_group_once(due, chat_type, group_posts):
+    store, rid, _, handlers = due
+    store.freeze(rid, 99)
+    run_command(handlers, f"/draw {rid}", chat_type=chat_type)
+    assert run_auto_draw(handlers).await_count == group_posts
+    run_auto_draw(handlers).assert_not_awaited()

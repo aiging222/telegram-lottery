@@ -285,6 +285,45 @@ def test_leave_is_judged_by_when_it_happened(setup):
     assert [e["user_id"] for e in store.view(rid)["entries"]] == [2]
 
 
+def test_auto_draw_bookkeeping(setup):
+    store, rid, now = setup
+    store.create(99, "never published", 1, 60)
+    store.bind(rid, 99, -100)
+    assert store.pending_announcements() == []
+    now[0] += 3600
+    assert store.pending_announcements() == [(rid, -100)]  # unpublished raffles are skipped
+    assert not store.mark_announced(rid, 0, -100)  # nothing drawn yet
+    store.draw(rid, 0)
+    assert not store.mark_announced(rid, 0, -200)  # not the raffle's group
+    assert store.mark_announced(rid, 0, -100)
+    assert not store.mark_announced(rid, 0, -100)
+    assert store.pending_announcements() == []
+    assert store.export(rid)["audit"][-1]["action"] == "announce"
+
+
+def test_upgrade_does_not_announce_raffles_already_past(tmp_path):
+    path = tmp_path / "v3.sqlite3"
+    db = sqlite3.connect(path)
+    for script in MIGRATIONS[:3]:
+        for statement in filter(str.strip, script.split(";")):
+            db.execute(statement)
+    db.execute("PRAGMA user_version = 3")
+    for title, deadline, result in [
+        ("drawn", 1.0, "{}"),
+        ("expired", 1.0, None),
+        ("future", 9e9, None),
+    ]:
+        db.execute(
+            "INSERT INTO raffles(title,winner_count,deadline,created_by,chat_id,result) "
+            "VALUES(?,1,?,99,-100,?)",
+            (title, deadline, result),
+        )
+    db.commit()
+    db.close()
+    store = Store(path, clock=lambda: 9e9 + 1)
+    assert store.pending_announcements() == [(3, -100)]
+
+
 def test_raffles_isolated(setup):
     store, rid, _ = setup
     other = store.create(99, "other", 1, 60)
