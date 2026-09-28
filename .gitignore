@@ -1,9 +1,10 @@
 .env
-.venv/
+.venv
+venv.nosync/
 __pycache__/
 *.pyc
 .pytest_cache/
 .ruff_cache/
 *.egg-info/
 data/
-
+.DS_Store

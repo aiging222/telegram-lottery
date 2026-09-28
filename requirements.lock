@@ -20,5 +20,7 @@ python-dotenv==1.2.3
     # via telegram-weighted-lottery (pyproject.toml)
 python-telegram-bot==22.8
     # via telegram-weighted-lottery (pyproject.toml)
+socksio==1.0.0
+    # via httpx
 typing-extensions==4.16.0
     # via anyio

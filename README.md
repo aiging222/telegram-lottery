@@ -16,6 +16,16 @@ cp .env.example .env
 
 也可以使用 [uv](https://docs.astral.sh/uv/)：执行 `uv sync` 按 `uv.lock` 创建 `.venv` 并安装项目和测试工具，再执行 `cp .env.example .env`。uv 创建的环境里没有 pip，下文命令改用 `uv run` 前缀，例如 `uv run python -m lottery.bot`。
 
+如果项目位于 iCloud 同步的「文稿」或「桌面」目录，iCloud 会给 `.venv` 里的文件加上隐藏标记，Python 会跳过被隐藏的 `.pth` 文件，导致 `lottery-bot` 命令找不到 `lottery` 模块。解决办法是把环境建在 iCloud 不同步的 `venv.nosync` 目录，再用 `.venv` 链接过去：
+
+```bash
+uv venv venv.nosync
+ln -s venv.nosync .venv
+uv sync
+```
+
+使用 SOCKS 代理（例如 `ALL_PROXY=socks5://…`）时，依赖里已包含所需的 `python-telegram-bot[socks]`。
+
 编辑本地 `.env`：
 
 ```dotenv

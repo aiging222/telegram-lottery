@@ -8,7 +8,8 @@ version = "0.1.0"
 description = "Telegram lottery with configurable weights and persistent draws"
 requires-python = ">=3.11"
 dependencies = [
-    "python-telegram-bot>=22.5,<23",
+    # socks: httpx needs socksio whenever ALL_PROXY points at a socks5:// proxy.
+    "python-telegram-bot[socks]>=22.5,<23",
     "python-dotenv>=1,<2",
 ]
 
