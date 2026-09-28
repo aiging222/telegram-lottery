@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from lottery.core import LotteryError, Store, weighted_draw
+from lottery.core import MIGRATIONS, LotteryError, Store, weighted_draw
 
 
 @pytest.fixture
@@ -226,6 +226,22 @@ def test_database_from_before_group_binding_is_upgraded(tmp_path):
     assert store.view(1)["chat_id"] is None
     store.bind(1, 99, -100)
     assert store.target_chat(1) == -100
+    with store.transaction() as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == len(MIGRATIONS)
+        assert db.execute("SELECT 1 FROM sqlite_master WHERE name='audit_by_raffle'").fetchone()
+
+
+def test_failed_migration_changes_nothing(tmp_path, monkeypatch):
+    path = tmp_path / "lottery.sqlite3"
+    Store(path)
+    broken = [*MIGRATIONS, "CREATE TABLE extra (x); SELECT * FROM missing"]
+    monkeypatch.setattr("lottery.core.MIGRATIONS", broken)
+    with pytest.raises(sqlite3.OperationalError):
+        Store(path)
+    db = sqlite3.connect(path)
+    assert db.execute("PRAGMA user_version").fetchone()[0] == len(MIGRATIONS)
+    assert db.execute("SELECT 1 FROM sqlite_master WHERE name='extra'").fetchone() is None
+    db.close()
 
 
 def test_raffles_isolated(setup):

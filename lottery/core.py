@@ -47,64 +47,81 @@ def weighted_draw(entries, count, randbelow=secrets.randbelow):
     return winners
 
 
+# Migration N upgrades a database from schema version N-1 (PRAGMA user_version) to N.
+# Append new migrations; never edit one that has shipped.
+MIGRATIONS = [
+    # 1: initial schema. IF NOT EXISTS lets unversioned databases from 0.1.0 pass through.
+    """
+    CREATE TABLE IF NOT EXISTS raffles (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        winner_count INTEGER NOT NULL,
+        deadline REAL NOT NULL,
+        default_weight INTEGER NOT NULL DEFAULT 1,
+        weight_cap INTEGER NOT NULL DEFAULT 100,
+        status TEXT NOT NULL DEFAULT 'OPEN',
+        created_by INTEGER NOT NULL,
+        snapshot TEXT,
+        snapshot_hash TEXT,
+        result TEXT
+    );
+    CREATE TABLE IF NOT EXISTS participants (
+        raffle_id INTEGER REFERENCES raffles(id),
+        user_id INTEGER NOT NULL,
+        display_name TEXT NOT NULL,
+        PRIMARY KEY (raffle_id, user_id)
+    );
+    CREATE TABLE IF NOT EXISTS rules (
+        raffle_id INTEGER REFERENCES raffles(id),
+        tag TEXT NOT NULL,
+        bonus INTEGER NOT NULL,
+        PRIMARY KEY (raffle_id, tag)
+    );
+    CREATE TABLE IF NOT EXISTS grants (
+        raffle_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        tag TEXT NOT NULL,
+        PRIMARY KEY (raffle_id, user_id, tag),
+        FOREIGN KEY (raffle_id, tag) REFERENCES rules(raffle_id, tag)
+    );
+    CREATE TABLE IF NOT EXISTS overrides (
+        raffle_id INTEGER REFERENCES raffles(id),
+        user_id INTEGER NOT NULL,
+        weight INTEGER NOT NULL,
+        PRIMARY KEY (raffle_id, user_id)
+    );
+    CREATE TABLE IF NOT EXISTS audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        raffle_id INTEGER REFERENCES raffles(id),
+        actor_id INTEGER NOT NULL,
+        action TEXT NOT NULL,
+        details TEXT NOT NULL,
+        at REAL NOT NULL
+    );
+    """,
+    # 2: group binding for member-only joins.
+    "ALTER TABLE raffles ADD COLUMN chat_id INTEGER",
+    # 3: export and audit lookups filter by raffle.
+    "CREATE INDEX IF NOT EXISTS audit_by_raffle ON audit(raffle_id)",
+]
+
+
 class Store:
     def __init__(self, path, clock=time.time):
         self.path = str(path)
         self.clock = clock
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self.transaction() as db:
-            db.executescript("""
-                CREATE TABLE IF NOT EXISTS raffles (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    title TEXT NOT NULL,
-                    winner_count INTEGER NOT NULL,
-                    deadline REAL NOT NULL,
-                    default_weight INTEGER NOT NULL DEFAULT 1,
-                    weight_cap INTEGER NOT NULL DEFAULT 100,
-                    status TEXT NOT NULL DEFAULT 'OPEN',
-                    created_by INTEGER NOT NULL,
-                    snapshot TEXT,
-                    snapshot_hash TEXT,
-                    result TEXT,
-                    chat_id INTEGER
-                );
-                CREATE TABLE IF NOT EXISTS participants (
-                    raffle_id INTEGER REFERENCES raffles(id),
-                    user_id INTEGER NOT NULL,
-                    display_name TEXT NOT NULL,
-                    PRIMARY KEY (raffle_id, user_id)
-                );
-                CREATE TABLE IF NOT EXISTS rules (
-                    raffle_id INTEGER REFERENCES raffles(id),
-                    tag TEXT NOT NULL,
-                    bonus INTEGER NOT NULL,
-                    PRIMARY KEY (raffle_id, tag)
-                );
-                CREATE TABLE IF NOT EXISTS grants (
-                    raffle_id INTEGER NOT NULL,
-                    user_id INTEGER NOT NULL,
-                    tag TEXT NOT NULL,
-                    PRIMARY KEY (raffle_id, user_id, tag),
-                    FOREIGN KEY (raffle_id, tag) REFERENCES rules(raffle_id, tag)
-                );
-                CREATE TABLE IF NOT EXISTS overrides (
-                    raffle_id INTEGER REFERENCES raffles(id),
-                    user_id INTEGER NOT NULL,
-                    weight INTEGER NOT NULL,
-                    PRIMARY KEY (raffle_id, user_id)
-                );
-                CREATE TABLE IF NOT EXISTS audit (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    raffle_id INTEGER REFERENCES raffles(id),
-                    actor_id INTEGER NOT NULL,
-                    action TEXT NOT NULL,
-                    details TEXT NOT NULL,
-                    at REAL NOT NULL
-                );
-            """)
-            columns = {row["name"] for row in db.execute("PRAGMA table_info(raffles)")}
-            if "chat_id" not in columns:  # databases created before group binding
-                db.execute("ALTER TABLE raffles ADD COLUMN chat_id INTEGER")
+            self._migrate(db)
+
+    def _migrate(self, db):
+        # Plain execute() keeps DDL inside the transaction, unlike executescript(), which
+        # commits first; a failed migration therefore leaves schema and version untouched.
+        version = db.execute("PRAGMA user_version").fetchone()[0]
+        for number, script in enumerate(MIGRATIONS[version:], version + 1):
+            for statement in filter(str.strip, script.split(";")):
+                db.execute(statement)
+            db.execute(f"PRAGMA user_version = {number}")
 
     @contextmanager
     def transaction(self):
