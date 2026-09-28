@@ -728,12 +728,15 @@ class Menu:
         for e in entries:
             chance = percent(e["weight"], total)
             people.append(
-                (e["user_id"], f"{name_text(e['display_name'])[:16]} · {e['weight']} · {chance}")
+                (
+                    e["user_id"],
+                    f"{name_text(e['display_name'])[:16]} · 权重 {e['weight']} · 概率 {chance}",
+                )
             )
         editable = raffle["status"] == "OPEN"
         if editable:
             presets = await asyncio.to_thread(self.store.presets, rid)
-            people += [(uid, f"ID {uid} · {weight}（未报名）") for uid, weight in presets]
+            people += [(uid, f"ID {uid} · 权重 {weight}（未报名）") for uid, weight in presets]
         shown = people[page * PAGE_SIZE : (page + 1) * PAGE_SIZE]
         rows = []
         if not people:
@@ -772,7 +775,7 @@ class Menu:
                 source = "、".join(f"{t['tag']} +{t['bonus']}" for t in entry["tags"]) or "默认"
             text = (
                 f"{name_text(entry['display_name'])}（ID：{uid}）\n"
-                f"权重 {entry['weight']} · 首轮 {percent(entry['weight'], total)} · {source}"
+                f"权重 {entry['weight']} · 概率 {percent(entry['weight'], total)} · {source}"
             )
             overridden = entry["override"] is not None
         else:

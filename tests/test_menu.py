@@ -444,20 +444,20 @@ def test_set_weights_with_buttons(weighted_env):
     env, rid = weighted_env, weighted_env.rid
     text, buttons = shown(press(env, ADMIN, f"m:w:{rid}:0"))
     assert text == "⚖️ 中奖加成 · 耳机  #1\n默认权重 1 · 上限 100\n已参与 2 人 · 已调整 0 人"
-    text, buttons = shown(press(env, ADMIN, buttons["Alice · 1 · 50%"]))
-    assert text == "Alice（ID：1）\n权重 1 · 首轮 50% · 默认"
+    text, buttons = shown(press(env, ADMIN, buttons["Alice · 权重 1 · 概率 50%"]))
+    assert text == "Alice（ID：1）\n权重 1 · 概率 50% · 默认"
     assert {"0 排除", "1", "2", "3", "5", "10", "其他"} <= set(buttons)
     assert "↩️ 恢复默认" not in buttons
     text, buttons = shown(press(env, ADMIN, buttons["3"]))
     assert text.endswith("已调整 1 人")
-    assert {"Alice · 3 · 75%", "Bob · 1 · 25%"} <= set(buttons)
+    assert {"Alice · 权重 3 · 概率 75%", "Bob · 权重 1 · 概率 25%"} <= set(buttons)
     card = env.bot.edit_message_text.await_args
     assert card.kwargs["message_id"] == 500
     assert "本场设有中奖加成" in card.args[0]  # the first weight adds the notice
-    text, buttons = shown(press(env, ADMIN, buttons["Alice · 3 · 75%"]))
+    text, buttons = shown(press(env, ADMIN, buttons["Alice · 权重 3 · 概率 75%"]))
     assert text.endswith("· 单独设置")
     _, buttons = shown(press(env, ADMIN, buttons["↩️ 恢复默认"]))
-    assert "Alice · 1 · 50%" in buttons
+    assert "Alice · 权重 1 · 概率 50%" in buttons
     assert env.bot.edit_message_text.await_count == 1  # the notice was already there
     assert env.store.view(rid)["weighted"]
 
@@ -468,11 +468,11 @@ def test_typed_weights_presets_and_defaults(weighted_env):
     assert text == "请输入权重（0～100），0 表示不参与抽取。"
     assert type_text(env, ADMIN, "abc")[0] == "权重需为 0～100 的整数，请重新输入。"
     text, buttons = type_text(env, ADMIN, "7")
-    assert "Alice · 7 · 88%" in buttons
+    assert "Alice · 权重 7 · 概率 88%" in buttons
     shown(press(env, ADMIN, f"m:wid:{rid}:0"))
     assert type_text(env, ADMIN, "12345")[0].startswith("请发送用户 ID 和权重")
     _, buttons = type_text(env, ADMIN, "12345 5")
-    text, buttons = shown(press(env, ADMIN, buttons["ID 12345 · 5（未报名）"]))
+    text, buttons = shown(press(env, ADMIN, buttons["ID 12345 · 权重 5（未报名）"]))
     assert text == "用户 12345（未报名）\n预设权重 5，报名后生效"
     text, _ = shown(press(env, ADMIN, f"m:wc:{rid}:0"))
     assert text.startswith("当前默认权重 1，上限 100。")
@@ -496,7 +496,9 @@ def test_weights_lock_when_signup_closes(weighted_env):
     env.store.override(rid, ADMIN, 1, 3)
     env.store.freeze(rid, ADMIN)
     text, buttons = shown(press(env, ADMIN, f"m:w:{rid}:0"))
-    assert text.endswith("报名已截止，权重已锁定。\nAlice · 3 · 75%\nBob · 1 · 25%")
+    assert text.endswith(
+        "报名已截止，权重已锁定。\nAlice · 权重 3 · 概率 75%\nBob · 权重 1 · 概率 25%"
+    )
     assert set(buttons) == {"📄 导出记录", "⬅️ 返回"}
     query = press(env, ADMIN, f"m:ws:{rid}:1:10:0")
     assert query.answer.await_args.args[0] == "报名已截止，权重已锁定。"
