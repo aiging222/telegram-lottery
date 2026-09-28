@@ -1,11 +1,14 @@
 """Text and cards shown in Telegram. Pure functions, no I/O."""
 
+import json
 from datetime import datetime
 from html import escape
+from io import BytesIO
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 STATUS = {"OPEN": "报名中", "FROZEN": "报名已截止", "DRAWN": "已开奖", "CANCELLED": "已取消"}
+EXPORT_CAPTION = "完整名单、规则、快照、开奖结果和管理员修改记录。"
 
 
 def name_text(text):
@@ -20,6 +23,13 @@ def when_text(timestamp, timezone):
     moment = datetime.fromtimestamp(timestamp, timezone)
     offset = f"{moment:%z}"  # per date, so daylight saving time shows correctly
     return f"{moment:%Y-%m-%d %H:%M}（UTC{offset[:3]}:{offset[3:]}）"
+
+
+def percent(weight, total):
+    """First-round chance, with enough digits that a real chance never shows as 0%."""
+    value = 100 * weight / total if total else 0
+    digits = 0 if value >= 10 or value == 0 else 1 if value >= 1 else 2
+    return f"{value:.{digits}f}%"
 
 
 def draw_rule(raffle, timezone):
@@ -82,3 +92,9 @@ def chunks(text, limit=1500):
         else:
             parts.extend(line[i : i + limit] for i in range(0, max(len(line), 1), limit))
     return parts
+
+
+def export_file(exported):
+    """The /export attachment as (file, file name)."""
+    raw = json.dumps(exported, ensure_ascii=False, indent=2).encode()
+    return BytesIO(raw), f"lottery-{exported['raffle']['id']}.json"

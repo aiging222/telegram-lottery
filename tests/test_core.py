@@ -410,3 +410,50 @@ def test_groups_and_drafts(setup):
     assert store.draft(7)[0] == -1001
     store.drop_draft(7)
     assert store.draft(7) is None
+
+
+def test_weighted_notice_stays_once_set(setup):
+    store, rid, now = setup
+    store.rule(rid, 99, "idle", 0)
+    assert not store.view(rid)["weighted"]  # a zero bonus changes nobody's odds
+    store.override(rid, 99, 123, 5)
+    store.override(rid, 99, 123, None)
+    assert store.view(rid)["weighted"]  # still on after the weight is taken back
+    now[0] += 3600
+    assert store.view(rid)["weighted"]  # and after the list is frozen
+    assert store.view(store.create(99, "开场即加权", 1, 60, weighted=True))["weighted"]
+    other = store.create(99, "规则", 1, 60)
+    store.rule(other, 99, "vip", 2)
+    assert store.view(other)["weighted"]
+
+
+def test_presets_are_weights_of_people_not_joined(setup):
+    store, rid, _ = setup
+    store.join(rid, 1, "one")
+    store.override(rid, 99, 1, 3)
+    store.override(rid, 99, 7, 5)
+    assert store.presets(rid) == [(7, 5)]
+    store.join(rid, 7, "seven")
+    assert store.presets(rid) == []
+    assert {e["user_id"]: e["weight"] for e in store.view(rid)["entries"]} == {1: 3, 7: 5}
+
+
+def test_upgrade_marks_raffles_that_already_had_weights(tmp_path):
+    path = tmp_path / "v5.sqlite3"
+    db = sqlite3.connect(path)
+    for script in MIGRATIONS[:5]:
+        for statement in filter(str.strip, script.split(";")):
+            db.execute(statement)
+    db.execute("PRAGMA user_version = 5")
+    for title in ("plain", "override", "bonus", "zero bonus"):
+        db.execute(
+            "INSERT INTO raffles(title,winner_count,deadline,created_by) VALUES(?,1,9e9,99)",
+            (title,),
+        )
+    db.execute("INSERT INTO overrides VALUES(2,123,5)")
+    db.execute("INSERT INTO rules VALUES(3,'vip',2)")
+    db.execute("INSERT INTO rules VALUES(4,'idle',0)")
+    db.commit()
+    db.close()
+    store = Store(path)
+    assert [store.view(rid)["weighted"] for rid in (1, 2, 3, 4)] == [False, True, True, False]

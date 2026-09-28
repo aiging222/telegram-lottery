@@ -129,6 +129,14 @@ MIGRATIONS = [
         updated_at REAL NOT NULL
     )
     """,
+    # 6: whether the group card says "本场设有中奖加成". Once any bonus or personal weight
+    # is set it stays on, so the notice never disappears from a card that showed it.
+    """
+    ALTER TABLE raffles ADD COLUMN weighted INTEGER NOT NULL DEFAULT 0;
+    UPDATE raffles SET weighted = 1
+    WHERE id IN (SELECT raffle_id FROM overrides)
+    OR id IN (SELECT raffle_id FROM rules WHERE bonus > 0)
+    """,
 ]
 
 
@@ -257,10 +265,20 @@ class Store:
             return ids
 
     def create(
-        self, actor, title, winner_count, minutes=None, *, deadline=None, chat_id=None, target=None
+        self,
+        actor,
+        title,
+        winner_count,
+        minutes=None,
+        *,
+        deadline=None,
+        chat_id=None,
+        target=None,
+        weighted=False,
     ):
         """Create a raffle ending after `minutes` or at `deadline`, or earlier once `target`
-        people have joined. Menus create it already bound to `chat_id`."""
+        people have joined. Menus create it already bound to `chat_id`; `weighted` shows the
+        bonus notice on the card from the start, before any weight is set."""
         integer(winner_count, "中奖名额", 1, 100)
         if not 1 <= len(title.strip()) <= 160:
             raise LotteryError("标题长度需为 1～160 字。")
@@ -274,9 +292,10 @@ class Store:
             elif not now + 60 <= deadline <= now + 525600 * 60:
                 raise LotteryError("开奖时间需在 1 分钟到 365 天之后。")
             cursor = db.execute(
-                "INSERT INTO raffles(title,winner_count,deadline,created_by,chat_id,target_count) "
-                "VALUES(?,?,?,?,?,?)",
-                (title.strip(), winner_count, deadline, actor, chat_id, target),
+                "INSERT INTO raffles"
+                "(title,winner_count,deadline,created_by,chat_id,target_count,weighted) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (title.strip(), winner_count, deadline, actor, chat_id, target, int(weighted)),
             )
             raffle_id = cursor.lastrowid
             self.audit(
@@ -290,6 +309,7 @@ class Store:
                     "winner_count": winner_count,
                     "chat_id": chat_id,
                     "target": target,
+                    "weighted": weighted,
                 },
             )
             return raffle_id
@@ -370,6 +390,8 @@ class Store:
                 "DO UPDATE SET bonus=excluded.bonus",
                 (raffle_id, tag, bonus),
             )
+            if bonus:
+                self._mark_weighted(db, raffle_id)
             self.audit(
                 db,
                 raffle_id,
@@ -425,6 +447,7 @@ class Store:
                     "DO UPDATE SET weight=excluded.weight",
                     (raffle_id, user_id, weight),
                 )
+                self._mark_weighted(db, raffle_id)
             self.audit(
                 db,
                 raffle_id,
@@ -432,6 +455,22 @@ class Store:
                 "override",
                 {"user_id": user_id, "before": before[0] if before else None, "after": weight},
             )
+
+    def _mark_weighted(self, db, raffle_id):
+        db.execute("UPDATE raffles SET weighted=1 WHERE id=?", (raffle_id,))
+
+    def presets(self, raffle_id):
+        """Personal weights of people who have not joined, as (user_id, weight)."""
+        with self.transaction() as db:
+            return [
+                (row["user_id"], row["weight"])
+                for row in db.execute(
+                    "SELECT o.user_id,o.weight FROM overrides o LEFT JOIN participants p "
+                    "ON p.raffle_id=o.raffle_id AND p.user_id=o.user_id "
+                    "WHERE o.raffle_id=? AND p.user_id IS NULL ORDER BY o.user_id",
+                    (raffle_id,),
+                )
+            ]
 
     def _entries(self, db, raffle):
         rid = raffle["id"]
@@ -516,7 +555,6 @@ class Store:
         if raffle["snapshot"]:
             snapshot = json.loads(raffle["snapshot"])
             raffle["entries"], raffle["rules"] = snapshot["entries"], snapshot["rules"]
-            overridden = any(e["override"] is not None for e in raffle["entries"])
         else:
             raffle["entries"] = self._entries(db, raffle)
             raffle["rules"] = [
@@ -525,11 +563,7 @@ class Store:
                     "SELECT tag,bonus FROM rules WHERE raffle_id=? ORDER BY tag", (raffle_id,)
                 )
             ]
-            overridden = bool(
-                db.execute("SELECT 1 FROM overrides WHERE raffle_id=?", (raffle_id,)).fetchone()
-            )
-        # Any bonus or personal weight makes the odds unequal, and the group card says so.
-        raffle["weighted"] = overridden or any(r["bonus"] for r in raffle["rules"])
+        raffle["weighted"] = bool(raffle["weighted"])
         raffle["result"] = json.loads(raffle["result"]) if raffle["result"] else None
         return raffle
 

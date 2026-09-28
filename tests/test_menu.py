@@ -36,6 +36,7 @@ def env(tmp_path):
         get_chat_member=AsyncMock(side_effect=get_chat_member),
         send_message=AsyncMock(return_value=SimpleNamespace(message_id=500)),
         edit_message_text=AsyncMock(),
+        send_document=AsyncMock(),
     )
     return SimpleNamespace(
         store=store, menu=Menu(handlers), handlers=handlers, bot=bot, now=now, statuses=statuses
@@ -324,3 +325,125 @@ def test_bot_added_without_admin_rights_asks_for_them(env):
     context = SimpleNamespace(bot=env.bot)
     asyncio.run(env.menu.bot_membership(SimpleNamespace(my_chat_member=change), context))
     assert env.bot.send_message.await_args.args[1].startswith("请把我设为管理员")
+
+
+@pytest.fixture
+def weighted_env(env):
+    rid = env.store.create(OWNER, "耳机", 1, 60, chat_id=GROUP)
+    env.store.set_card(rid, 500)
+    env.store.join(rid, 1, "Alice")
+    env.store.join(rid, 2, "Bob")
+    env.rid = rid
+    return env
+
+
+def test_only_super_admins_see_the_bonus_button(weighted_env):
+    env, rid = weighted_env, weighted_env.rid
+    _, buttons = shown(press(env, OWNER, f"m:r:{rid}"))
+    assert "⚖️ 中奖加成" not in buttons
+    _, buttons = shown(press(env, ADMIN, f"m:r:{rid}"))
+    assert buttons["⚖️ 中奖加成"] == f"m:w:{rid}:0"
+    for data in (f"m:w:{rid}:0", f"m:ws:{rid}:1:10:0", f"m:export:{rid}:0"):
+        assert (
+            press(env, OWNER, data).answer.await_args.args[0] == "只有超级管理员可以设置中奖加成。"
+        )
+    assert env.store.view(rid)["entries"][0]["override"] is None
+    env.bot.send_document.assert_not_awaited()
+
+
+def test_set_weights_with_buttons(weighted_env):
+    env, rid = weighted_env, weighted_env.rid
+    text, buttons = shown(press(env, ADMIN, f"m:w:{rid}:0"))
+    assert text == "⚖️ 中奖加成 · 耳机  #1\n默认权重 1 · 上限 100\n已参与 2 人 · 已调整 0 人"
+    text, buttons = shown(press(env, ADMIN, buttons["Alice · 1 · 50%"]))
+    assert text == "Alice（ID：1）\n权重 1 · 首轮 50% · 默认"
+    assert {"0 排除", "1", "2", "3", "5", "10", "其他"} <= set(buttons)
+    assert "↩️ 恢复默认" not in buttons
+    text, buttons = shown(press(env, ADMIN, buttons["3"]))
+    assert text.endswith("已调整 1 人")
+    assert {"Alice · 3 · 75%", "Bob · 1 · 25%"} <= set(buttons)
+    card = env.bot.edit_message_text.await_args
+    assert card.kwargs["message_id"] == 500
+    assert "本场设有中奖加成" in card.args[0]  # the first weight adds the notice
+    text, buttons = shown(press(env, ADMIN, buttons["Alice · 3 · 75%"]))
+    assert text.endswith("· 单独设置")
+    _, buttons = shown(press(env, ADMIN, buttons["↩️ 恢复默认"]))
+    assert "Alice · 1 · 50%" in buttons
+    assert env.bot.edit_message_text.await_count == 1  # the notice was already there
+    assert env.store.view(rid)["weighted"]
+
+
+def test_typed_weights_presets_and_defaults(weighted_env):
+    env, rid = weighted_env, weighted_env.rid
+    text, _ = shown(press(env, ADMIN, f"m:ws:{rid}:1:x:0"))
+    assert text == "请输入权重（0～100），0 表示不参与抽取。"
+    assert type_text(env, ADMIN, "abc")[0] == "权重需为 0～100 的整数，请重新输入。"
+    text, buttons = type_text(env, ADMIN, "7")
+    assert "Alice · 7 · 88%" in buttons
+    shown(press(env, ADMIN, f"m:wid:{rid}:0"))
+    assert type_text(env, ADMIN, "12345")[0].startswith("请发送用户 ID 和权重")
+    _, buttons = type_text(env, ADMIN, "12345 5")
+    text, buttons = shown(press(env, ADMIN, buttons["ID 12345 · 5（未报名）"]))
+    assert text == "用户 12345（未报名）\n预设权重 5，报名后生效"
+    text, _ = shown(press(env, ADMIN, f"m:wc:{rid}:0"))
+    assert text.startswith("当前默认权重 1，上限 100。")
+    assert type_text(env, ADMIN, "5 3")[0] == "默认权重不能超过上限。"
+    text, _ = type_text(env, ADMIN, "2 50")
+    assert "默认权重 2 · 上限 50" in text
+    weights = {e["user_id"]: e["weight"] for e in env.store.view(rid)["entries"]}
+    assert weights == {1: 7, 2: 2}
+
+
+def test_another_button_drops_the_typed_answer(weighted_env):
+    env, rid = weighted_env, weighted_env.rid
+    press(env, ADMIN, f"m:ws:{rid}:1:x:0")
+    press(env, ADMIN, f"m:w:{rid}:0")
+    assert type_text(env, ADMIN, "5")[0] == "发送 /start 打开菜单。"
+    assert env.store.view(rid)["entries"][0]["override"] is None
+
+
+def test_weights_lock_when_signup_closes(weighted_env):
+    env, rid = weighted_env, weighted_env.rid
+    env.store.override(rid, ADMIN, 1, 3)
+    env.store.freeze(rid, ADMIN)
+    text, buttons = shown(press(env, ADMIN, f"m:w:{rid}:0"))
+    assert text.endswith("报名已截止，权重已锁定。\nAlice · 3 · 75%\nBob · 1 · 25%")
+    assert set(buttons) == {"📄 导出记录", "⬅️ 返回"}
+    query = press(env, ADMIN, f"m:ws:{rid}:1:10:0")
+    assert query.answer.await_args.args[0] == "报名已截止，权重已锁定。"
+
+
+def test_export_goes_to_the_super_admin(weighted_env):
+    env, rid = weighted_env, weighted_env.rid
+    press(env, ADMIN, f"m:export:{rid}:0")
+    call = env.bot.send_document.await_args
+    assert call.args == (ADMIN,)
+    assert call.kwargs["filename"] == f"lottery-{rid}.json"
+
+
+def fill_wizard(env, user_id):
+    press(env, user_id, f"m:new:{GROUP}")
+    type_text(env, user_id, "坦克300")
+    press(env, user_id, "m:c:1")
+    press(env, user_id, "m:mode:t")
+    return shown(press(env, user_id, "m:t:1440"))
+
+
+def test_super_admins_can_publish_with_the_notice_from_the_start(env):
+    _, buttons = fill_wizard(env, ADMIN)
+    text, buttons = shown(press(env, ADMIN, buttons["⚖️ 中奖加成：关"]))
+    assert "\n本场设有中奖加成\n" in text
+    assert "⚖️ 中奖加成：开" in buttons
+    _, buttons = shown(press(env, ADMIN, "m:pub"))
+    (raffle,), _ = env.store.group_raffles(GROUP, 0, 8)
+    assert buttons["⚖️ 设置加成"] == f"m:w:{raffle['id']}:0"
+    assert "本场设有中奖加成" in env.bot.send_message.await_args.args[1]
+
+
+def test_group_admins_get_no_bonus_switch(env):
+    _, buttons = fill_wizard(env, OWNER)
+    assert not any(label.startswith("⚖️") for label in buttons)
+    assert press(env, OWNER, "m:wz").answer.await_args.args[0] == "只有超级管理员可以设置中奖加成。"
+    _, buttons = shown(press(env, OWNER, "m:pub"))
+    assert "⚖️ 设置加成" not in buttons
+    assert "加成" not in env.bot.send_message.await_args.args[1]

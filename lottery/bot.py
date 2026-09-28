@@ -1,11 +1,9 @@
 """Telegram command interface. Configuration is loaded only at startup."""
 
 import asyncio
-import json
 import logging
 import os
 from dataclasses import dataclass
-from io import BytesIO
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -23,7 +21,16 @@ from telegram.ext import (
 
 from lottery.core import LotteryError, Store, integer
 from lottery.menu import Menu
-from lottery.views import card, chunks, name_text, result_text, status_text
+from lottery.views import (
+    EXPORT_CAPTION,
+    card,
+    chunks,
+    export_file,
+    name_text,
+    percent,
+    result_text,
+    status_text,
+)
 
 LOG = logging.getLogger(__name__)
 MEMBER_STATUSES = {ChatMember.OWNER, ChatMember.ADMINISTRATOR, ChatMember.MEMBER}
@@ -79,7 +86,9 @@ PUBLIC_HELP = """🎁 抽奖机器人
 /id — 查看自己的用户 ID"""
 ADMIN_HELP = """
 
-超级管理员命令（除发布和开奖外均在私聊使用）：
+超级管理员命令（除发布和开奖外均在私聊使用）。
+权重也可以用按钮设置：/start → 我的群 → 抽奖记录 → 某场抽奖 → ⚖️ 中奖加成。
+
 /new 3 60 周末抽奖 — 创建活动，60 分钟后截止
 /config 1 1 100 — 默认权重 1，上限 100
 /rule 1 vip 2 — vip 规则加成 2
@@ -256,11 +265,9 @@ class BotHandlers:
                 return
             elif command == "export":
                 exported = await asyncio.to_thread(self.store.export, rid)
-                stream = BytesIO(json.dumps(exported, ensure_ascii=False, indent=2).encode())
+                document, filename = export_file(exported)
                 await message.reply_document(
-                    document=stream,
-                    filename=f"lottery-{rid}.json",
-                    caption="完整名单、规则、快照、开奖结果和管理员修改记录。",
+                    document=document, filename=filename, caption=EXPORT_CAPTION
                 )
                 return
             else:
@@ -294,11 +301,10 @@ class BotHandlers:
                     total = sum(p["weight"] for p in raffle["entries"])
                     lines = [f"抽奖 {rid}｜{status_text(raffle)}｜总权重 {total}"]
                     for p in raffle["entries"][:30]:
-                        chance = 100 * p["weight"] / total if total else 0
                         source = "个人覆盖" if p["override"] is not None else "规则"
                         lines.append(
                             f"{name_text(p['display_name'])} / {p['user_id']}："
-                            f"权重 {p['weight']}（{source}），首轮 {chance:.2f}%"
+                            f"权重 {p['weight']}（{source}），首轮 {percent(p['weight'], total)}"
                         )
                     lines.append("展示前 30 人。完整名单和记录使用 /export。")
                     await reply(message, "\n".join(lines))

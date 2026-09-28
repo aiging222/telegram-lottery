@@ -1,5 +1,6 @@
 """Button menus in private chat. Group admins create and manage their group's raffles;
-the super admins listed in ADMIN_USER_IDS may manage every group."""
+the super admins listed in ADMIN_USER_IDS may manage every group and alone see and set
+the weights."""
 
 import asyncio
 import logging
@@ -11,7 +12,7 @@ from telegram import ChatMember, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest, TelegramError
 
 from lottery.core import LotteryError, integer
-from lottery.views import draw_rule, name_text, status_text
+from lottery.views import EXPORT_CAPTION, draw_rule, export_file, name_text, percent, status_text
 
 LOG = logging.getLogger(__name__)
 MANAGERS = {ChatMember.OWNER, ChatMember.ADMINISTRATOR}
@@ -22,6 +23,7 @@ FULL_DEADLINE_MINUTES = 7 * 1440  # a raffle that never fills up still ends afte
 COUNTS = (1, 2, 3, 5, 10)
 DURATIONS = (("1小时", 60), ("6小时", 360), ("1天", 1440), ("3天", 4320), ("7天", 10080))
 TARGETS = (10, 50, 100)
+WEIGHTS = (0, 1, 2, 3, 5, 10)
 UNITS = {"分钟": 1, "分": 1, "m": 1, "小时": 60, "时": 60, "h": 60, "天": 1440, "d": 1440}
 CONFIRM = {
     "draw": "确定现在开奖？",
@@ -29,6 +31,7 @@ CONFIRM = {
     "cancel": "确定取消这场抽奖？取消后不能恢复。",
 }
 NOT_MANAGER = "只有该群的管理员可以管理抽奖。"
+NOT_SUPER = "只有超级管理员可以设置中奖加成。"
 EXPIRED = "操作已过期，请重新开始。"
 
 
@@ -75,6 +78,9 @@ class Menu:
         self.handlers = handlers
         self.store = handlers.store
         self._managers = {}  # (chat_id, user_id) -> (expires_at, allowed)
+        # user_id -> (kind, raffle_id, user_id or None, page): a weight page waiting for a
+        # typed answer. Any button press or /start drops it; a restart forgets it.
+        self._asking = {}
 
     # Permissions
 
@@ -95,6 +101,13 @@ class Menu:
     async def require(self, bot, user_id, chat_id):
         if chat_id is None or not await self.can_manage(bot, user_id, chat_id):
             raise LotteryError(NOT_MANAGER)
+
+    def is_super(self, user_id):
+        return user_id in self.handlers.admin_ids
+
+    def require_super(self, user_id):
+        if not self.is_super(user_id):
+            raise LotteryError(NOT_SUPER)
 
     # Entry points
 
@@ -121,6 +134,7 @@ class Menu:
             await asyncio.to_thread(self.store.remember_group, chat.id, chat.title or str(chat.id))
             await self.welcome(context.bot, chat.id, "点击下面按钮管理本群抽奖（仅限群管理员）。")
             return
+        self._asking.pop(user.id, None)
         payload = context.args[0] if context.args else ""
         if payload.startswith("g"):
             try:
@@ -161,6 +175,7 @@ class Menu:
         if query is None or query.from_user.is_bot:
             return
         action, *args = query.data.split(":")[1:]
+        self._asking.pop(query.from_user.id, None)
         try:
             text, markup = await self.route(context, query.from_user.id, action, args)
         except LotteryError as exc:
@@ -189,7 +204,7 @@ class Menu:
             return await self.wizard_start(bot, user_id, int(args[0]))
         if action == "quit":
             return await self.wizard_quit(user_id)
-        if action in ("c", "mode", "t", "f", "pub"):
+        if action in ("c", "mode", "t", "f", "pub", "wz"):
             return await self.wizard_step(bot, user_id, action, args[0] if args else "")
         if action == "list":
             await self.require(bot, user_id, int(args[0]))
@@ -202,6 +217,9 @@ class Menu:
             return await self.act(bot, user_id, args[0], int(args[1]))
         if action == "repost":
             return await self.repost(bot, user_id, int(args[0]))
+        if action in ("w", "wu", "ws", "wid", "wc", "export"):
+            self.require_super(user_id)
+            return await self.weight_action(bot, user_id, action, args)
         raise ValueError(action)
 
     # Group menu
@@ -253,6 +271,11 @@ class Menu:
         chat_id, data = found
         if action == "pub":
             return await self.publish(bot, user_id, chat_id, data)
+        if action == "wz":
+            self.require_super(user_id)
+            data["weighted"] = not data.get("weighted")
+            await asyncio.to_thread(self.store.save_draft, user_id, chat_id, data)
+            return self.next_prompt(data, user_id)
         if value == "x":
             data["step"] = {"c": "count", "t": "time", "f": "target"}[action]
             await asyncio.to_thread(self.store.save_draft, user_id, chat_id, data)
@@ -268,11 +291,15 @@ class Menu:
             data["target"] = integer(int(value), "满人开奖人数", data["count"], 100_000)
         data["step"] = None
         await asyncio.to_thread(self.store.save_draft, user_id, chat_id, data)
-        return self.next_prompt(data)
+        return self.next_prompt(data, user_id)
 
     async def text(self, update, context):
         """A typed answer to the current wizard step."""
         message, user = update.effective_message, update.effective_user
+        asking = self._asking.get(user.id)
+        if asking:
+            await self.weight_typed(context.bot, message, user.id, asking)
+            return
         found = await asyncio.to_thread(self.store.draft, user.id)
         if not found or not found[1].get("step"):
             await message.reply_text("发送 /start 打开菜单。")
@@ -285,7 +312,7 @@ class Menu:
             return
         data["step"] = None
         await asyncio.to_thread(self.store.save_draft, user.id, chat_id, data)
-        text, markup = self.next_prompt(data)
+        text, markup = self.next_prompt(data, user.id)
         await message.reply_text(text, reply_markup=markup)
 
     def typed(self, data, text):
@@ -314,7 +341,7 @@ class Menu:
             return "请输入开奖时间，例如 2026-10-05 20:00，或 90分钟、2小时、3天。"
         return f"请输入满多少人开奖（{data['count']}～100000）。"
 
-    def next_prompt(self, data):
+    def next_prompt(self, data, user_id):
         if "count" not in data:
             choices = [button(str(n), f"m:c:{n}") for n in COUNTS] + [button("其他", "m:c:x")]
             return "② 中奖人数", keyboard(*in_rows(choices, 3), CANCEL_ROW)
@@ -332,7 +359,12 @@ class Menu:
             return "④ 满多少人开奖？", keyboard(
                 *in_rows([*choices, button("其他", "m:f:x")], 4), CANCEL_ROW
             )
-        return self.summary(data), keyboard((button("✅ 发布到群", "m:pub"),), CANCEL_ROW)
+        bonus = ()
+        if self.is_super(user_id):
+            # Turning this on shows the bonus notice on the card from the very start, so it
+            # does not appear halfway through when the first weight is set.
+            bonus = (button(f"⚖️ 中奖加成：{'开' if data.get('weighted') else '关'}", "m:wz"),)
+        return self.summary(data), keyboard((button("✅ 发布到群", "m:pub"),), bonus, CANCEL_ROW)
 
     def deadline_of(self, data):
         if data.get("deadline"):
@@ -344,7 +376,8 @@ class Menu:
             {"deadline": self.deadline_of(data), "target_count": data.get("target")},
             self.handlers.timezone,
         )
-        return f"{data['title']}\n{data['count']} 人中奖 · {rule}\n确认后发布到群。"
+        bonus = "\n本场设有中奖加成" if data.get("weighted") else ""
+        return f"{data['title']}\n{data['count']} 人中奖 · {rule}{bonus}\n确认后发布到群。"
 
     async def publish(self, bot, user_id, chat_id, data):
         await self.require(bot, user_id, chat_id)
@@ -359,10 +392,12 @@ class Menu:
             deadline=data.get("deadline"),
             chat_id=chat_id,
             target=data.get("target"),
+            weighted=bool(data.get("weighted")) and self.is_super(user_id),
         )
         await asyncio.to_thread(self.store.drop_draft, user_id)
         back = keyboard(
-            (button("📜 抽奖记录", f"m:list:{chat_id}:0"), button("⬅️ 返回", f"m:g:{chat_id}"))
+            (button("⚖️ 设置加成", f"m:w:{rid}:0"),) if self.is_super(user_id) else (),
+            (button("📜 抽奖记录", f"m:list:{chat_id}:0"), button("⬅️ 返回", f"m:g:{chat_id}")),
         )
         try:
             await self.handlers.publish_card(bot, rid)
@@ -398,6 +433,8 @@ class Menu:
             f"{raffle['winner_count']} 人中奖 · 已参与 {len(raffle['entries'])} 人",
             draw_rule(raffle, self.handlers.timezone),
         ]
+        if raffle["weighted"]:
+            lines.append("本场设有中奖加成")
         if raffle["result"]:
             names = "、".join(name_text(w["display_name"]) for w in raffle["result"]["winners"])
             lines.append(f"中奖：{names or '无'}")
@@ -420,6 +457,8 @@ class Menu:
                     button("✖ 取消抽奖", f"m:ask:cancel:{rid}"),
                 )
             )
+        if self.is_super(user_id):
+            rows.append((button("⚖️ 中奖加成", f"m:w:{rid}:0"),))
         rows.append((button("⬅️ 返回", f"m:list:{raffle['chat_id']}:0"),))
         return "\n".join(lines), keyboard(*rows)
 
@@ -461,3 +500,159 @@ class Menu:
         except TelegramError as exc:
             raise LotteryError(f"发布失败：{exc}") from None
         return await self.detail(bot, user_id, rid)
+
+    # Weights, for super admins only (route() checks). Participants never see any of this;
+    # the group card only says whether the raffle is weighted.
+
+    async def weight_action(self, bot, user_id, action, args):
+        rid = int(args[0])
+        if action == "w":
+            return await self.weights(rid, int(args[1]))
+        if action == "export":
+            exported = await asyncio.to_thread(self.store.export, rid)
+            document, filename = export_file(exported)
+            await bot.send_document(
+                user_id, document=document, filename=filename, caption=EXPORT_CAPTION
+            )
+            return await self.weights(rid, int(args[1]))
+        raffle = await asyncio.to_thread(self.store.view, rid)
+        if raffle["status"] != "OPEN":
+            raise LotteryError(f"{status_text(raffle)}，权重已锁定。")
+        page = int(args[-1])
+        back = keyboard((button("⬅️ 返回", f"m:w:{rid}:{page}"),))
+        if action == "wid":
+            self._asking[user_id] = ("preset", rid, None, page)
+            return "发送用户 ID 和权重，用空格分开，例如：123456789 5", back
+        if action == "wc":
+            self._asking[user_id] = ("config", rid, None, page)
+            return (
+                f"当前默认权重 {raffle['default_weight']}，上限 {raffle['weight_cap']}。\n"
+                "发送新的默认权重和上限，用空格分开，例如：1 100"
+            ), back
+        uid = int(args[1])
+        if action == "wu":
+            return await self.person(raffle, uid, page)
+        value = args[2]
+        if value == "x":
+            self._asking[user_id] = ("weight", rid, uid, page)
+            back = keyboard((button("⬅️ 返回", f"m:wu:{rid}:{uid}:{page}"),))
+            return f"请输入权重（0～{raffle['weight_cap']}），0 表示不参与抽取。", back
+        weight = None if value == "a" else int(value)
+        await asyncio.to_thread(self.store.override, rid, user_id, uid, weight)
+        await self.weights_changed(bot, raffle)
+        return await self.weights(rid, page)
+
+    async def weights_changed(self, bot, before):
+        """The first bonus or personal weight adds the notice to the group card."""
+        if not before["weighted"]:
+            await self.handlers.refresh_card(bot, before["id"])
+
+    async def weights(self, rid, page):
+        raffle = await asyncio.to_thread(self.store.view, rid)
+        entries = raffle["entries"]
+        total = sum(e["weight"] for e in entries)
+        adjusted = sum(1 for e in entries if e["override"] is not None or e["tags"])
+        lines = [
+            f"⚖️ 中奖加成 · {raffle['title']}  #{rid}",
+            f"默认权重 {raffle['default_weight']} · 上限 {raffle['weight_cap']}",
+            f"已参与 {len(entries)} 人 · 已调整 {adjusted} 人",
+        ]
+        people = []
+        for e in entries:
+            chance = percent(e["weight"], total)
+            people.append(
+                (e["user_id"], f"{name_text(e['display_name'])[:16]} · {e['weight']} · {chance}")
+            )
+        editable = raffle["status"] == "OPEN"
+        if editable:
+            presets = await asyncio.to_thread(self.store.presets, rid)
+            people += [(uid, f"ID {uid} · {weight}（未报名）") for uid, weight in presets]
+        shown = people[page * PAGE_SIZE : (page + 1) * PAGE_SIZE]
+        rows = []
+        if not people:
+            lines.append("还没有人报名。")
+        if editable:
+            rows += [(button(label, f"m:wu:{rid}:{uid}:{page}"),) for uid, label in shown]
+        else:
+            lines.append(f"{status_text(raffle)}，权重已锁定。")
+            lines += [label for _, label in shown]
+        nav = []
+        if page:
+            nav.append(button("◂ 上一页", f"m:w:{rid}:{page - 1}"))
+        if len(people) > (page + 1) * PAGE_SIZE:
+            nav.append(button("下一页 ▸", f"m:w:{rid}:{page + 1}"))
+        rows.append(nav)
+        if editable:
+            rows.append(
+                (
+                    button("➕ 按用户 ID 设置", f"m:wid:{rid}:{page}"),
+                    button("⚙️ 默认与上限", f"m:wc:{rid}:{page}"),
+                )
+            )
+        rows.append(
+            (button("📄 导出记录", f"m:export:{rid}:{page}"), button("⬅️ 返回", f"m:r:{rid}"))
+        )
+        return "\n".join(lines), keyboard(*rows)
+
+    async def person(self, raffle, uid, page):
+        rid = raffle["id"]
+        total = sum(e["weight"] for e in raffle["entries"])
+        entry = next((e for e in raffle["entries"] if e["user_id"] == uid), None)
+        if entry:
+            if entry["override"] is not None:
+                source = "单独设置"
+            else:
+                source = "、".join(f"{t['tag']} +{t['bonus']}" for t in entry["tags"]) or "默认"
+            text = (
+                f"{name_text(entry['display_name'])}（ID：{uid}）\n"
+                f"权重 {entry['weight']} · 首轮 {percent(entry['weight'], total)} · {source}"
+            )
+            overridden = entry["override"] is not None
+        else:
+            preset = dict(await asyncio.to_thread(self.store.presets, rid)).get(uid)
+            overridden = preset is not None
+            text = f"用户 {uid}（未报名）\n" + (
+                f"预设权重 {preset}，报名后生效" if overridden else "没有预设权重"
+            )
+        choices = [
+            button("0 排除" if w == 0 else str(w), f"m:ws:{rid}:{uid}:{w}:{page}")
+            for w in WEIGHTS
+            if w <= raffle["weight_cap"]
+        ]
+        choices.append(button("其他", f"m:ws:{rid}:{uid}:x:{page}"))
+        return text, keyboard(
+            *in_rows(choices, 4),
+            (button("↩️ 恢复默认", f"m:ws:{rid}:{uid}:a:{page}"),) if overridden else (),
+            (button("⬅️ 返回", f"m:w:{rid}:{page}"),),
+        )
+
+    async def weight_typed(self, bot, message, user_id, asking):
+        kind, rid, uid, page = asking
+        parts = message.text.split()
+        try:
+            raffle = await asyncio.to_thread(self.store.view, rid)
+            cap = raffle["weight_cap"]
+            if kind == "weight":
+                weight = number(message.text.strip(), "权重", 0, cap)
+                await asyncio.to_thread(self.store.override, rid, user_id, uid, weight)
+            elif kind == "preset":
+                if len(parts) != 2 or not parts[0].isdigit():
+                    raise LotteryError("请发送用户 ID 和权重，用空格分开，例如：123456789 5")
+                weight = number(parts[1], "权重", 0, cap)
+                target = integer(int(parts[0]), "用户 ID", 1, 2**63 - 1)
+                await asyncio.to_thread(self.store.override, rid, user_id, target, weight)
+            else:
+                if len(parts) != 2:
+                    raise LotteryError("请发送默认权重和上限，用空格分开，例如：1 100")
+                default = number(parts[0], "默认权重", 0, 1_000_000)
+                cap = number(parts[1], "权重上限", 1, 1_000_000)
+                await asyncio.to_thread(self.store.configure, rid, user_id, default, cap)
+        except LotteryError as exc:
+            back = keyboard((button("⬅️ 返回", f"m:w:{rid}:{page}"),))
+            await message.reply_text(str(exc), reply_markup=back)
+            return
+        self._asking.pop(user_id, None)
+        if kind != "config":
+            await self.weights_changed(bot, raffle)
+        text, markup = await self.weights(rid, page)
+        await message.reply_text(text, reply_markup=markup)
