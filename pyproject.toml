@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "telegram-weighted-lottery"
+version = "0.1.0"
+description = "Telegram lottery with configurable weights and persistent draws"
+requires-python = ">=3.11"
+dependencies = [
+    "python-telegram-bot>=22.5,<23",
+    "python-dotenv>=1,<2",
+]
+
+# pip: `pip install -e '.[dev]'`. uv installs the matching group below by default,
+# so `uv sync` keeps the test tools. Keep the two lists identical.
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "ruff>=0.11,<1"]
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "ruff>=0.11,<1"]
+
+[project.scripts]
+lottery-bot = "lottery.bot:main"
+
+[tool.setuptools.packages.find]
+include = ["lottery*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+

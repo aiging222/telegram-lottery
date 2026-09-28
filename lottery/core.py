@@ -1,0 +1,404 @@
+"""Transactional storage and integer-weighted sampling without replacement."""
+
+import hashlib
+import json
+import re
+import secrets
+import sqlite3
+import time
+from contextlib import contextmanager
+from datetime import UTC, datetime
+from pathlib import Path
+
+
+class LotteryError(ValueError):
+    pass
+
+
+def integer(value, name, low=0, high=1_000_000):
+    if type(value) is not int or not low <= value <= high:
+        raise LotteryError(f"{name}必须为 {low}～{high} 的整数。")
+    return value
+
+
+def encode(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def weighted_draw(entries, count, randbelow=secrets.randbelow):
+    integer(count, "中奖名额", 1, 100)
+    pool = []
+    seen = set()
+    for entry in entries:
+        weight = integer(entry["weight"], "权重")
+        if entry["user_id"] in seen:
+            raise LotteryError("候选名单存在重复用户。")
+        seen.add(entry["user_id"])
+        if weight:
+            pool.append(dict(entry))
+    winners = []
+    for _ in range(min(count, len(pool))):
+        ticket = randbelow(sum(p["weight"] for p in pool))
+        for index, person in enumerate(pool):
+            if ticket < person["weight"]:
+                winners.append(pool.pop(index))
+                break
+            ticket -= person["weight"]
+    return winners
+
+
+class Store:
+    def __init__(self, path, clock=time.time):
+        self.path = str(path)
+        self.clock = clock
+        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        with self.transaction() as db:
+            db.executescript("""
+                CREATE TABLE IF NOT EXISTS raffles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    winner_count INTEGER NOT NULL,
+                    deadline REAL NOT NULL,
+                    default_weight INTEGER NOT NULL DEFAULT 1,
+                    weight_cap INTEGER NOT NULL DEFAULT 100,
+                    status TEXT NOT NULL DEFAULT 'OPEN',
+                    created_by INTEGER NOT NULL,
+                    snapshot TEXT,
+                    snapshot_hash TEXT,
+                    result TEXT
+                );
+                CREATE TABLE IF NOT EXISTS participants (
+                    raffle_id INTEGER REFERENCES raffles(id),
+                    user_id INTEGER NOT NULL,
+                    display_name TEXT NOT NULL,
+                    PRIMARY KEY (raffle_id, user_id)
+                );
+                CREATE TABLE IF NOT EXISTS rules (
+                    raffle_id INTEGER REFERENCES raffles(id),
+                    tag TEXT NOT NULL,
+                    bonus INTEGER NOT NULL,
+                    PRIMARY KEY (raffle_id, tag)
+                );
+                CREATE TABLE IF NOT EXISTS grants (
+                    raffle_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    tag TEXT NOT NULL,
+                    PRIMARY KEY (raffle_id, user_id, tag),
+                    FOREIGN KEY (raffle_id, tag) REFERENCES rules(raffle_id, tag)
+                );
+                CREATE TABLE IF NOT EXISTS overrides (
+                    raffle_id INTEGER REFERENCES raffles(id),
+                    user_id INTEGER NOT NULL,
+                    weight INTEGER NOT NULL,
+                    PRIMARY KEY (raffle_id, user_id)
+                );
+                CREATE TABLE IF NOT EXISTS audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    raffle_id INTEGER REFERENCES raffles(id),
+                    actor_id INTEGER NOT NULL,
+                    action TEXT NOT NULL,
+                    details TEXT NOT NULL,
+                    at REAL NOT NULL
+                );
+            """)
+
+    @contextmanager
+    def transaction(self):
+        db = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA foreign_keys = ON")
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            yield db
+            db.commit()
+        except BaseException:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def audit(self, db, raffle_id, actor, action, details):
+        db.execute(
+            "INSERT INTO audit(raffle_id,actor_id,action,details,at) VALUES(?,?,?,?,?)",
+            (raffle_id, actor, action, encode(details), self.clock()),
+        )
+
+    def _get(self, db, raffle_id):
+        row = db.execute("SELECT * FROM raffles WHERE id=?", (raffle_id,)).fetchone()
+        if row is None:
+            raise LotteryError("抽奖不存在。")
+        return dict(row)
+
+    def _editable(self, db, raffle_id):
+        raffle = self._get(db, raffle_id)
+        if raffle["status"] != "OPEN" or self.clock() >= raffle["deadline"]:
+            raise LotteryError("本场抽奖已截止或冻结，不能报名或修改权重。")
+        return raffle
+
+    def create(self, actor, title, winner_count, minutes):
+        integer(winner_count, "中奖名额", 1, 100)
+        integer(minutes, "报名时长（分钟）", 1, 525600)
+        if not 1 <= len(title.strip()) <= 160:
+            raise LotteryError("标题长度需为 1～160 字。")
+        with self.transaction() as db:
+            deadline = self.clock() + minutes * 60
+            cursor = db.execute(
+                "INSERT INTO raffles(title,winner_count,deadline,created_by) VALUES(?,?,?,?)",
+                (title.strip(), winner_count, deadline, actor),
+            )
+            raffle_id = cursor.lastrowid
+            self.audit(
+                db,
+                raffle_id,
+                actor,
+                "create",
+                {"title": title, "deadline": deadline, "winner_count": winner_count},
+            )
+            return raffle_id
+
+    def join(self, raffle_id, user_id, display_name):
+        integer(user_id, "用户 ID", 1, 2**63 - 1)
+        with self.transaction() as db:
+            self._editable(db, raffle_id)
+            cursor = db.execute(
+                "INSERT OR IGNORE INTO participants VALUES(?,?,?)",
+                (raffle_id, user_id, display_name[:128]),
+            )
+            return cursor.rowcount == 1
+
+    def configure(self, raffle_id, actor, default, cap):
+        integer(default, "默认权重")
+        integer(cap, "权重上限", 1)
+        if default > cap:
+            raise LotteryError("默认权重不能超过上限。")
+        with self.transaction() as db:
+            before = self._editable(db, raffle_id)
+            maximum = db.execute(
+                "SELECT MAX(weight) FROM overrides WHERE raffle_id=?", (raffle_id,)
+            ).fetchone()[0]
+            if maximum is not None and maximum > cap:
+                raise LotteryError("已有个人覆盖值高于新上限，请先调整个人权重。")
+            db.execute(
+                "UPDATE raffles SET default_weight=?,weight_cap=? WHERE id=?",
+                (default, cap, raffle_id),
+            )
+            self.audit(
+                db,
+                raffle_id,
+                actor,
+                "configure",
+                {
+                    "before": [before["default_weight"], before["weight_cap"]],
+                    "after": [default, cap],
+                },
+            )
+
+    def rule(self, raffle_id, actor, tag, bonus):
+        if not re.fullmatch(r"[A-Za-z0-9_\-]{1,32}", tag):
+            raise LotteryError("规则名限 1～32 位字母、数字、下划线和短横线。")
+        integer(bonus, "加成")
+        with self.transaction() as db:
+            self._editable(db, raffle_id)
+            before = db.execute(
+                "SELECT bonus FROM rules WHERE raffle_id=? AND tag=?", (raffle_id, tag)
+            ).fetchone()
+            db.execute(
+                "INSERT INTO rules VALUES(?,?,?) ON CONFLICT(raffle_id,tag) "
+                "DO UPDATE SET bonus=excluded.bonus",
+                (raffle_id, tag, bonus),
+            )
+            self.audit(
+                db,
+                raffle_id,
+                actor,
+                "rule",
+                {"tag": tag, "before": before[0] if before else None, "after": bonus},
+            )
+
+    def grant(self, raffle_id, actor, user_id, tag, enabled=True):
+        integer(user_id, "用户 ID", 1, 2**63 - 1)
+        with self.transaction() as db:
+            self._editable(db, raffle_id)
+            if not db.execute(
+                "SELECT 1 FROM rules WHERE raffle_id=? AND tag=?", (raffle_id, tag)
+            ).fetchone():
+                raise LotteryError("规则不存在，请先使用 /rule 添加。")
+            if enabled:
+                db.execute("INSERT OR IGNORE INTO grants VALUES(?,?,?)", (raffle_id, user_id, tag))
+            else:
+                db.execute(
+                    "DELETE FROM grants WHERE raffle_id=? AND user_id=? AND tag=?",
+                    (raffle_id, user_id, tag),
+                )
+            self.audit(
+                db,
+                raffle_id,
+                actor,
+                "grant" if enabled else "revoke",
+                {"user_id": user_id, "tag": tag},
+            )
+
+    def override(self, raffle_id, actor, user_id, weight):
+        integer(user_id, "用户 ID", 1, 2**63 - 1)
+        with self.transaction() as db:
+            raffle = self._editable(db, raffle_id)
+            if weight is not None:
+                integer(weight, "个人权重", 0, raffle["weight_cap"])
+            before = db.execute(
+                "SELECT weight FROM overrides WHERE raffle_id=? AND user_id=?", (raffle_id, user_id)
+            ).fetchone()
+            if weight is None:
+                db.execute(
+                    "DELETE FROM overrides WHERE raffle_id=? AND user_id=?", (raffle_id, user_id)
+                )
+            else:
+                db.execute(
+                    "INSERT INTO overrides VALUES(?,?,?) ON CONFLICT(raffle_id,user_id) "
+                    "DO UPDATE SET weight=excluded.weight",
+                    (raffle_id, user_id, weight),
+                )
+            self.audit(
+                db,
+                raffle_id,
+                actor,
+                "override",
+                {"user_id": user_id, "before": before[0] if before else None, "after": weight},
+            )
+
+    def _entries(self, db, raffle):
+        rid = raffle["id"]
+        people = db.execute(
+            "SELECT * FROM participants WHERE raffle_id=? ORDER BY user_id", (rid,)
+        ).fetchall()
+        overrides = dict(
+            db.execute("SELECT user_id,weight FROM overrides WHERE raffle_id=?", (rid,))
+        )
+        bonuses = {}
+        for row in db.execute(
+            "SELECT g.user_id,g.tag,r.bonus FROM grants g JOIN rules r "
+            "ON g.raffle_id=r.raffle_id AND g.tag=r.tag WHERE g.raffle_id=? "
+            "ORDER BY g.tag",
+            (rid,),
+        ):
+            bonuses.setdefault(row["user_id"], []).append(
+                {"tag": row["tag"], "bonus": row["bonus"]}
+            )
+        entries = []
+        for person in people:
+            uid = person["user_id"]
+            tags = bonuses.get(uid, [])
+            override = overrides.get(uid)
+            weight = (
+                override
+                if override is not None
+                else min(
+                    raffle["weight_cap"], raffle["default_weight"] + sum(t["bonus"] for t in tags)
+                )
+            )
+            entries.append(
+                {
+                    "user_id": uid,
+                    "display_name": person["display_name"],
+                    "weight": weight,
+                    "override": override,
+                    "tags": tags,
+                }
+            )
+        return entries
+
+    def _freeze(self, db, raffle, actor):
+        if raffle["status"] != "OPEN":
+            return raffle
+        snapshot = {
+            "raffle_id": raffle["id"],
+            "title": raffle["title"],
+            "winner_count": raffle["winner_count"],
+            "deadline": raffle["deadline"],
+            "default_weight": raffle["default_weight"],
+            "weight_cap": raffle["weight_cap"],
+            "rules": [
+                dict(r)
+                for r in db.execute(
+                    "SELECT tag,bonus FROM rules WHERE raffle_id=? ORDER BY tag", (raffle["id"],)
+                )
+            ],
+            "entries": self._entries(db, raffle),
+        }
+        raw = encode(snapshot)
+        digest = hashlib.sha256(raw.encode()).hexdigest()
+        db.execute(
+            "UPDATE raffles SET status='FROZEN',snapshot=?,snapshot_hash=? WHERE id=?",
+            (raw, digest, raffle["id"]),
+        )
+        self.audit(db, raffle["id"], actor, "freeze", {"snapshot_hash": digest})
+        return self._get(db, raffle["id"])
+
+    def freeze(self, raffle_id, actor):
+        with self.transaction() as db:
+            return self._freeze(db, self._get(db, raffle_id), actor)
+
+    def view(self, raffle_id):
+        with self.transaction() as db:
+            return self._view(db, raffle_id)
+
+    def _view(self, db, raffle_id):
+        raffle = self._get(db, raffle_id)
+        if self.clock() >= raffle["deadline"]:
+            raffle = self._freeze(db, raffle, 0)
+        if raffle["snapshot"]:
+            snapshot = json.loads(raffle["snapshot"])
+            raffle["entries"], raffle["rules"] = snapshot["entries"], snapshot["rules"]
+        else:
+            raffle["entries"] = self._entries(db, raffle)
+            raffle["rules"] = [
+                dict(r)
+                for r in db.execute(
+                    "SELECT tag,bonus FROM rules WHERE raffle_id=? ORDER BY tag", (raffle_id,)
+                )
+            ]
+        raffle["result"] = json.loads(raffle["result"]) if raffle["result"] else None
+        return raffle
+
+    def draw(self, raffle_id, actor):
+        with self.transaction() as db:
+            raffle = self._get(db, raffle_id)
+            if raffle["result"]:
+                return json.loads(raffle["result"])
+            if raffle["status"] == "OPEN" and self.clock() < raffle["deadline"]:
+                raise LotteryError("尚未到截止时间。如需提前开奖，请先 /freeze 冻结名单。")
+            raffle = self._freeze(db, raffle, actor)
+            snapshot = json.loads(raffle["snapshot"])
+            winners = weighted_draw(snapshot["entries"], raffle["winner_count"])
+            result = {
+                "raffle_id": raffle_id,
+                "title": raffle["title"],
+                "requested_count": raffle["winner_count"],
+                "winners": winners,
+                "snapshot_hash": raffle["snapshot_hash"],
+                "drawn_at": datetime.fromtimestamp(self.clock(), UTC).isoformat(),
+            }
+            db.execute(
+                "UPDATE raffles SET status='DRAWN',result=? WHERE id=?", (encode(result), raffle_id)
+            )
+            self.audit(db, raffle_id, actor, "draw", result)
+            return result
+
+    def recent(self):
+        with self.transaction() as db:
+            return [
+                dict(r)
+                for r in db.execute(
+                    "SELECT id,title,status,deadline FROM raffles ORDER BY id DESC LIMIT 20"
+                )
+            ]
+
+    def export(self, raffle_id):
+        with self.transaction() as db:
+            raffle = self._view(db, raffle_id)
+            audit = [
+                dict(r)
+                for r in db.execute(
+                    "SELECT * FROM audit WHERE raffle_id=? ORDER BY id", (raffle_id,)
+                )
+            ]
+        return {"raffle": raffle, "audit": audit}
