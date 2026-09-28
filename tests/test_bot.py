@@ -378,6 +378,21 @@ def test_startup_failure_keeps_cause_but_masks_token(monkeypatch, tmp_path):
     assert "SECRET" not in message
 
 
+def test_repeated_grant_and_missing_revoke_are_reported(setup):
+    store, rid, handlers = setup
+    run_command(handlers, f"/rule {rid} vip 2")
+    replies = [
+        run_command(handlers, text).reply_text.call_args.args[0]
+        for text in [f"/grant {rid} 123 vip"] * 2 + [f"/revoke {rid} 123 vip"] * 2
+    ]
+    assert "已保存" in replies[0]
+    assert "已有此条件" in replies[1]
+    assert "已保存" in replies[2]
+    assert "没有此条件" in replies[3]
+    actions = [e["action"] for e in store.export(rid)["audit"]]
+    assert (actions.count("grant"), actions.count("revoke")) == (1, 1)
+
+
 def test_raffles_lists_current_status(setup):
     _, rid, handlers = setup
     text = run_command(handlers, "/raffles").reply_text.call_args.args[0]

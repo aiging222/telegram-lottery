@@ -53,19 +53,22 @@ def test_rules_override_and_restore(setup):
     store.configure(rid, 99, 1, 5)
     store.rule(rid, 99, "vip", 2)
     store.rule(rid, 99, "task", 4)
-    store.grant(rid, 99, 123, "vip")
-    store.grant(rid, 99, 123, "vip")
-    store.grant(rid, 99, 123, "task")
+    assert store.grant(rid, 99, 123, "vip")
+    assert not store.grant(rid, 99, 123, "vip")
+    assert store.grant(rid, 99, 123, "task")
     assert store.join(rid, 123, "Alice")
     assert not store.join(rid, 123, "Renamed")
     assert store.view(rid)["entries"][0]["weight"] == 5
     store.override(rid, 99, 123, 0)
     assert store.view(rid)["entries"][0]["weight"] == 0
     store.override(rid, 99, 123, None)
-    store.grant(rid, 99, 123, "task", False)
+    assert store.grant(rid, 99, 123, "task", False)
+    assert not store.grant(rid, 99, 123, "task", False)
     assert store.view(rid)["entries"][0]["weight"] == 3
     store.rule(rid, 99, "vip", 3)
     assert store.view(rid)["entries"][0]["weight"] == 4
+    actions = [e["action"] for e in store.export(rid)["audit"]]
+    assert (actions.count("grant"), actions.count("revoke")) == (2, 1)
 
 
 def test_override_before_join_and_cap_validation(setup):

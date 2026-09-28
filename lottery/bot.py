@@ -249,9 +249,17 @@ class BotHandlers:
             elif command == "rule":
                 await asyncio.to_thread(self.store.rule, rid, user.id, args[1], int(args[2]))
             elif command in ("grant", "revoke"):
-                await asyncio.to_thread(
+                changed = await asyncio.to_thread(
                     self.store.grant, rid, user.id, int(args[1]), args[2], command == "grant"
                 )
+                if not changed:
+                    await reply(
+                        message,
+                        "该用户已有此条件，未做修改。"
+                        if command == "grant"
+                        else "该用户没有此条件，未做修改。",
+                    )
+                    return
             elif command == "weight":
                 value = None if args[2].lower() == "auto" else int(args[2])
                 await asyncio.to_thread(self.store.override, rid, user.id, int(args[1]), value)

@@ -282,12 +282,16 @@ class Store:
             ).fetchone():
                 raise LotteryError("规则不存在，请先使用 /rule 添加。")
             if enabled:
-                db.execute("INSERT OR IGNORE INTO grants VALUES(?,?,?)", (raffle_id, user_id, tag))
+                cursor = db.execute(
+                    "INSERT OR IGNORE INTO grants VALUES(?,?,?)", (raffle_id, user_id, tag)
+                )
             else:
-                db.execute(
+                cursor = db.execute(
                     "DELETE FROM grants WHERE raffle_id=? AND user_id=? AND tag=?",
                     (raffle_id, user_id, tag),
                 )
+            if cursor.rowcount == 0:
+                return False  # already granted, or nothing to revoke: no change to record
             self.audit(
                 db,
                 raffle_id,
@@ -295,6 +299,7 @@ class Store:
                 "grant" if enabled else "revoke",
                 {"user_id": user_id, "tag": tag},
             )
+            return True
 
     def override(self, raffle_id, actor, user_id, weight):
         integer(user_id, "用户 ID", 1, 2**63 - 1)
