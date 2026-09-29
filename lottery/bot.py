@@ -413,12 +413,14 @@ class BotHandlers:
             return
         # Judge by when the member left, not when the update arrives: after downtime a
         # leave from before the deadline still cancels the join if the list is not frozen.
-        await asyncio.to_thread(
+        left = await asyncio.to_thread(
             self.store.leave_group,
             change.chat.id,
             change.new_chat_member.user.id,
             change.date.timestamp(),
         )
+        for rid in left:
+            self.refresh_card_soon(context, rid)  # one fewer on the card
 
     async def after_join(self, context, rid):
         if await asyncio.to_thread(self.store.is_full, rid):

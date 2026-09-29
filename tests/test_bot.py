@@ -3,7 +3,7 @@ import logging
 import sys
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -547,6 +547,17 @@ def test_leaving_group_cancels_join(setup, status, fields, kept):
     left_at = store.view(rid)["deadline"] - 60
     asyncio.run(handlers.member_changed(member_update(status, left_at, **fields), None))
     assert len(store.view(rid)["entries"]) == int(kept)
+
+
+def test_leaving_group_updates_the_card(setup):
+    store, rid, handlers = setup
+    store.bind(rid, 99, GROUP["id"])
+    store.join(rid, 123, "Alice")
+    jobs = SimpleNamespace(get_jobs_by_name=lambda name: [], run_once=Mock())
+    left_at = store.view(rid)["deadline"] - 60
+    update = member_update(ChatMember.LEFT, left_at)
+    asyncio.run(handlers.member_changed(update, SimpleNamespace(job_queue=jobs)))
+    assert jobs.run_once.call_args.kwargs["name"] == f"card:{rid}"
 
 
 def test_rejoining_group_allows_joining_again(setup):
