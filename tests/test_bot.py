@@ -204,8 +204,31 @@ def test_join_follows_supergroup_upgrade(setup):
 def test_supergroup_upgrade_message_moves_binding(setup, message):
     store, rid, handlers = setup
     store.bind(rid, 99, -1)
-    asyncio.run(handlers.migrate(SimpleNamespace(effective_message=message), None))
+    context = SimpleNamespace(bot=fake_bot())
+    asyncio.run(handlers.migrate(SimpleNamespace(effective_message=message), context))
     assert store.view(rid)["chat_id"] == -1001
+    context.bot.send_message.assert_not_awaited()  # it never had a card to replace
+
+
+def test_supergroup_upgrade_reposts_open_cards(setup):
+    store, rid, handlers = setup
+    store.bind(rid, 99, -1)
+    store.set_card(rid, 500)
+    drawn = store.create(99, "已开奖", 1, 60, chat_id=-1)
+    store.set_card(drawn, 501)
+    store.freeze(drawn, 99)
+    store.draw(drawn, 99)
+    bot = fake_bot()
+    message = SimpleNamespace(chat=SimpleNamespace(id=-1), migrate_to_chat_id=-1001)
+    asyncio.run(
+        handlers.migrate(SimpleNamespace(effective_message=message), SimpleNamespace(bot=bot))
+    )
+    assert bot.send_message.await_count == 1  # the open raffle only
+    assert bot.send_message.await_args.args[0] == -1001
+    assert store.view(rid)["card_message_id"] == 88
+    assert store.view(drawn)["card_message_id"] is None
+    bot.pin_chat_message.assert_awaited_once()
+    bot.unpin_chat_message.assert_not_awaited()  # the old card is out of reach
 
 
 def test_publish_binds_first_group_only(setup):
@@ -726,3 +749,12 @@ def test_command_errors_in_groups_are_deleted_later(due):
     run_command(handlers, "/new 1 60 x", user_id=123)  # private chats are left alone
     now[0] += 600
     assert store.due_deletions() == {GROUP["id"]: [10, 77]}
+
+
+def test_messages_left_in_an_upgraded_group_are_given_up(due):
+    store, rid, now, handlers = due
+    store.schedule_deletions(GROUP["id"], [10], now[0])
+    bot = fake_bot(delete_messages=AsyncMock(side_effect=ChatMigrated(-1001)))
+    asyncio.run(handlers.cleanup(SimpleNamespace(bot=bot)))
+    assert store.due_deletions() == {}
+    assert store.view(rid)["chat_id"] == -1001

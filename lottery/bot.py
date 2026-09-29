@@ -143,16 +143,6 @@ class Settings:
         return cls(token, admins, os.environ.get("DATABASE_PATH", "data/lottery.sqlite3"), timezone)
 
 
-async def group_member(bot, store, chat_id, user_id):
-    """Ask Telegram whether user_id is in chat_id now, following a supergroup upgrade."""
-    try:
-        member = await bot.get_chat_member(chat_id, user_id)
-    except ChatMigrated as exc:
-        await asyncio.to_thread(store.migrate_chat, chat_id, exc.new_chat_id)
-        member = await bot.get_chat_member(exc.new_chat_id, user_id)
-    return in_group(member)
-
-
 def in_group(member):
     # Restricted users may still be in the group; only ChatMemberRestricted has is_member.
     return member.status in MEMBER_STATUSES or getattr(member, "is_member", False)
@@ -349,9 +339,7 @@ class BotHandlers:
             if action == "join":
                 chat_id = await asyncio.to_thread(self.store.target_chat, rid)
                 try:
-                    member = await group_member(
-                        context.bot, self.store, chat_id, query.from_user.id
-                    )
+                    member = await self.group_member(context.bot, chat_id, query.from_user.id)
                 except TelegramError as exc:
                     # Fail closed: without a definite answer nobody is let in.
                     LOG.warning("群成员校验失败：%s", exc)
@@ -452,7 +440,7 @@ class BotHandlers:
                 ]
             except ChatMigrated as exc:
                 # The group became a supergroup; announce there on the next pass.
-                await asyncio.to_thread(self.store.migrate_chat, chat_id, exc.new_chat_id)
+                await self.follow_migration(bot, chat_id, exc.new_chat_id)
                 return
             except (Forbidden, BadRequest) as exc:
                 # The bot was removed or the chat is gone: stop retrying. The result stays
@@ -538,6 +526,9 @@ class BotHandlers:
         """Delete messages; False only when it is worth trying again later."""
         try:
             await bot.delete_messages(chat_id, message_ids)
+        except ChatMigrated as exc:
+            # Messages left behind in a group upgraded to a supergroup cannot be deleted.
+            await self.follow_migration(bot, chat_id, exc.new_chat_id)
         except (Forbidden, BadRequest) as exc:
             # No right to delete, or the messages are gone or too old: give up on them.
             LOG.info("群 %s 删除消息失败：%s", chat_id, exc)
@@ -590,7 +581,28 @@ class BotHandlers:
             old, new = message.chat.id, message.migrate_to_chat_id
         else:
             old, new = message.migrate_from_chat_id, message.chat.id
-        await asyncio.to_thread(self.store.migrate_chat, old, new)
+        await self.follow_migration(context.bot, old, new)
+
+    async def follow_migration(self, bot, old_chat_id, new_chat_id):
+        """Follow a group's upgrade to a supergroup, which changes its chat ID. The cards stay
+        behind in the old group, so raffles still open get a new one in the supergroup."""
+        left_behind = await asyncio.to_thread(self.store.migrate_chat, old_chat_id, new_chat_id)
+        for rid in left_behind:
+            if (await asyncio.to_thread(self.store.view, rid))["status"] != "OPEN":
+                continue
+            try:
+                await self.publish_card(bot, rid)
+            except TelegramError as exc:
+                LOG.warning("抽奖 %s 的卡片未能发到升级后的群 %s：%s", rid, new_chat_id, exc)
+
+    async def group_member(self, bot, chat_id, user_id):
+        """Ask Telegram whether user_id is in chat_id now, following a supergroup upgrade."""
+        try:
+            member = await bot.get_chat_member(chat_id, user_id)
+        except ChatMigrated as exc:
+            await self.follow_migration(bot, chat_id, exc.new_chat_id)
+            member = await bot.get_chat_member(exc.new_chat_id, user_id)
+        return in_group(member)
 
 
 def redact(text, token):

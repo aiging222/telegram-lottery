@@ -278,25 +278,32 @@ class Store:
         return chat_id
 
     def migrate_chat(self, old_chat_id, new_chat_id):
-        """Follow Telegram's group-to-supergroup upgrade, which changes the chat ID."""
+        """Follow Telegram's group-to-supergroup upgrade, which changes the chat ID. The old
+        group's messages stay behind, out of the bot's reach, so cards, pins and deletions
+        there are forgotten. Returns the raffles whose card was left behind."""
         with self.transaction() as db:
-            ids = [
-                row["id"]
-                for row in db.execute("SELECT id FROM raffles WHERE chat_id=?", (old_chat_id,))
-            ]
-            db.execute("UPDATE raffles SET chat_id=? WHERE chat_id=?", (new_chat_id, old_chat_id))
+            rows = db.execute(
+                "SELECT id,card_message_id FROM raffles WHERE chat_id=?", (old_chat_id,)
+            ).fetchall()
             db.execute(
-                "UPDATE OR REPLACE groups SET chat_id=? WHERE chat_id=?", (new_chat_id, old_chat_id)
+                "UPDATE raffles SET chat_id=?,card_message_id=NULL WHERE chat_id=?",
+                (new_chat_id, old_chat_id),
+            )
+            db.execute(
+                "UPDATE OR REPLACE groups SET chat_id=?,pinned_result=NULL WHERE chat_id=?",
+                (new_chat_id, old_chat_id),
             )
             db.execute("UPDATE drafts SET chat_id=? WHERE chat_id=?", (new_chat_id, old_chat_id))
             db.execute(
                 "UPDATE OR REPLACE managers SET chat_id=? WHERE chat_id=?",
                 (new_chat_id, old_chat_id),
             )
-            for raffle_id in ids:
+            db.execute("DELETE FROM deletions WHERE chat_id=?", (old_chat_id,))
+            for row in rows:
                 self.audit(
-                    db, raffle_id, 0, "migrate_chat", {"before": old_chat_id, "after": new_chat_id}
+                    db, row["id"], 0, "migrate_chat", {"before": old_chat_id, "after": new_chat_id}
                 )
+            return [row["id"] for row in rows if row["card_message_id"] is not None]
 
     def leave_group(self, chat_id, user_id, left_at):
         """Cancel user_id's joins in raffles bound to chat_id that were still open at left_at.

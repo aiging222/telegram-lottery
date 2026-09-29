@@ -224,6 +224,20 @@ def test_group_binding_rules(setup):
     assert store.view(rid)["chat_id"] == -1001
 
 
+def test_supergroup_upgrade_forgets_messages_left_behind(setup):
+    store, rid, now = setup
+    store.bind(rid, 99, -100)
+    store.set_card(rid, 500)
+    store.create(99, "没有卡片", 1, 60, chat_id=-100)
+    store.remember_group(-100, "群")
+    store.swap_pinned_result(-100, 600)
+    store.schedule_deletions(-100, [700], now[0])
+    assert store.migrate_chat(-100, -1001) == [rid]  # the raffles whose card stayed behind
+    assert store.view(rid)["card_message_id"] is None
+    assert store.swap_pinned_result(-1001, 800) is None
+    assert store.due_deletions() == {}
+
+
 def test_database_from_before_group_binding_is_upgraded(tmp_path):
     path = tmp_path / "old.sqlite3"
     db = sqlite3.connect(path)
