@@ -67,19 +67,21 @@ def in_rows(buttons, width):
 CANCEL_ROW = (button("✖ 取消", "m:quit"),)
 
 
-def parse_deadline(text, now, timezone):
-    """'90分钟' / '2小时' / '3天' / '45' (minutes), or 'YYYY-MM-DD HH:MM' / 'MM-DD HH:MM'."""
+def parse_time(text, now, timezone):
+    """A typed answer to "when" as the draft field it fills: {"minutes": n} for '90分钟' /
+    '2小时' / '3天' / '45' (minutes), counted from publishing like the buttons, or
+    {"deadline": timestamp} for 'YYYY-MM-DD HH:MM' / 'MM-DD HH:MM'."""
     text = " ".join(text.replace("：", ":").split())
     match = re.fullmatch(r"(\d{1,6}) ?(分钟|分|小时|时|天|m|h|d)?", text, re.IGNORECASE)
     if match:
-        return now + int(match[1]) * UNITS[(match[2] or "分钟").lower()] * 60
+        return {"minutes": int(match[1]) * UNITS[(match[2] or "分钟").lower()]}
     year = datetime.fromtimestamp(now, timezone).year
     for candidate in (text, f"{year}-{text}"):
         try:
             moment = datetime.strptime(candidate, "%Y-%m-%d %H:%M").replace(tzinfo=timezone)
         except ValueError:
             continue
-        return moment.timestamp()
+        return {"deadline": moment.timestamp()}
     raise LotteryError("看不懂这个时间，请按 2026-10-05 20:00 或 2小时 这样输入。")
 
 
@@ -385,10 +387,11 @@ class Menu:
             data["minutes"] = integer(int(value), "报名时长（分钟）", 1, 525600)
         elif step == "time":
             now = self.store.clock()
-            deadline = parse_deadline(value, now, self.handlers.timezone)
+            when = parse_time(value, now, self.handlers.timezone)
+            deadline = when["deadline"] if "deadline" in when else now + when["minutes"] * 60
             if not now + 60 <= deadline <= now + 525600 * 60:
                 raise LotteryError("开奖时间需在 1 分钟到 365 天之后，请重新输入。")
-            data["deadline"] = deadline
+            data.update(when)
         elif step == "target":
             data["target"] = number(value, "满人开奖人数", total, 100_000)
         elif step == "join":
@@ -501,6 +504,12 @@ class Menu:
         await self.require(bot, user_id, chat_id)
         if data.get("step") or "title" not in data:
             raise LotteryError("请先完成当前步骤。")
+        if data.get("deadline") and data["deadline"] < self.store.clock() + 60:
+            # The date typed has come while the draft waited: ask when to draw again.
+            data.pop("deadline")
+            data.pop("minutes", None)
+            text, markup = await self.advance(user_id, chat_id, data)
+            return "⚠️ 填写的开奖时间已经过了，请重新填写。\n\n" + text, markup
         prizes = data["prizes"]
         rid = await asyncio.to_thread(
             self.store.create,

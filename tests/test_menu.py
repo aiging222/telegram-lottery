@@ -10,7 +10,7 @@ from telegram.error import Forbidden, TimedOut
 
 from lottery.bot import BotHandlers
 from lottery.core import LotteryError, Store
-from lottery.menu import NOT_MANAGER, Menu, parse_deadline
+from lottery.menu import NOT_MANAGER, Menu, parse_time
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 NOW = 1_800_000_000.0  # 2027-01-15 16:00 in Shanghai
@@ -228,6 +228,38 @@ def test_wizard_typed_deadline(env):
     assert "├ 开奖时间：2027-01-20 20:00（UTC+08:00）" in text
 
 
+def test_typed_duration_counts_from_publishing(env):
+    press(env, OWNER, f"m:new:{GROUP}")
+    type_text(env, OWNER, "耳机")
+    press(env, OWNER, "m:c:1")
+    press(env, OWNER, "m:mode:t")
+    type_text(env, OWNER, "30分钟")
+    press(env, OWNER, "m:j:b")
+    press(env, OWNER, "m:tt")
+    env.now[0] += 3600  # the admin comes back to the confirmation page an hour later
+    assert shown(press(env, OWNER, "m:pub"))[0] == "✅ 已发布到群。"
+    assert env.store.view(1)["deadline"] == env.now[0] + 1800
+
+
+def test_typed_date_that_has_passed_is_asked_again(env):
+    press(env, OWNER, f"m:new:{GROUP}")
+    type_text(env, OWNER, "耳机")
+    press(env, OWNER, "m:c:1")
+    press(env, OWNER, "m:mode:t")
+    type_text(env, OWNER, "01-15 17:00")
+    press(env, OWNER, "m:j:b")
+    press(env, OWNER, "m:tt")
+    env.now[0] += 7200  # 18:00, the time typed is gone
+    text, buttons = shown(press(env, OWNER, "m:pub"))
+    assert text.startswith("⚠️ 填写的开奖时间已经过了，请重新填写。\n\n" + HEADER)
+    assert "├ 开奖时间" not in text
+    assert text.endswith("🕒 现在是 2027-01-15 18:00（UTC+08:00）")
+    text, _ = shown(press(env, OWNER, buttons["1小时"]))
+    assert text.endswith("发布到「测试群」？")
+    assert shown(press(env, OWNER, "m:pub"))[0] == "✅ 已发布到群。"
+    assert env.store.view(1)["deadline"] == env.now[0] + 3600
+
+
 def test_wizard_can_publish_to_another_group(env):
     env.store.remember_group(-200, "二群")
     env.store.remember_group(-300, "别人的群")
@@ -286,22 +318,22 @@ def test_joining_by_keyword(env):
 @pytest.mark.parametrize(
     "typed, expected",
     [
-        ("90分钟", NOW + 5400),
-        ("2小时", NOW + 7200),
-        ("3天", NOW + 259200),
-        ("45", NOW + 2700),
-        ("2 H", NOW + 7200),
-        ("2027-01-20 20:00", datetime(2027, 1, 20, 20, tzinfo=SHANGHAI).timestamp()),
-        ("01-20 20：00", datetime(2027, 1, 20, 20, tzinfo=SHANGHAI).timestamp()),
+        ("90分钟", {"minutes": 90}),
+        ("2小时", {"minutes": 120}),
+        ("3天", {"minutes": 4320}),
+        ("45", {"minutes": 45}),
+        ("2 H", {"minutes": 120}),
+        ("2027-01-20 20:00", {"deadline": datetime(2027, 1, 20, 20, tzinfo=SHANGHAI).timestamp()}),
+        ("01-20 20：00", {"deadline": datetime(2027, 1, 20, 20, tzinfo=SHANGHAI).timestamp()}),
     ],
 )
-def test_parse_deadline(typed, expected):
-    assert parse_deadline(typed, NOW, SHANGHAI) == expected
+def test_parse_time(typed, expected):
+    assert parse_time(typed, NOW, SHANGHAI) == expected
 
 
-def test_parse_deadline_rejects_nonsense():
+def test_parse_time_rejects_nonsense():
     with pytest.raises(LotteryError):
-        parse_deadline("明天晚上", NOW, SHANGHAI)
+        parse_time("明天晚上", NOW, SHANGHAI)
 
 
 def test_wizard_can_be_abandoned_and_expires(env):
