@@ -173,6 +173,15 @@ MIGRATIONS = [
     );
     CREATE INDEX IF NOT EXISTS deletions_by_due ON deletions(due_at)
     """,
+    # 9: the groups each user was last seen managing, so that "我的群" asks Telegram about
+    # those only instead of every group the bot is in.
+    """
+    CREATE TABLE IF NOT EXISTS managers (
+        chat_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        PRIMARY KEY (chat_id, user_id)
+    )
+    """,
 ]
 # Deletion delays are seconds after posting: 0 deletes at once, None keeps the message.
 GROUP_DEFAULTS = {"pin_card": True, "pin_result": True, "delete_keyword": 60, "delete_notices": 600}
@@ -280,6 +289,10 @@ class Store:
                 "UPDATE OR REPLACE groups SET chat_id=? WHERE chat_id=?", (new_chat_id, old_chat_id)
             )
             db.execute("UPDATE drafts SET chat_id=? WHERE chat_id=?", (new_chat_id, old_chat_id))
+            db.execute(
+                "UPDATE OR REPLACE managers SET chat_id=? WHERE chat_id=?",
+                (new_chat_id, old_chat_id),
+            )
             for raffle_id in ids:
                 self.audit(
                     db, raffle_id, 0, "migrate_chat", {"before": old_chat_id, "after": new_chat_id}
@@ -766,6 +779,26 @@ class Store:
                 (r["chat_id"], r["title"])
                 for r in db.execute(
                     "SELECT chat_id,title FROM groups WHERE active=1 ORDER BY title"
+                )
+            ]
+
+    def set_manager(self, chat_id, user_id, manages):
+        """Remember whether Telegram last said user_id manages chat_id."""
+        with self.transaction() as db:
+            if manages:
+                db.execute("INSERT OR IGNORE INTO managers VALUES(?,?)", (chat_id, user_id))
+            else:
+                db.execute("DELETE FROM managers WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+
+    def managed_groups(self, user_id):
+        """Groups the bot is in that user_id was last seen managing, as (chat_id, title)."""
+        with self.transaction() as db:
+            return [
+                (r["chat_id"], r["title"])
+                for r in db.execute(
+                    "SELECT g.chat_id,g.title FROM groups g JOIN managers m "
+                    "ON m.chat_id=g.chat_id WHERE m.user_id=? AND g.active=1 ORDER BY g.title",
+                    (user_id,),
                 )
             ]
 

@@ -134,12 +134,23 @@ class Menu:
         except TelegramError as exc:
             LOG.warning("无法确认 %s 是否为群 %s 的管理员：%s", user_id, chat_id, exc)
             allowed = False  # fail closed
+        else:
+            await asyncio.to_thread(self.store.set_manager, chat_id, user_id, allowed)
         self._managers[(chat_id, user_id)] = (time.monotonic() + ADMIN_CACHE_SECONDS, allowed)
         return allowed
 
     async def require(self, bot, user_id, chat_id):
         if chat_id is None or not await self.can_manage(bot, user_id, chat_id):
             raise LotteryError(NOT_MANAGER)
+
+    async def my_groups(self, bot, user_id):
+        """Groups user_id manages, as (chat_id, title). Only super admins get every group the
+        bot is in; anyone else is checked against the groups they were last seen managing,
+        so a press costs a lookup per own group rather than one per group the bot is in."""
+        if self.is_super(user_id):
+            return await asyncio.to_thread(self.store.groups)
+        seen = await asyncio.to_thread(self.store.managed_groups, user_id)
+        return [(chat, title) for chat, title in seen if await self.can_manage(bot, user_id, chat)]
 
     def is_super(self, user_id):
         return user_id in self.handlers.admin_ids
@@ -210,6 +221,8 @@ class Menu:
         )
         if status in GONE or change.old_chat_member.status not in GONE:
             return  # it left, or only its rights changed
+        # Whoever added the bot finds the group in "我的群" if they manage it.
+        await self.can_manage(context.bot, change.from_user.id, chat.id)
         if status == ChatMember.ADMINISTRATOR:
             text = "✅ 已就绪。群管理员点击下面按钮发起和管理抽奖。"
         else:
@@ -279,14 +292,12 @@ class Menu:
     # Group menu
 
     async def groups_menu(self, bot, user_id):
-        groups = await asyncio.to_thread(self.store.groups)
-        mine = [
-            (chat, title) for chat, title in groups if await self.can_manage(bot, user_id, chat)
-        ]
+        mine = await self.my_groups(bot, user_id)
         if not mine:
-            return "还没有你能管理的群。先把我拉进群并设为管理员。", keyboard(
-                (self.add_button(bot),)
-            )
+            return (
+                "还没有你能管理的群。先把我拉进群并设为管理员；"
+                "我已在群里的话，在群里发送 /start，再点「⚙️ 管理抽奖」。"
+            ), keyboard((self.add_button(bot),))
         rows = [(button(title[:30], f"m:g:{chat}"),) for chat, title in mine]
         return "选择要管理的群：", keyboard(*rows, (self.add_button(bot),))
 
@@ -502,11 +513,9 @@ class Menu:
         return self.store.clock() + data.get("minutes", FULL_DEADLINE_MINUTES) * 60
 
     async def target_groups(self, bot, user_id, current):
-        groups = await asyncio.to_thread(self.store.groups)
         rows = [
             (button(("✅ " if chat == current else "") + title[:30], f"m:to:{chat}"),)
-            for chat, title in groups
-            if await self.can_manage(bot, user_id, chat)
+            for chat, title in await self.my_groups(bot, user_id)
         ]
         return "发布到哪个群？", keyboard(*rows, (button("⬅️ 返回", "m:cur"),))
 

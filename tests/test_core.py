@@ -433,6 +433,20 @@ def test_groups_and_drafts(setup):
     assert store.draft(7) is None
 
 
+def test_managers_are_remembered_per_group(setup):
+    store, _, _ = setup
+    store.remember_group(-100, "甲群")
+    store.remember_group(-200, "乙群", active=False)  # the bot has left
+    for chat_id in (-100, -100, -200):
+        store.set_manager(chat_id, 5, True)
+    assert store.managed_groups(5) == [(-100, "甲群")]
+    assert store.managed_groups(6) == []
+    store.migrate_chat(-100, -1001)
+    assert store.managed_groups(5) == [(-1001, "甲群")]
+    store.set_manager(-1001, 5, False)
+    assert store.managed_groups(5) == []
+
+
 def test_weighted_notice_stays_once_set(setup):
     store, rid, now = setup
     store.rule(rid, 99, "idle", 0)

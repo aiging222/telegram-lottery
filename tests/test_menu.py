@@ -133,12 +133,30 @@ def test_admin_lookup_fails_closed_and_is_cached(env):
 
 def test_my_groups_lists_only_groups_the_user_manages(env):
     env.store.remember_group(-200, "别人的群")
+    text, _ = shown(press(env, OWNER, "m:groups"))
+    assert text.startswith("还没有你能管理的群")  # never seen managing a group yet
+    start(env, OWNER, f"g{GROUP}")  # the group's "⚙️ 管理抽奖" button
     text, buttons = shown(press(env, OWNER, "m:groups"))
     assert text == "选择要管理的群："
     assert buttons["测试群"] == f"m:g:{GROUP}"
     assert "别人的群" not in buttons
+    # Telegram is asked about the user's own groups only, not every group the bot is in.
+    assert {call.args[0] for call in env.bot.get_chat_member.await_args_list} == {GROUP}
     text, _ = shown(press(env, MEMBER, "m:groups"))
     assert text.startswith("还没有你能管理的群")
+    env.bot.get_chat_member.reset_mock()
+    _, buttons = shown(press(env, ADMIN, "m:groups"))
+    assert {"测试群", "别人的群"} <= set(buttons)
+    env.bot.get_chat_member.assert_not_awaited()
+
+
+def test_my_groups_drops_a_group_the_user_no_longer_manages(env):
+    start(env, OWNER, f"g{GROUP}")
+    env.statuses[(GROUP, OWNER)] = ChatMember.MEMBER
+    env.menu._managers.clear()  # the 60-second cache has run out
+    text, _ = shown(press(env, OWNER, "m:groups"))
+    assert text.startswith("还没有你能管理的群")
+    assert env.store.managed_groups(OWNER) == []
 
 
 HEADER = "🎁 发起抽奖（/cancel 退出）\n\n"
@@ -264,6 +282,7 @@ def test_wizard_can_publish_to_another_group(env):
     env.store.remember_group(-200, "二群")
     env.store.remember_group(-300, "别人的群")
     env.statuses[(-200, OWNER)] = ChatMember.ADMINISTRATOR
+    start(env, OWNER, "g-200")  # seen managing 二群 once
     fill_wizard(env, OWNER)
     text, buttons = shown(press(env, OWNER, "m:to"))
     assert text == "发布到哪个群？"
@@ -425,8 +444,10 @@ def test_last_join_of_a_full_raffle_draws_at_once(env):
 
 
 def test_bot_added_to_group_posts_welcome_and_is_remembered(env):
+    env.statuses[(-300, OWNER)] = ChatMember.OWNER
     change = SimpleNamespace(
         chat=SimpleNamespace(id=-300, type="supergroup", title="新群"),
+        from_user=SimpleNamespace(id=OWNER),
         old_chat_member=SimpleNamespace(status=ChatMember.LEFT),
         new_chat_member=SimpleNamespace(status=ChatMember.ADMINISTRATOR),
     )
@@ -438,16 +459,19 @@ def test_bot_added_to_group_posts_welcome_and_is_remembered(env):
         "⚙️ 管理抽奖": "https://t.me/lottery_test_bot?start=g-300"
     }
     assert (-300, "新群") in env.store.groups()
+    assert env.store.managed_groups(OWNER) == [(-300, "新群")]  # the owner who added it
     change.old_chat_member = change.new_chat_member
     change.new_chat_member = SimpleNamespace(status=ChatMember.LEFT)
     asyncio.run(env.menu.bot_membership(SimpleNamespace(my_chat_member=change), context))
     assert (-300, "新群") not in env.store.groups()
+    assert env.store.managed_groups(OWNER) == []
     assert env.bot.send_message.await_count == 1
 
 
 def test_bot_added_without_admin_rights_asks_for_them(env):
     change = SimpleNamespace(
         chat=SimpleNamespace(id=-300, type="group", title="新群"),
+        from_user=SimpleNamespace(id=MEMBER),
         old_chat_member=SimpleNamespace(status=ChatMember.LEFT),
         new_chat_member=SimpleNamespace(status=ChatMember.MEMBER),
     )
