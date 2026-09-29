@@ -228,11 +228,13 @@ class BotHandlers:
                 raise LotteryError("用法：" + USAGE[command])
             rid = integer(int(args[0]), "抽奖 ID", 1, 2**63 - 1)
             if command == "config":
-                await asyncio.to_thread(
+                changed = await asyncio.to_thread(
                     self.store.configure, rid, user.id, int(args[1]), int(args[2])
                 )
             elif command == "rule":
-                await asyncio.to_thread(self.store.rule, rid, user.id, args[1], int(args[2]))
+                changed = await asyncio.to_thread(
+                    self.store.rule, rid, user.id, args[1], int(args[2])
+                )
             elif command in ("grant", "revoke"):
                 changed = await asyncio.to_thread(
                     self.store.grant, rid, user.id, int(args[1]), args[2], command == "grant"
@@ -247,7 +249,9 @@ class BotHandlers:
                     return
             elif command == "weight":
                 value = None if args[2].lower() == "auto" else int(args[2])
-                await asyncio.to_thread(self.store.override, rid, user.id, int(args[1]), value)
+                changed = await asyncio.to_thread(
+                    self.store.override, rid, user.id, int(args[1]), value
+                )
             elif command == "freeze":
                 frozen = await asyncio.to_thread(self.store.freeze, rid, user.id)
                 if frozen["status"] == "DRAWN":
@@ -315,6 +319,9 @@ class BotHandlers:
                         )
                     lines.append("展示前 30 人。完整名单和记录使用 /export。")
                     await reply(message, "\n".join(lines))
+                return
+            if not changed:
+                await reply(message, "与现有设置相同，未做修改。")
                 return
             # A first bonus or personal weight must show up on the group card.
             self.refresh_card_soon(context, rid)

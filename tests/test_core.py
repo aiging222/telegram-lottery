@@ -175,6 +175,18 @@ def test_audit_old_and_new_values(setup):
     assert json.loads(entry["details"]) == {"user_id": 123, "before": 10, "after": 0}
 
 
+def test_settings_left_as_they_were_are_not_recorded(setup):
+    store, rid, _ = setup
+    assert store.configure(rid, 99, 1, 100) is False  # the defaults
+    assert store.override(rid, 99, 123, None) is False  # no override to remove
+    assert store.rule(rid, 99, "vip", 2) is True
+    assert store.rule(rid, 99, "vip", 2) is False
+    assert store.override(rid, 99, 123, 5) is True
+    assert store.override(rid, 99, 123, 5) is False
+    actions = [e["action"] for e in store.export(rid)["audit"]]
+    assert actions == ["create", "rule", "override"]
+
+
 def test_random_failure_rolls_back_draw(setup, monkeypatch):
     store, rid, now = setup
     store.join(rid, 123, "Alice")

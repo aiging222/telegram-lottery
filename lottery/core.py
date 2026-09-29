@@ -429,6 +429,8 @@ class Store:
             raise LotteryError("默认权重不能超过上限。")
         with self.transaction() as db:
             before = self._editable(db, raffle_id)
+            if (before["default_weight"], before["weight_cap"]) == (default, cap):
+                return False  # already so: no change to record
             maximum = db.execute(
                 "SELECT MAX(weight) FROM overrides WHERE raffle_id=?", (raffle_id,)
             ).fetchone()[0]
@@ -448,6 +450,7 @@ class Store:
                     "after": [default, cap],
                 },
             )
+            return True
 
     def rule(self, raffle_id, actor, tag, bonus):
         if not re.fullmatch(r"[A-Za-z0-9_\-]{1,32}", tag):
@@ -458,6 +461,8 @@ class Store:
             before = db.execute(
                 "SELECT bonus FROM rules WHERE raffle_id=? AND tag=?", (raffle_id, tag)
             ).fetchone()
+            if before and before[0] == bonus:
+                return False  # already so: no change to record
             db.execute(
                 "INSERT INTO rules VALUES(?,?,?) ON CONFLICT(raffle_id,tag) "
                 "DO UPDATE SET bonus=excluded.bonus",
@@ -472,6 +477,7 @@ class Store:
                 "rule",
                 {"tag": tag, "before": before[0] if before else None, "after": bonus},
             )
+            return True
 
     def grant(self, raffle_id, actor, user_id, tag, enabled=True):
         integer(user_id, "用户 ID", 1, 2**63 - 1)
@@ -510,6 +516,8 @@ class Store:
             before = db.execute(
                 "SELECT weight FROM overrides WHERE raffle_id=? AND user_id=?", (raffle_id, user_id)
             ).fetchone()
+            if (before[0] if before else None) == weight:
+                return False  # already so, or no override to remove: no change to record
             if weight is None:
                 db.execute(
                     "DELETE FROM overrides WHERE raffle_id=? AND user_id=?", (raffle_id, user_id)
@@ -528,6 +536,7 @@ class Store:
                 "override",
                 {"user_id": user_id, "before": before[0] if before else None, "after": weight},
             )
+            return True
 
     def _mark_weighted(self, db, raffle_id):
         db.execute("UPDATE raffles SET weighted=1 WHERE id=?", (raffle_id,))

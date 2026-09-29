@@ -498,6 +498,14 @@ def test_repeated_grant_and_missing_revoke_are_reported(setup):
     assert (actions.count("grant"), actions.count("revoke")) == (1, 1)
 
 
+def test_unchanged_settings_are_reported(setup):
+    store, rid, handlers = setup
+    for text in [f"/config {rid} 1 100", f"/weight {rid} 123 auto"]:
+        reply_text = run_command(handlers, text).reply_text.call_args.args[0]
+        assert reply_text == "与现有设置相同，未做修改。"
+    assert len(store.export(rid)["audit"]) == 1
+
+
 def member_update(status, left_at, **fields):
     change = SimpleNamespace(
         chat=SimpleNamespace(id=GROUP["id"]),
