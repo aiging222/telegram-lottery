@@ -67,6 +67,15 @@ def in_rows(buttons, width):
 CANCEL_ROW = (button("✖ 取消", "m:quit"),)
 
 
+def local_time(text, timezone):
+    """'YYYY-MM-DD HH:MM' in timezone as a timestamp, or None if text is not one."""
+    try:
+        moment = datetime.strptime(text, "%Y-%m-%d %H:%M").replace(tzinfo=timezone)
+    except ValueError:
+        return None
+    return moment.timestamp()
+
+
 def parse_time(text, now, timezone):
     """A typed answer to "when" as the draft field it fills: {"minutes": n} for '90分钟' /
     '2小时' / '3天' / '45' (minutes), counted from publishing like the buttons, or
@@ -75,14 +84,15 @@ def parse_time(text, now, timezone):
     match = re.fullmatch(r"(\d{1,6}) ?(分钟|分|小时|时|天|m|h|d)?", text, re.IGNORECASE)
     if match:
         return {"minutes": int(match[1]) * UNITS[(match[2] or "分钟").lower()]}
-    year = datetime.fromtimestamp(now, timezone).year
-    for candidate in (text, f"{year}-{text}"):
-        try:
-            moment = datetime.strptime(candidate, "%Y-%m-%d %H:%M").replace(tzinfo=timezone)
-        except ValueError:
-            continue
-        return {"deadline": moment.timestamp()}
-    raise LotteryError("看不懂这个时间，请按 2026-10-05 20:00 或 2小时 这样输入。")
+    deadline = local_time(text, timezone)
+    if deadline is None:
+        # Without a year it is the nearest such date, so in December "01-05" is next January.
+        year = datetime.fromtimestamp(now, timezone).year
+        dates = [local_time(f"{y}-{text}", timezone) for y in (year, year + 1)]
+        deadline = min(filter(None, dates), key=lambda d: abs(d - now), default=None)
+    if deadline is None:
+        raise LotteryError("看不懂这个时间，请按 2026-10-05 20:00 或 2小时 这样输入。")
+    return {"deadline": deadline}
 
 
 def setting_text(value):

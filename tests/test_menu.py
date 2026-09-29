@@ -331,6 +331,14 @@ def test_parse_time(typed, expected):
     assert parse_time(typed, NOW, SHANGHAI) == expected
 
 
+def test_a_date_without_year_is_the_nearest_one():
+    december = datetime(2027, 12, 20, 12, tzinfo=SHANGHAI).timestamp()
+    next_january = datetime(2028, 1, 5, 20, tzinfo=SHANGHAI).timestamp()
+    assert parse_time("01-05 20:00", december, SHANGHAI) == {"deadline": next_january}
+    an_hour_ago = datetime(2027, 1, 15, 15, tzinfo=SHANGHAI).timestamp()
+    assert parse_time("01-15 15:00", NOW, SHANGHAI) == {"deadline": an_hour_ago}  # not 2028
+
+
 def test_parse_time_rejects_nonsense():
     with pytest.raises(LotteryError):
         parse_time("明天晚上", NOW, SHANGHAI)
