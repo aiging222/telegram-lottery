@@ -9,7 +9,7 @@ import time
 from datetime import datetime
 
 from telegram import ChatMember, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, ChatMigrated, Forbidden, TelegramError
 
 from lottery.core import MAX_PRIZES, LotteryError, check_keyword, integer
 from lottery.views import (
@@ -147,6 +147,15 @@ class Menu:
         """Record the group's admins as Telegram lists them, so they find it in "我的群"."""
         try:
             admins = await bot.get_chat_administrators(chat_id)
+        except ChatMigrated as exc:
+            await self.handlers.follow_migration(bot, chat_id, exc.new_chat_id)
+            await self.sync_admins(bot, exc.new_chat_id)
+            return
+        except (Forbidden, BadRequest) as exc:
+            # Removed or deleted while the bot was away longer than Telegram keeps updates.
+            LOG.warning("群 %s 已无法访问，不再列出：%s", chat_id, exc)
+            await asyncio.to_thread(self.store.deactivate_group, chat_id)
+            return
         except TelegramError as exc:
             LOG.warning("无法获取群 %s 的管理员名单：%s", chat_id, exc)
             return

@@ -779,6 +779,13 @@ class Store:
                 (chat_id, title, int(active), self.clock()),
             )
 
+    def deactivate_group(self, chat_id):
+        """The bot turns out not to be in chat_id any more, without having been told."""
+        with self.transaction() as db:
+            db.execute(
+                "UPDATE groups SET active=0,updated_at=? WHERE chat_id=?", (self.clock(), chat_id)
+            )
+
     def groups(self):
         """Groups the bot is currently in, as (chat_id, title)."""
         with self.transaction() as db:

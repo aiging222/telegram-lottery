@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from telegram import ChatMember
-from telegram.error import Forbidden, TimedOut
+from telegram.error import BadRequest, ChatMigrated, Forbidden, TimedOut
 
 from lottery.bot import BotHandlers
 from lottery.core import LotteryError, Store
@@ -184,6 +184,30 @@ def test_admins_are_recorded_at_startup(env):
     # The owner never pressed the group's button, yet finds the group.
     _, buttons = shown(press(env, OWNER, "m:groups"))
     assert buttons["测试群"] == f"m:g:{GROUP}"
+
+
+def test_startup_notices_groups_that_changed_while_the_bot_was_away(env):
+    env.store.remember_group(-200, "被踢的群")
+    env.store.remember_group(-300, "已删除的群")
+    env.store.remember_group(-1, "升级了的群")
+    env.statuses[(-1001, OWNER)] = ChatMember.OWNER
+    errors = {
+        -200: Forbidden("bot was kicked from the supergroup chat"),
+        -300: BadRequest("Chat not found"),
+        -1: ChatMigrated(-1001),
+    }
+    lookup = env.bot.get_chat_administrators.side_effect
+
+    async def get_chat_administrators(chat_id):
+        if chat_id in errors:
+            raise errors[chat_id]
+        return await lookup(chat_id)
+
+    env.bot.get_chat_administrators.side_effect = get_chat_administrators
+    asyncio.run(env.menu.sync_all_admins(SimpleNamespace(bot=env.bot)))
+    listed = [(-1001, "升级了的群"), (GROUP, "测试群")]
+    assert env.store.groups() == listed  # no longer the groups the bot is gone from
+    assert env.store.managed_groups(OWNER) == listed
 
 
 HEADER = "🎁 发起抽奖（/cancel 退出）\n\n"
