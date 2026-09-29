@@ -614,6 +614,15 @@ async def slow_reply(*args, **kwargs):
     return SimpleNamespace(message_id=88)
 
 
+def test_publishing_a_drawn_raffle_in_its_group_announces_it(due):
+    store, rid, _, handlers = due
+    store.freeze(rid, 99)
+    run_command(handlers, f"/draw {rid}")  # in private: the group has not seen it yet
+    message = run_command(handlers, f"/publish {rid}", chat_type="supergroup")
+    assert "开奖结果" in message.reply_text.call_args.args[0]
+    run_auto_draw(handlers).assert_not_awaited()
+
+
 def test_overlapping_announcements_post_the_result_once(due):
     store, rid, now, handlers = due
     now[0] += 3600

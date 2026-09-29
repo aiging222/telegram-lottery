@@ -268,11 +268,7 @@ class BotHandlers:
             elif command == "draw":
                 async with self._announcing:
                     result = await asyncio.to_thread(self.store.draw, rid, user.id)
-                    sent = await reply(message, result_text(result, mention=True), html=True)
-                    # Drawn in the bound group itself: no automatic announcement needed there.
-                    if await asyncio.to_thread(self.store.mark_announced, rid, user.id, chat.id):
-                        await self.refresh_card(context.bot, rid)
-                        await self.pin_result(context.bot, chat.id, sent.message_id)
+                    await self.post_result(context.bot, message, rid, result, user.id)
                 return
             elif command == "export":
                 exported = await asyncio.to_thread(self.store.export, rid)
@@ -285,7 +281,10 @@ class BotHandlers:
                 if command == "publish" and chat.type != "private":
                     await asyncio.to_thread(self.store.bind, rid, user.id, chat.id)
                 raffle = await asyncio.to_thread(self.store.view, rid)
-                if command in ("publish", "raffle"):
+                if command == "publish" and raffle["result"]:
+                    async with self._announcing:
+                        await self.post_result(context.bot, message, rid, raffle["result"], user.id)
+                elif command in ("publish", "raffle"):
                     if raffle["result"]:
                         await reply(message, result_text(raffle["result"], mention=True), html=True)
                     else:
@@ -452,6 +451,15 @@ class BotHandlers:
             await asyncio.to_thread(self.store.mark_announced, rid, 0, chat_id)
             await self.refresh_card(bot, rid)
             await self.pin_result(bot, chat_id, sent[0].message_id)
+
+    async def post_result(self, bot, message, rid, result, actor):
+        """Reply with a result. Posted in the raffle's own group, it is the announcement
+        there, so the deadline job need not send it; callers hold self._announcing."""
+        sent = await reply(message, result_text(result, mention=True), html=True)
+        chat_id = message.chat.id
+        if await asyncio.to_thread(self.store.mark_announced, rid, actor, chat_id):
+            await self.refresh_card(bot, rid)
+            await self.pin_result(bot, chat_id, sent.message_id)
 
     async def publish_card(self, bot, rid):
         """Post the card to the raffle's group and remember it for later edits."""
