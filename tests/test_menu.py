@@ -10,7 +10,7 @@ from telegram.error import BadRequest, ChatMigrated, Forbidden, TimedOut
 
 from lottery.bot import BotHandlers
 from lottery.core import LotteryError, Store
-from lottery.menu import NOT_MANAGER, Menu, parse_time
+from lottery.menu import NOT_MANAGER, STALE, Menu, parse_time
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 NOW = 1_800_000_000.0  # 2027-01-15 16:00 in Shanghai
@@ -327,6 +327,32 @@ def test_typed_date_that_has_passed_is_asked_again(env):
     assert text.endswith("发布到「测试群」？")
     assert shown(press(env, OWNER, "m:pub"))[0] == "✅ 已发布到群。"
     assert env.store.view(1)["deadline"] == env.now[0] + 3600
+
+
+def test_buttons_left_on_earlier_wizard_messages_are_stale(env):
+    fill_wizard(env, OWNER)  # at the confirmation page: timed, joined by button
+    for data in ("m:mode:f", "m:f:10", "m:t:60", "m:c:1", "m:j:k", "m:tt"):
+        assert press(env, OWNER, data).answer.await_args.args[0] == STALE
+    _, data = env.store.draft(OWNER)
+    assert (data["mode"], data["join"], "target" in data) == ("t", "b", False)
+    press(env, OWNER, "m:more")
+    assert press(env, OWNER, "m:pub").answer.await_args.args[0] == STALE  # a prize is asked
+    assert env.store.group_summary(GROUP)["active"] == 0
+
+
+def test_no_prize_is_added_beyond_the_limit(env):
+    data = {"prizes": [[f"奖{i}", 1] for i in range(10)], "mode": "t", "minutes": 60}
+    data |= {"join": "b", "title": "十种奖品"}
+    _, markup = asyncio.run(env.menu.advance(OWNER, GROUP, data))
+    assert "➕ 添加奖品" not in labels(markup)
+    query = press(env, OWNER, "m:more")  # left on an earlier confirmation page
+    assert query.answer.await_args.args[0].startswith("奖品最多 10 种")
+
+
+def test_a_draft_saved_by_the_previous_version_carries_on(env):
+    env.store.save_draft(OWNER, GROUP, {"prizes": [["耳机", 1]], "step": None})  # "怎么开奖？"
+    text, _ = shown(press(env, OWNER, "m:mode:t"))
+    assert "什么时候开奖？" in text
 
 
 def test_wizard_can_publish_to_another_group(env):
