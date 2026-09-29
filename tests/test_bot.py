@@ -483,6 +483,21 @@ def test_startup_failure_keeps_cause_but_masks_token(monkeypatch, tmp_path):
     assert "SECRET" not in message
 
 
+def test_raffles_are_looked_up_only_in_their_group(setup):
+    store, rid, handlers = setup
+    store.bind(rid, 99, GROUP["id"])
+    elsewhere = "请在发布这场抽奖的群里查询。"
+    for text in [f"/raffle {rid}", f"/result {rid}"]:
+        private = run_command(handlers, text, user_id=123)
+        other = run_command(handlers, text, user_id=123, chat_type="supergroup", chat_id=-200)
+        here = run_command(handlers, text, user_id=123, chat_type="supergroup")
+        super_admin = run_command(handlers, text)
+        assert private.reply_text.call_args.args[0] == elsewhere
+        assert other.reply_text.call_args.args[0] == elsewhere
+        assert here.reply_text.call_args.args[0] != elsewhere
+        assert super_admin.reply_text.call_args.args[0] != elsewhere
+
+
 def test_repeated_grant_and_missing_revoke_are_reported(setup):
     store, rid, handlers = setup
     run_command(handlers, f"/rule {rid} vip 2")

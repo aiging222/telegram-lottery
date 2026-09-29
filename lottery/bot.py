@@ -82,8 +82,8 @@ COUNTS = {name: 1 for name in USAGE}
 COUNTS.update({name: 3 for name in ("config", "rule", "grant", "revoke", "weight")})
 PUBLIC_HELP = """🎁 抽奖机器人
 群管理员私聊我发送 /start，用按钮发起和管理抽奖。
-/raffle 抽奖ID — 查看抽奖
-/result 抽奖ID — 查看开奖结果
+/raffle 抽奖ID — 在发布群里查看抽奖
+/result 抽奖ID — 在发布群里查看开奖结果
 /id — 查看自己的用户 ID"""
 ADMIN_HELP = """
 
@@ -281,6 +281,13 @@ class BotHandlers:
                 if command == "publish" and chat.type != "private":
                     await asyncio.to_thread(self.store.bind, rid, user.id, chat.id)
                 raffle = await asyncio.to_thread(self.store.view, rid)
+                if (
+                    command in ("raffle", "result")
+                    and raffle["chat_id"] != chat.id
+                    and user.id not in self.admin_ids
+                ):
+                    # IDs count up, so anyone could otherwise read every group's winners.
+                    raise LotteryError("请在发布这场抽奖的群里查询。")
                 if command == "publish" and raffle["result"]:
                     async with self._announcing:
                         await self.post_result(context.bot, message, rid, raffle["result"], user.id)
