@@ -80,7 +80,7 @@ WantedBy=multi-user.target
 bash /home/lottery/telegram-lottery/scripts/update.sh
 ```
 
-脚本会依次停止机器人、备份数据库（`data/backup-时间.sqlite3`，保留最近 5 份）、拉取 `main`、安装锁定的依赖、重新启动，最后显示运行状态。中途任何一步失败，也会把机器人重新启动。数据库表结构在启动时自动升级。
+脚本会依次停止机器人、备份数据库（`.env` 里 `DATABASE_PATH` 指向的文件，备份为同目录下的 `backup-时间.sqlite3`，保留最近 5 份）、拉取 `main`、按原来的安装方式安装锁定的依赖（`.venv` 里有 pip 就用 pip 安装 `requirements.lock`，否则用 `uv sync`）、重新启动，最后显示运行状态。中途任何一步失败，也会把机器人重新启动。数据库表结构在启动时自动升级。
 
 ## 谁能做什么
 
