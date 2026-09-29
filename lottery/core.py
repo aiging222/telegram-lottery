@@ -64,6 +64,16 @@ def weighted_draw(entries, count, randbelow=secrets.randbelow):
     return winners
 
 
+def pick_winners(entries, count, randbelow=secrets.randbelow):
+    """Designated entries win first, in their order; the places left are drawn by weight
+    from everyone else."""
+    winners = [dict(entry) for entry in entries if entry.get("designated")][:count]
+    if len(winners) < count:
+        rest = [entry for entry in entries if not entry.get("designated")]
+        winners += weighted_draw(rest, count - len(winners), randbelow)
+    return winners
+
+
 # Migration N upgrades a database from schema version N-1 (PRAGMA user_version) to N.
 # Append new migrations; never edit one that has shipped.
 MIGRATIONS = [
@@ -180,6 +190,14 @@ MIGRATIONS = [
         chat_id INTEGER NOT NULL,
         user_id INTEGER NOT NULL,
         PRIMARY KEY (chat_id, user_id)
+    )
+    """,
+    # 10: participants a super admin names as winners ahead of the draw.
+    """
+    CREATE TABLE IF NOT EXISTS designations (
+        raffle_id INTEGER NOT NULL REFERENCES raffles(id),
+        user_id INTEGER NOT NULL,
+        PRIMARY KEY (raffle_id, user_id)
     )
     """,
 ]
@@ -331,9 +349,10 @@ class Store:
                 )
             ]
             for raffle_id in ids:
-                db.execute(
-                    "DELETE FROM participants WHERE raffle_id=? AND user_id=?", (raffle_id, user_id)
-                )
+                for table in ("participants", "designations"):
+                    db.execute(
+                        f"DELETE FROM {table} WHERE raffle_id=? AND user_id=?", (raffle_id, user_id)
+                    )
                 self.audit(db, raffle_id, 0, "leave", {"user_id": user_id, "chat_id": chat_id})
             return ids
 
@@ -570,6 +589,42 @@ class Store:
             )
             return True
 
+    def designate(self, raffle_id, actor, user_id, chosen=True):
+        """Name a participant as a winner ahead of the draw, or take it back; False if that
+        was so already. Designated winners take the first places and prizes. Unlike weights,
+        a designation adds no notice to the card."""
+        with self.transaction() as db:
+            raffle = self._editable(db, raffle_id)
+            if chosen:
+                if not db.execute(
+                    "SELECT 1 FROM participants WHERE raffle_id=? AND user_id=?",
+                    (raffle_id, user_id),
+                ).fetchone():
+                    raise LotteryError("只能指定已报名的成员。")
+                taken = [
+                    row[0]
+                    for row in db.execute(
+                        "SELECT user_id FROM designations WHERE raffle_id=?", (raffle_id,)
+                    )
+                ]
+                if user_id in taken:
+                    return False
+                if len(taken) >= raffle["winner_count"]:
+                    raise LotteryError(f"指定人数不能超过中奖人数 {raffle['winner_count']}。")
+                db.execute("INSERT INTO designations VALUES(?,?)", (raffle_id, user_id))
+            elif not db.execute(
+                "DELETE FROM designations WHERE raffle_id=? AND user_id=?", (raffle_id, user_id)
+            ).rowcount:
+                return False
+            self.audit(
+                db,
+                raffle_id,
+                actor,
+                "designate" if chosen else "undesignate",
+                {"user_id": user_id},
+            )
+            return True
+
     def _mark_weighted(self, db, raffle_id):
         db.execute("UPDATE raffles SET weighted=1 WHERE id=?", (raffle_id,))
 
@@ -594,6 +649,10 @@ class Store:
         overrides = dict(
             db.execute("SELECT user_id,weight FROM overrides WHERE raffle_id=?", (rid,))
         )
+        designated = {
+            row[0]
+            for row in db.execute("SELECT user_id FROM designations WHERE raffle_id=?", (rid,))
+        }
         bonuses = {}
         for row in db.execute(
             "SELECT g.user_id,g.tag,r.bonus FROM grants g JOIN rules r "
@@ -623,6 +682,7 @@ class Store:
                     "weight": weight,
                     "override": override,
                     "tags": tags,
+                    "designated": uid in designated,
                 }
             )
         return entries
@@ -696,7 +756,7 @@ class Store:
                 raise LotteryError("尚未到截止时间。如需提前开奖，请先 /freeze 截止报名。")
             raffle = self._freeze(db, raffle, actor)
             snapshot = json.loads(raffle["snapshot"])
-            winners = weighted_draw(snapshot["entries"], raffle["winner_count"])
+            winners = pick_winners(snapshot["entries"], raffle["winner_count"])
             if raffle["prizes"]:
                 # The first winners drawn take the first prizes listed.
                 names = [name for name, count in json.loads(raffle["prizes"]) for _ in range(count)]

@@ -25,10 +25,10 @@ from lottery.menu import MANAGERS, Menu, one_at_a_time, presser, sender
 from lottery.views import (
     EXPORT_CAPTION,
     card,
+    chances,
     chunks,
     export_file,
     name_text,
-    percent,
     result_text,
     status_text,
 )
@@ -318,13 +318,14 @@ class BotHandlers:
                         ),
                     )
                 elif command == "preview":
+                    odds = chances(raffle["entries"], raffle["winner_count"])
                     total = sum(p["weight"] for p in raffle["entries"])
                     lines = [f"抽奖 {rid}｜{status_text(raffle)}｜总权重 {total}"]
                     for p in raffle["entries"][:30]:
                         source = "个人覆盖" if p["override"] is not None else "规则"
                         lines.append(
                             f"{name_text(p['display_name'])} / {p['user_id']}："
-                            f"权重 {p['weight']}（{source}），首轮 {percent(p['weight'], total)}"
+                            f"权重 {p['weight']}（{source}），首轮 {odds[p['user_id']]}"
                         )
                     lines.append("展示前 30 人。完整名单和记录使用 /export。")
                     await reply(message, "\n".join(lines))

@@ -782,6 +782,19 @@ def test_draw_in_the_group_is_not_announced_again_by_the_job(due):
     assert update.effective_message.reply_text.await_count == 1
 
 
+def test_designated_winners_are_listed_like_the_others(due):
+    store, rid, now, handlers = due  # one place; Alice has joined
+    store.join(rid, 124, "Bob")
+    store.designate(rid, 99, 124)
+    preview = run_command(handlers, f"/preview {rid}").reply_text.call_args.args[0]
+    assert "Bob / 124：权重 1（规则），首轮 指定获奖" in preview
+    assert "Alice / 123：权重 1（规则），首轮 0%" in preview  # the only place is taken
+    now[0] += 3600
+    announcement = run_auto_draw(handlers).await_args.args[1]
+    assert "Bob" in announcement and "Alice" not in announcement
+    assert "指定" not in announcement
+
+
 def test_result_names_each_winners_prize():
     result = {
         "raffle_id": 1,

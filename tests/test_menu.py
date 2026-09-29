@@ -627,6 +627,26 @@ def test_set_weights_with_buttons(weighted_env):
     assert env.store.view(rid)["weighted"]
 
 
+def test_designate_a_winner_with_buttons(weighted_env):
+    env, rid = weighted_env, weighted_env.rid  # one place; Alice and Bob have joined
+    _, buttons = shown(press(env, ADMIN, f"m:wu:{rid}:1:0"))
+    text, buttons = shown(press(env, ADMIN, buttons["🎯 指定获奖"]))
+    assert text == "Alice（ID：1）\n🎯 已指定获奖，开奖时直接中奖"
+    assert "↩️ 取消指定" in buttons
+    env.bot.edit_message_text.assert_not_awaited()  # the card shows nothing of it
+    assert not env.store.view(rid)["weighted"]
+    text, buttons = shown(press(env, ADMIN, f"m:w:{rid}:0"))
+    assert text.endswith("已参与 2 人 · 已调整 0 人 · 指定 1 人")
+    assert {"Alice · 🎯 指定获奖", "Bob · 权重 1 · 概率 0%"} <= set(buttons)
+    query = press(env, ADMIN, f"m:wd:{rid}:2:0")
+    assert query.answer.await_args.args[0] == "指定人数不能超过中奖人数 1。"
+    query = press(env, OWNER, f"m:wd:{rid}:2:0")
+    assert query.answer.await_args.args[0] == "只有超级管理员可以设置中奖加成。"
+    _, buttons = shown(press(env, ADMIN, f"m:wd:{rid}:1:0"))  # taken back
+    assert "🎯 指定获奖" in buttons
+    assert [e["designated"] for e in env.store.view(rid)["entries"]] == [False, False]
+
+
 def test_typed_weights_presets_and_defaults(weighted_env):
     env, rid = weighted_env, weighted_env.rid
     text, _ = shown(press(env, ADMIN, f"m:ws:{rid}:1:x:0"))

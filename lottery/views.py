@@ -32,6 +32,18 @@ def percent(weight, total):
     return f"{value:.{digits}f}%"
 
 
+def chances(entries, winner_count):
+    """Each entry's chance in the first random pick, as text by user ID. Designated winners
+    take their places before it; when they take them all, nobody else has a chance."""
+    designated = sum(1 for e in entries if e.get("designated"))
+    drawn = [e for e in entries if not e.get("designated")]
+    total = sum(e["weight"] for e in drawn) if designated < winner_count else 0
+    return {
+        e["user_id"]: "指定获奖" if e.get("designated") else percent(e["weight"], total)
+        for e in entries
+    }
+
+
 def prize_text(prizes):
     return "、".join(f"{name} ×{count}" for name, count in prizes)
 

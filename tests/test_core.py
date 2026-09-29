@@ -527,6 +527,63 @@ def test_prizes_go_to_winners_in_draw_order(setup):
     assert [w["prize"] for w in store.draw(short, 99)["winners"]] == ["iPhone"]
 
 
+def test_designated_winners_come_first_with_the_first_prizes(setup):
+    store, _, _ = setup
+    rid = store.create(99, "指定", 3, 60, prizes=[["iPhone", 1], ["1usdt", 2]])
+    for uid in (1, 2, 3, 4, 5):
+        store.join(rid, uid, f"u{uid}")
+    assert store.designate(rid, 99, 4)
+    assert not store.designate(rid, 99, 4)
+    assert not store.view(rid)["weighted"]  # the card shows nothing of it
+    store.override(rid, 99, 4, 0)  # a weight no longer matters once designated
+    store.freeze(rid, 99)
+    winners = store.draw(rid, 99)["winners"]
+    assert (winners[0]["user_id"], winners[0]["prize"], winners[0]["designated"]) == (
+        4,
+        "iPhone",
+        True,
+    )
+    assert [w["prize"] for w in winners[1:]] == ["1usdt", "1usdt"]
+    assert 4 not in {w["user_id"] for w in winners[1:]}
+    actions = [e["action"] for e in store.export(rid)["audit"]]
+    assert actions.count("designate") == 1
+
+
+def test_designations_have_their_limits(setup):
+    store, rid, now = setup  # 3 winners
+    with pytest.raises(LotteryError, match="已报名"):
+        store.designate(rid, 99, 1)
+    for uid in (1, 2, 3, 4):
+        store.join(rid, uid, f"u{uid}")
+    for uid in (1, 2, 3):
+        store.designate(rid, 99, uid)
+    with pytest.raises(LotteryError, match="不能超过中奖人数 3"):
+        store.designate(rid, 99, 4)
+    assert store.designate(rid, 99, 3, chosen=False)
+    assert not store.designate(rid, 99, 3, chosen=False)
+    store.bind(rid, 99, -100)
+    store.leave_group(-100, 2, now[0])  # leaving takes the designation with it
+    assert [e["user_id"] for e in store.view(rid)["entries"] if e["designated"]] == [1]
+    store.freeze(rid, 99)
+    with pytest.raises(LotteryError, match="截止"):
+        store.designate(rid, 99, 3)
+
+
+def test_nothing_is_drawn_when_designations_take_every_place(setup, monkeypatch):
+    store, _, _ = setup
+    rid = store.create(99, "全部指定", 1, 60)
+    store.join(rid, 1, "u1")
+    store.join(rid, 2, "u2")
+    store.designate(rid, 99, 2)
+    store.freeze(rid, 99)
+
+    def fail(*args):
+        raise AssertionError("no random pick is needed")
+
+    monkeypatch.setattr("lottery.core.weighted_draw", fail)
+    assert [w["user_id"] for w in store.draw(rid, 99)["winners"]] == [2]
+
+
 def test_keyword_raffles(setup):
     store, _, now = setup
     rid = store.create(99, "a", 1, 60, chat_id=-100, keyword=" Hello ")

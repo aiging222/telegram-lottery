@@ -15,11 +15,11 @@ from telegram.error import BadRequest, ChatMigrated, Forbidden, TelegramError
 from lottery.core import MAX_PRIZES, LotteryError, check_keyword, integer
 from lottery.views import (
     EXPORT_CAPTION,
+    chances,
     draw_rule,
     export_file,
     join_text,
     name_text,
-    percent,
     prize_text,
     status_text,
     when_text,
@@ -360,7 +360,7 @@ class Menu:
             if action == "sv":
                 await self.cycle_setting(chat_id, args[1])
             return await self.settings(bot, chat_id)
-        if action in ("w", "wu", "ws", "wid", "wc", "export"):
+        if action in ("w", "wu", "ws", "wd", "wid", "wc", "export"):
             self.require_super(user_id)
             return await self.weight_action(bot, user_id, action, args)
         raise ValueError(action)
@@ -809,6 +809,11 @@ class Menu:
         uid = int(args[1])
         if action == "wu":
             return await self.person(raffle, uid, page)
+        if action == "wd":
+            entry = next((e for e in raffle["entries"] if e["user_id"] == uid), None)
+            chosen = not (entry and entry["designated"])
+            await asyncio.to_thread(self.store.designate, rid, user_id, uid, chosen)
+            return await self.person(await asyncio.to_thread(self.store.view, rid), uid, page)
         value = args[2]
         if value == "x":
             self._asking[user_id] = ("weight", rid, uid, page)
@@ -827,22 +832,23 @@ class Menu:
     async def weights(self, rid, page):
         raffle = await asyncio.to_thread(self.store.view, rid)
         entries = raffle["entries"]
-        total = sum(e["weight"] for e in entries)
+        odds = chances(entries, raffle["winner_count"])
         adjusted = sum(1 for e in entries if e["override"] is not None or e["tags"])
+        designated = sum(1 for e in entries if e.get("designated"))
         lines = [
             f"⚖️ 中奖加成 · {raffle['title']}  #{rid}",
             f"默认权重 {raffle['default_weight']} · 上限 {raffle['weight_cap']}",
-            f"已参与 {len(entries)} 人 · 已调整 {adjusted} 人",
+            f"已参与 {len(entries)} 人 · 已调整 {adjusted} 人"
+            + (f" · 指定 {designated} 人" if designated else ""),
         ]
         people = []
         for e in entries:
-            chance = percent(e["weight"], total)
-            people.append(
-                (
-                    e["user_id"],
-                    f"{name_text(e['display_name'])[:16]} · 权重 {e['weight']} · 概率 {chance}",
-                )
-            )
+            name = name_text(e["display_name"])[:16]
+            if e.get("designated"):
+                people.append((e["user_id"], f"{name} · 🎯 指定获奖"))
+            else:
+                chance = odds[e["user_id"]]
+                people.append((e["user_id"], f"{name} · 权重 {e['weight']} · 概率 {chance}"))
         editable = raffle["status"] == "OPEN"
         if editable:
             presets = await asyncio.to_thread(self.store.presets, rid)
@@ -876,8 +882,9 @@ class Menu:
 
     async def person(self, raffle, uid, page):
         rid = raffle["id"]
-        total = sum(e["weight"] for e in raffle["entries"])
+        odds = chances(raffle["entries"], raffle["winner_count"])
         entry = next((e for e in raffle["entries"] if e["user_id"] == uid), None)
+        designate = ()
         if entry:
             if entry["override"] is not None:
                 source = "单独设置"
@@ -885,8 +892,12 @@ class Menu:
                 source = "、".join(f"{t['tag']} +{t['bonus']}" for t in entry["tags"]) or "默认"
             text = (
                 f"{name_text(entry['display_name'])}（ID：{uid}）\n"
-                f"权重 {entry['weight']} · 概率 {percent(entry['weight'], total)} · {source}"
+                f"权重 {entry['weight']} · 概率 {odds[uid]} · {source}"
             )
+            if entry["designated"]:
+                text = f"{name_text(entry['display_name'])}（ID：{uid}）\n🎯 已指定获奖，开奖时直接中奖"
+            label = "↩️ 取消指定" if entry["designated"] else "🎯 指定获奖"
+            designate = (button(label, f"m:wd:{rid}:{uid}:{page}"),)
             overridden = entry["override"] is not None
         else:
             preset = dict(await asyncio.to_thread(self.store.presets, rid)).get(uid)
@@ -903,6 +914,7 @@ class Menu:
         return text, keyboard(
             *in_rows(choices, 4),
             (button("↩️ 恢复默认", f"m:ws:{rid}:{uid}:a:{page}"),) if overridden else (),
+            designate,
             (button("⬅️ 返回", f"m:w:{rid}:{page}"),),
         )
 
