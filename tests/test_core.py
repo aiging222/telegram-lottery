@@ -372,7 +372,11 @@ def test_cancel(setup):
     store.join(rid, 1, "one")
     assert store.cancel(rid, 99)
     assert not store.cancel(rid, 99)
-    for operation in (lambda: store.join(rid, 2, "two"), lambda: store.draw(rid, 99)):
+    for operation in (
+        lambda: store.join(rid, 2, "two"),
+        lambda: store.freeze(rid, 99),
+        lambda: store.draw(rid, 99),
+    ):
         with pytest.raises(LotteryError, match="已取消"):
             operation()
     now[0] += 3600

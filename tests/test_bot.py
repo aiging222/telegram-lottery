@@ -402,6 +402,13 @@ def test_freeze_after_draw_reports_saved_result(setup):
     assert "已开奖" in message.reply_text.call_args.args[0]
 
 
+def test_freeze_after_cancel_says_so(setup):
+    store, rid, handlers = setup
+    store.cancel(rid, 99)
+    message = run_command(handlers, f"/freeze {rid}")
+    assert message.reply_text.call_args.args[0] == "本场抽奖已取消。"
+
+
 def test_stale_button_answer_failure_keeps_join_and_stays_silent(setup):
     store, rid, handlers = setup
     store.bind(rid, 99, GROUP["id"])

@@ -615,7 +615,10 @@ class Store:
 
     def freeze(self, raffle_id, actor):
         with self.transaction() as db:
-            return self._freeze(db, self._get(db, raffle_id), actor)
+            raffle = self._get(db, raffle_id)
+            if raffle["status"] == "CANCELLED":
+                raise LotteryError("本场抽奖已取消。")
+            return self._freeze(db, raffle, actor)
 
     def view(self, raffle_id):
         with self.transaction() as db:
