@@ -538,6 +538,19 @@ def test_keyword_raffles(setup):
     assert store.keyword_raffles(-100, "hello") == []
 
 
+def test_keyword_lookups_do_not_wait_for_other_transactions(setup):
+    store, _, _ = setup
+    rid = store.create(99, "口令", 1, 60, chat_id=-100, keyword="go")
+    writer = sqlite3.connect(store.path, isolation_level=None)
+    writer.execute("BEGIN IMMEDIATE")  # e.g. a draw being saved
+    try:
+        # A write transaction here would wait for it, and fail after 30 seconds.
+        assert store.keyword_raffles(-100, "GO") == [rid]
+    finally:
+        writer.rollback()
+        writer.close()
+
+
 def test_group_settings(setup):
     store, _, _ = setup
     store.remember_group(-100, "甲群")

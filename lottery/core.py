@@ -223,6 +223,17 @@ class Store:
         finally:
             db.close()
 
+    @contextmanager
+    def reading(self):
+        """A connection for a lone query. It takes no write lock, so unlike transaction() it
+        neither waits for other transactions to finish nor makes them wait."""
+        db = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+        db.row_factory = sqlite3.Row
+        try:
+            yield db
+        finally:
+            db.close()
+
     def audit(self, db, raffle_id, actor, action, details):
         db.execute(
             "INSERT INTO audit(raffle_id,actor_id,action,details,at) VALUES(?,?,?,?,?)",
@@ -413,8 +424,9 @@ class Store:
             return True
 
     def keyword_raffles(self, chat_id, text):
-        """Open raffles of chat_id that people join by sending `text` (any letter case)."""
-        with self.transaction() as db:
+        """Open raffles of chat_id that people join by sending `text` (any letter case).
+        Asked for every short message in every group, so it is a plain read."""
+        with self.reading() as db:
             rows = db.execute(
                 "SELECT id,keyword FROM raffles WHERE chat_id=? AND status='OPEN' "
                 "AND keyword IS NOT NULL AND deadline>?",
