@@ -3,6 +3,7 @@ the super admins listed in ADMIN_USER_IDS may manage every group and alone see a
 the weights."""
 
 import asyncio
+import functools
 import logging
 import re
 import time
@@ -80,6 +81,33 @@ def in_rows(buttons, width):
 CANCEL_ROW = (button("✖ 取消", "m:quit"),)
 
 
+def one_at_a_time(user_of):
+    """Handle one person's updates one after another, in the order they came, although the
+    bot handles updates concurrently; user_of(update) is that person. A double tap on
+    "✅ 发布抽奖" thus cannot publish a draft twice."""
+
+    def wrap(handler):
+        @functools.wraps(handler)
+        async def run(self, update, context):
+            user = user_of(update)
+            if user is None:
+                return await handler(self, update, context)
+            async with self.user_lock(user.id):
+                return await handler(self, update, context)
+
+        return run
+
+    return wrap
+
+
+def sender(update):
+    return update.effective_user
+
+
+def presser(update):
+    return update.callback_query.from_user if update.callback_query else None
+
+
 def room_for_prize(data):
     """Whether the draft takes another prize: 10 kinds and 100 winners at most, and no more
     winners than the people that fill the raffle."""
@@ -140,6 +168,9 @@ class Menu:
         # user_id -> (kind, raffle_id, user_id or None, page): a weight page waiting for a
         # typed answer. Any button press or /start drops it; a restart forgets it.
         self._asking = {}
+
+    def user_lock(self, user_id):
+        return self.handlers.user_lock(user_id)
 
     # Permissions
 
@@ -224,6 +255,7 @@ class Menu:
         ids = [sent.message_id] if trigger is None else [trigger, sent.message_id]
         await self.handlers.tidy(bot, chat_id, ids, "delete_notices")
 
+    @one_at_a_time(sender)
     async def start(self, update, context):
         message, user, chat = update.effective_message, update.effective_user, update.effective_chat
         if message is None or user is None or user.is_bot:
@@ -274,6 +306,7 @@ class Menu:
 
     # Button presses
 
+    @one_at_a_time(presser)
     async def callback(self, update, context):
         query = update.callback_query
         if query is None or query.from_user.is_bot:
@@ -380,6 +413,7 @@ class Menu:
             await self.group_menu(found[0]) if found else ("已退出。发送 /start 打开菜单。", None)
         )
 
+    @one_at_a_time(sender)
     async def cancel(self, update, context):
         """/cancel leaves the creation wizard or a weight prompt."""
         self._asking.pop(update.effective_user.id, None)
@@ -415,6 +449,7 @@ class Menu:
             self.answer(data, BUTTON_STEPS[action], value, typed=False)
         return await self.advance(user_id, chat_id, data)
 
+    @one_at_a_time(sender)
     async def text(self, update, context):
         """A typed answer to the current wizard step or weight prompt."""
         message, user = update.effective_message, update.effective_user

@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -20,7 +21,7 @@ from telegram.ext import (
 )
 
 from lottery.core import MAX_KEYWORD, LotteryError, Store, integer
-from lottery.menu import MANAGERS, Menu
+from lottery.menu import MANAGERS, Menu, one_at_a_time, presser, sender
 from lottery.views import (
     EXPORT_CAPTION,
     card,
@@ -173,7 +174,16 @@ class BotHandlers:
         # raffle ID -> message IDs of the parts of a long result already posted, so a retry
         # carries on from the part that failed. A restart in between posts it all again.
         self._posted_parts = {}
+        # user ID -> the lock that keeps that person's updates in order; see one_at_a_time.
+        self._user_locks = weakref.WeakValueDictionary()
 
+    def user_lock(self, user_id):
+        lock = self._user_locks.get(user_id)
+        if lock is None:
+            lock = self._user_locks[user_id] = asyncio.Lock()
+        return lock
+
+    @one_at_a_time(sender)
     async def command(self, update, context):
         message, user = update.effective_message, update.effective_user
         if message is None or user is None or user.is_bot or message.sender_chat:
@@ -332,6 +342,7 @@ class BotHandlers:
                 context.bot, message, "数字参数格式错误。用法：" + USAGE.get(command, "/help")
             )
 
+    @one_at_a_time(presser)
     async def callback(self, update, context):
         query = update.callback_query
         if query is None or query.from_user.is_bot:
@@ -367,6 +378,7 @@ class BotHandlers:
             # already saved, so there is nothing to retry and nothing to tell the group.
             LOG.warning("按钮应答失败：%s", exc)
 
+    @one_at_a_time(sender)
     async def keyword(self, update, context):
         """Join by sending a raffle's keyword in its group. Whoever writes in the group is a
         member, so no membership lookup is needed; admins must not post anonymously."""
@@ -398,6 +410,7 @@ class BotHandlers:
                 LOG.info("报名成功的表情回应失败：%s", exc)
         await self.tidy(context.bot, message.chat.id, [message.message_id], "delete_keyword")
 
+    @one_at_a_time(lambda update: update.chat_member.new_chat_member.user)
     async def member_changed(self, update, context):
         change = update.chat_member
         member = change.new_chat_member
@@ -670,7 +683,10 @@ def build_application(settings):
     app = (
         Application.builder()
         .token(settings.token)
-        .concurrent_updates(False)
+        # Updates run concurrently, so a slow Telegram lookup for one click holds up no one
+        # else. Store calls are transactions, results are posted under a lock, and each
+        # person's own updates keep their order (one_at_a_time).
+        .concurrent_updates(True)
         .post_init(register_commands)
         .build()
     )

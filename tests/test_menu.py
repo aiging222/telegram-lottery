@@ -60,13 +60,17 @@ def labels(markup):
     return {b.text: b.callback_data or b.url for b in buttons}
 
 
-def press(env, user_id, data):
-    query = SimpleNamespace(
+def query_for(user_id, data):
+    return SimpleNamespace(
         data=data,
         from_user=SimpleNamespace(id=user_id, is_bot=False),
         answer=AsyncMock(),
         edit_message_text=AsyncMock(),
     )
+
+
+def press(env, user_id, data):
+    query = query_for(user_id, data)
     context = SimpleNamespace(bot=env.bot)
     asyncio.run(env.menu.callback(SimpleNamespace(callback_query=query), context))
     return query
@@ -338,6 +342,26 @@ def test_buttons_left_on_earlier_wizard_messages_are_stale(env):
     press(env, OWNER, "m:more")
     assert press(env, OWNER, "m:pub").answer.await_args.args[0] == STALE  # a prize is asked
     assert env.store.group_summary(GROUP)["active"] == 0
+
+
+def test_a_double_tap_on_publish_publishes_once(env):
+    fill_wizard(env, OWNER)
+
+    async def slow_send(*args, **kwargs):
+        await asyncio.sleep(0.05)
+        return SimpleNamespace(message_id=500)
+
+    env.bot.send_message.side_effect = slow_send
+    taps = [query_for(OWNER, "m:pub") for _ in range(2)]
+
+    async def double_tap():
+        context = SimpleNamespace(bot=env.bot)
+        updates = [SimpleNamespace(callback_query=tap) for tap in taps]
+        await asyncio.gather(*(env.menu.callback(update, context) for update in updates))
+
+    asyncio.run(double_tap())
+    assert env.store.group_summary(GROUP)["active"] == 1
+    assert taps[1].answer.await_args.args[0] == "操作已过期，请重新开始。"
 
 
 def test_no_prize_is_added_beyond_the_limit(env):

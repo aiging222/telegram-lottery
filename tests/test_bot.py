@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import sys
+import time
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -297,7 +298,7 @@ def test_build_application_offline(tmp_path, monkeypatch):
     )
     app = build_application(settings)
     assert len(app.handlers[0]) == 10
-    assert app.concurrent_updates == 1
+    assert app.concurrent_updates > 1
     assert {"chat_member", "my_chat_member"} <= set(ALLOWED_UPDATES)
     jobs = [job.callback.__name__ for job in app.job_queue.jobs()]
     assert jobs == ["auto_draw", "cleanup", "sync_all_admins"]
@@ -522,6 +523,27 @@ def test_raffles_are_looked_up_only_in_their_group(setup):
         assert super_admin.reply_text.call_args.args[0] != elsewhere
 
 
+def test_one_persons_commands_run_in_the_order_sent(setup):
+    store, rid, handlers = setup
+    add_rule = store.rule
+
+    def slow_rule(*args):
+        time.sleep(0.05)  # the /grant right behind must wait for the rule it needs
+        return add_rule(*args)
+
+    store.rule = slow_rule
+    rule, rule_context = command_update(f"/rule {rid} vip 2")
+    grant, grant_context = command_update(f"/grant {rid} 123 vip")
+
+    async def both():
+        await asyncio.gather(
+            handlers.command(rule, rule_context), handlers.command(grant, grant_context)
+        )
+
+    asyncio.run(both())
+    assert "已保存" in grant.effective_message.reply_text.call_args.args[0]
+
+
 def test_repeated_grant_and_missing_revoke_are_reported(setup):
     store, rid, handlers = setup
     run_command(handlers, f"/rule {rid} vip 2")
@@ -594,6 +616,35 @@ def test_leaving_group_updates_the_card(setup):
     update = member_update(ChatMember.LEFT, left_at)
     asyncio.run(handlers.member_changed(update, SimpleNamespace(job_queue=jobs)))
     assert jobs.run_once.call_args.kwargs["name"] == f"card:{rid}"
+
+
+def test_a_leave_just_after_a_click_is_not_overtaken_by_it(setup):
+    store, rid, handlers = setup
+    store.bind(rid, 99, GROUP["id"])
+    looking_up = asyncio.Event()
+
+    async def slow_lookup(chat_id, user_id):
+        looking_up.set()
+        await asyncio.sleep(0.05)  # Telegram answers while the leave comes in
+        return SimpleNamespace(status=ChatMember.MEMBER)
+
+    query = SimpleNamespace(
+        data=f"join:{rid}",
+        answer=AsyncMock(),
+        from_user=SimpleNamespace(id=123, full_name="Alice", is_bot=False),
+    )
+    context = SimpleNamespace(bot=fake_bot(get_chat_member=AsyncMock(side_effect=slow_lookup)))
+    leave = member_update(ChatMember.LEFT, store.view(rid)["deadline"] - 60)
+
+    async def click_then_leave():
+        click = asyncio.create_task(
+            handlers.callback(SimpleNamespace(callback_query=query), context)
+        )
+        await looking_up.wait()
+        await asyncio.gather(click, handlers.member_changed(leave, None))
+
+    asyncio.run(click_then_leave())
+    assert store.view(rid)["entries"] == []
 
 
 def test_rejoining_group_allows_joining_again(setup):
