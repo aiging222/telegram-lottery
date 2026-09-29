@@ -751,6 +751,51 @@ def test_command_errors_in_groups_are_deleted_later(due):
     assert store.due_deletions() == {GROUP["id"]: [10, 77]}
 
 
+def long_list(store):
+    """A raffle in the group whose result takes several messages."""
+    rid = store.create(99, "长名单", 30, 60, chat_id=GROUP["id"])
+    for uid in range(1, 31):
+        store.join(rid, uid, "名" * 100)
+    return rid
+
+
+def test_a_long_result_carries_on_from_the_part_that_failed(due):
+    store, rid, now, handlers = due
+    store.cancel(rid, 99)  # only the long list is due
+    long = long_list(store)
+    now[0] += 3600
+    posted, failures = [], [TimedOut()]
+
+    async def send_message(chat_id, text, **kwargs):
+        if len(posted) == 1 and failures:
+            raise failures.pop()  # the second part fails once
+        posted.append(text)
+        return SimpleNamespace(message_id=len(posted))
+
+    bot = fake_bot(send_message=AsyncMock(side_effect=send_message))
+    for _ in range(2):  # the second pass retries
+        asyncio.run(handlers.auto_draw(SimpleNamespace(bot=bot)))
+    parts = chunks(result_text(store.view(long)["result"], mention=True))
+    assert len(parts) > 2
+    assert posted == parts  # every part once, in order
+    assert bot.pin_chat_message.await_args.args[1] == 1  # the first part
+
+
+def test_a_long_result_drawn_in_the_group_pins_its_first_part(due):
+    store, rid, _, handlers = due
+    store.cancel(rid, 99)
+    long = long_list(store)
+    store.freeze(long, 99)
+    update, context = command_update(f"/draw {long}", chat_type="supergroup")
+    ids = iter(range(100, 200))
+    update.effective_message.reply_text = AsyncMock(
+        side_effect=lambda *args, **kwargs: SimpleNamespace(message_id=next(ids))
+    )
+    asyncio.run(handlers.command(update, context))
+    assert update.effective_message.reply_text.await_count > 2
+    assert context.bot.pin_chat_message.await_args.args[1] == 100
+
+
 def test_messages_left_in_an_upgraded_group_are_given_up(due):
     store, rid, now, handlers = due
     store.schedule_deletions(GROUP["id"], [10], now[0])

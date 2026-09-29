@@ -149,16 +149,16 @@ def in_group(member):
 
 
 async def reply(message, text, markup=None, html=False):
-    """Reply in as many messages as needed; returns the last one sent."""
+    """Reply in as many messages as needed, the markup on the last; returns them all."""
     parts = chunks(text)
-    sent = None
-    for index, part in enumerate(parts):
-        sent = await message.reply_text(
+    return [
+        await message.reply_text(
             part,
             reply_markup=markup if index == len(parts) - 1 else None,
             parse_mode="HTML" if html else None,
         )
-    return sent
+        for index, part in enumerate(parts)
+    ]
 
 
 class BotHandlers:
@@ -170,6 +170,9 @@ class BotHandlers:
         # draw button or /draw in the group can reach the same result at the same moment.
         # Posting it happens under this lock, and whoever comes second finds it announced.
         self._announcing = asyncio.Lock()
+        # raffle ID -> message IDs of the parts of a long result already posted, so a retry
+        # carries on from the part that failed. A restart in between posts it all again.
+        self._posted_parts = {}
 
     async def command(self, update, context):
         message, user = update.effective_message, update.effective_user
@@ -288,7 +291,7 @@ class BotHandlers:
                         text, markup = card(raffle, self.timezone)
                         sent = await reply(message, text, markup)
                         if command == "publish" and raffle["chat_id"] == chat.id:
-                            await self.card_posted(context.bot, raffle, sent.message_id)
+                            await self.card_posted(context.bot, raffle, sent[-1].message_id)
                 elif command == "result":
                     if raffle["result"]:
                         await reply(message, result_text(raffle["result"], mention=True), html=True)
@@ -432,28 +435,31 @@ class BotHandlers:
         async with self._announcing:
             if not await asyncio.to_thread(self.store.announcement_due, rid):
                 return
+            sent = self._posted_parts.setdefault(rid, [])
             try:
                 result = await asyncio.to_thread(self.store.draw, rid, 0)
-                sent = [
-                    await bot.send_message(chat_id, part, parse_mode="HTML")
-                    for part in chunks(result_text(result, mention=True))
-                ]
+                for part in chunks(result_text(result, mention=True))[len(sent) :]:
+                    message = await bot.send_message(chat_id, part, parse_mode="HTML")
+                    sent.append(message.message_id)
             except ChatMigrated as exc:
-                # The group became a supergroup; announce there on the next pass.
+                # The group became a supergroup; announce there in full on the next pass.
+                del self._posted_parts[rid]
                 await self.follow_migration(bot, chat_id, exc.new_chat_id)
                 return
             except (Forbidden, BadRequest) as exc:
                 # The bot was removed or the chat is gone: stop retrying. The result stays
                 # saved and can still be read with /result.
+                del self._posted_parts[rid]
                 LOG.warning("抽奖 %s 的开奖结果无法发到群 %s：%s", rid, chat_id, exc)
                 await asyncio.to_thread(self.store.mark_announced, rid, 0, chat_id, str(exc))
                 return
             except TelegramError as exc:
                 LOG.warning("抽奖 %s 的开奖公告发送失败，稍后重试：%s", rid, exc)
                 return
+            del self._posted_parts[rid]
             await asyncio.to_thread(self.store.mark_announced, rid, 0, chat_id)
             await self.refresh_card(bot, rid)
-            await self.pin_result(bot, chat_id, sent[0].message_id)
+            await self.pin_result(bot, chat_id, sent[0])
 
     async def post_result(self, bot, message, rid, result, actor):
         """Reply with a result. Posted in the raffle's own group, it is the announcement
@@ -462,7 +468,7 @@ class BotHandlers:
         chat_id = message.chat.id
         if await asyncio.to_thread(self.store.mark_announced, rid, actor, chat_id):
             await self.refresh_card(bot, rid)
-            await self.pin_result(bot, chat_id, sent.message_id)
+            await self.pin_result(bot, chat_id, sent[0].message_id)
 
     async def publish_card(self, bot, rid):
         """Post the card to the raffle's group and remember it for later edits."""
@@ -509,7 +515,7 @@ class BotHandlers:
         """Answer a command; in a group both the command and the answer are tidied away."""
         sent = await reply(message, text, markup)
         if message.chat.type in ("group", "supergroup"):
-            ids = [message.message_id, sent.message_id]
+            ids = [message.message_id, *(part.message_id for part in sent)]
             await self.tidy(bot, message.chat.id, ids, "delete_notices")
 
     async def tidy(self, bot, chat_id, message_ids, setting):
