@@ -593,6 +593,25 @@ class BotHandlers:
     async def _refresh_job(self, context):
         await self.refresh_card(context.bot, context.job.data)
 
+    async def on_error(self, update, context):
+        # TokenFilter, installed by main(), masks the token in the message and traceback.
+        LOG.error("处理更新失败。", exc_info=context.error)
+        if not isinstance(update, Update):
+            return
+        try:
+            if update.callback_query:
+                # effective_message is the shared group card; tell only the person who clicked.
+                await update.callback_query.answer("操作未能完成，请重试。", show_alert=True)
+            elif update.effective_message:
+                # In a group it is tidied away with the message it answers.
+                await self.notice(
+                    context.bot,
+                    update.effective_message,
+                    "操作未能完成，请重试。若开奖已保存，重试会返回相同结果。",
+                )
+        except Exception:  # reporting an error must not raise another
+            LOG.exception("错误提示发送失败。")
+
     async def migrate(self, update, context):
         # Telegram sends one service message in the old group and one in the new supergroup.
         message = update.effective_message
@@ -648,23 +667,6 @@ class TokenFilter(logging.Filter):
         return True
 
 
-async def on_error(update, context):
-    # TokenFilter, installed by main(), masks the token in the message and traceback.
-    LOG.error("处理更新失败。", exc_info=context.error)
-    if not isinstance(update, Update):
-        return
-    try:
-        if update.callback_query:
-            # effective_message is the shared group card; tell only the person who clicked.
-            await update.callback_query.answer("操作未能完成，请重试。", show_alert=True)
-        elif update.effective_message:
-            await reply(
-                update.effective_message, "操作未能完成，请重试。若开奖已保存，重试会返回相同结果。"
-            )
-    except TelegramError:
-        LOG.error("错误提示发送失败。")
-
-
 async def register_commands(app):
     await app.bot.set_my_commands(
         [
@@ -709,7 +711,7 @@ def build_application(settings):
     for job in (handlers.auto_draw, handlers.cleanup):
         app.job_queue.run_repeating(job, interval=AUTO_DRAW_SECONDS, first=AUTO_DRAW_SECONDS)
     app.job_queue.run_once(menu.sync_all_admins, when=0)
-    app.add_error_handler(on_error)
+    app.add_error_handler(handlers.on_error)
     return app
 
 

@@ -18,7 +18,6 @@ from lottery.bot import (
     TokenFilter,
     build_application,
     main,
-    on_error,
 )
 from lottery.core import LotteryError, Store
 from lottery.views import card, chunks, result_text
@@ -451,7 +450,8 @@ def telegram_update(payload):
     return update, bot
 
 
-def test_button_error_is_answered_privately_not_in_group():
+def test_button_error_is_answered_privately_not_in_group(setup):
+    _, _, handlers = setup
     card_message = {"message_id": 5, "date": 0, "chat": GROUP, "text": "card"}
     update, bot = telegram_update(
         {
@@ -464,16 +464,20 @@ def test_button_error_is_answered_privately_not_in_group():
             }
         }
     )
-    asyncio.run(on_error(update, SimpleNamespace(error=RuntimeError("database is locked"))))
+    context = SimpleNamespace(bot=bot, error=RuntimeError("database is locked"))
+    asyncio.run(handlers.on_error(update, context))
     bot.send_message.assert_not_awaited()
     assert bot.answer_callback_query.await_args.kwargs["show_alert"] is True
 
 
-def test_command_error_still_replies_in_chat():
+def test_command_error_replies_and_is_tidied_away_in_groups(due):
+    store, _, now, handlers = due
     message = {"message_id": 5, "date": 0, "chat": GROUP, "from": USER, "text": "/draw 1"}
     update, bot = telegram_update({"message": message})
-    asyncio.run(on_error(update, SimpleNamespace(error=RuntimeError("network down"))))
+    asyncio.run(handlers.on_error(update, SimpleNamespace(bot=bot, error=RuntimeError("down"))))
     assert "请重试" in bot.send_message.await_args.kwargs["text"]
+    now[0] += 600
+    assert store.due_deletions() == {GROUP["id"]: [5, 88]}  # the command and the reply
 
 
 def test_token_filter_masks_message_and_traceback():
