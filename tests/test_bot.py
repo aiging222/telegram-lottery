@@ -594,6 +594,53 @@ def test_early_manual_draw_reaches_group_once(due, chat_type, group_posts):
     run_auto_draw(handlers).assert_not_awaited()
 
 
+async def slow_reply(*args, **kwargs):
+    await asyncio.sleep(0.05)  # a network round trip: other tasks run meanwhile
+    return SimpleNamespace(message_id=88)
+
+
+def test_overlapping_announcements_post_the_result_once(due):
+    store, rid, now, handlers = due
+    now[0] += 3600
+    bot = fake_bot(send_message=AsyncMock(side_effect=slow_reply))
+
+    async def overlap():
+        # The menu's draw button while the deadline job and a filling join run.
+        context = SimpleNamespace(bot=bot)
+        await asyncio.gather(
+            handlers.announce(bot, rid, GROUP["id"]),
+            handlers.auto_draw(context),
+            handlers.auto_draw(context),
+        )
+
+    asyncio.run(overlap())
+    assert bot.send_message.await_count == 1
+    assert [e["action"] for e in store.export(rid)["audit"]].count("announce") == 1
+
+
+def test_draw_in_the_group_is_not_announced_again_by_the_job(due):
+    store, rid, _, handlers = due
+    store.freeze(rid, 99)
+    update, context = command_update(f"/draw {rid}", chat_type="supergroup")
+    replying = asyncio.Event()
+
+    async def reply_text(*args, **kwargs):
+        replying.set()
+        return await slow_reply()
+
+    update.effective_message.reply_text = AsyncMock(side_effect=reply_text)
+    job_bot = fake_bot()
+
+    async def overlap():
+        draw = asyncio.create_task(handlers.command(update, context))
+        await replying.wait()  # drawn and being posted: the job now sees it as due
+        await asyncio.gather(draw, handlers.auto_draw(SimpleNamespace(bot=job_bot)))
+
+    asyncio.run(overlap())
+    job_bot.send_message.assert_not_awaited()
+    assert update.effective_message.reply_text.await_count == 1
+
+
 def test_result_names_each_winners_prize():
     result = {
         "raffle_id": 1,

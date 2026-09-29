@@ -687,6 +687,12 @@ class Store:
                 )
             ]
 
+    def announcement_due(self, raffle_id):
+        """Whether the result has yet to reach the group: neither announced nor cancelled."""
+        with self.transaction() as db:
+            raffle = self._get(db, raffle_id)
+        return raffle["announced_at"] is None and raffle["status"] != "CANCELLED"
+
     def mark_announced(self, raffle_id, actor, chat_id, error=None):
         """Record that the result reached its group (or never can); False if nothing was due."""
         with self.transaction() as db:

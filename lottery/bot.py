@@ -176,6 +176,10 @@ class BotHandlers:
         self.store = store
         self.admin_ids = admin_ids
         self.timezone = timezone
+        # The deadline job runs alongside updates, so a join that fills a raffle, the menu's
+        # draw button or /draw in the group can reach the same result at the same moment.
+        # Posting it happens under this lock, and whoever comes second finds it announced.
+        self._announcing = asyncio.Lock()
 
     async def command(self, update, context):
         message, user = update.effective_message, update.effective_user
@@ -258,12 +262,13 @@ class BotHandlers:
                 await reply(message, text)
                 return
             elif command == "draw":
-                result = await asyncio.to_thread(self.store.draw, rid, user.id)
-                sent = await reply(message, result_text(result, mention=True), html=True)
-                # Drawn in the bound group itself: no automatic announcement needed there.
-                if await asyncio.to_thread(self.store.mark_announced, rid, user.id, chat.id):
-                    await self.refresh_card(context.bot, rid)
-                    await self.pin_result(context.bot, chat.id, sent.message_id)
+                async with self._announcing:
+                    result = await asyncio.to_thread(self.store.draw, rid, user.id)
+                    sent = await reply(message, result_text(result, mention=True), html=True)
+                    # Drawn in the bound group itself: no automatic announcement needed there.
+                    if await asyncio.to_thread(self.store.mark_announced, rid, user.id, chat.id):
+                        await self.refresh_card(context.bot, rid)
+                        await self.pin_result(context.bot, chat.id, sent.message_id)
                 return
             elif command == "export":
                 exported = await asyncio.to_thread(self.store.export, rid)
@@ -415,28 +420,31 @@ class BotHandlers:
 
     async def announce(self, bot, rid, chat_id):
         """Draw if needed, post the result to the raffle's group and close its card."""
-        try:
-            result = await asyncio.to_thread(self.store.draw, rid, 0)
-            sent = [
-                await bot.send_message(chat_id, part, parse_mode="HTML")
-                for part in chunks(result_text(result, mention=True))
-            ]
-        except ChatMigrated as exc:
-            # The group became a supergroup; announce there on the next pass.
-            await asyncio.to_thread(self.store.migrate_chat, chat_id, exc.new_chat_id)
-            return
-        except (Forbidden, BadRequest) as exc:
-            # The bot was removed or the chat is gone: stop retrying. The result stays
-            # saved and can still be read with /result.
-            LOG.warning("抽奖 %s 的开奖结果无法发到群 %s：%s", rid, chat_id, exc)
-            await asyncio.to_thread(self.store.mark_announced, rid, 0, chat_id, str(exc))
-            return
-        except TelegramError as exc:
-            LOG.warning("抽奖 %s 的开奖公告发送失败，稍后重试：%s", rid, exc)
-            return
-        await asyncio.to_thread(self.store.mark_announced, rid, 0, chat_id)
-        await self.refresh_card(bot, rid)
-        await self.pin_result(bot, chat_id, sent[0].message_id)
+        async with self._announcing:
+            if not await asyncio.to_thread(self.store.announcement_due, rid):
+                return
+            try:
+                result = await asyncio.to_thread(self.store.draw, rid, 0)
+                sent = [
+                    await bot.send_message(chat_id, part, parse_mode="HTML")
+                    for part in chunks(result_text(result, mention=True))
+                ]
+            except ChatMigrated as exc:
+                # The group became a supergroup; announce there on the next pass.
+                await asyncio.to_thread(self.store.migrate_chat, chat_id, exc.new_chat_id)
+                return
+            except (Forbidden, BadRequest) as exc:
+                # The bot was removed or the chat is gone: stop retrying. The result stays
+                # saved and can still be read with /result.
+                LOG.warning("抽奖 %s 的开奖结果无法发到群 %s：%s", rid, chat_id, exc)
+                await asyncio.to_thread(self.store.mark_announced, rid, 0, chat_id, str(exc))
+                return
+            except TelegramError as exc:
+                LOG.warning("抽奖 %s 的开奖公告发送失败，稍后重试：%s", rid, exc)
+                return
+            await asyncio.to_thread(self.store.mark_announced, rid, 0, chat_id)
+            await self.refresh_card(bot, rid)
+            await self.pin_result(bot, chat_id, sent[0].message_id)
 
     async def publish_card(self, bot, rid):
         """Post the card to the raffle's group and remember it for later edits."""
