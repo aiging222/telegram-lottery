@@ -790,6 +790,14 @@ class Store:
             else:
                 db.execute("DELETE FROM managers WHERE chat_id=? AND user_id=?", (chat_id, user_id))
 
+    def set_admins(self, chat_id, user_ids):
+        """Replace what is known about chat_id's managers with Telegram's list of admins."""
+        with self.transaction() as db:
+            db.execute("DELETE FROM managers WHERE chat_id=?", (chat_id,))
+            db.executemany(
+                "INSERT OR IGNORE INTO managers VALUES(?,?)", [(chat_id, u) for u in user_ids]
+            )
+
     def managed_groups(self, user_id):
         """Groups the bot is in that user_id was last seen managing, as (chat_id, title)."""
         with self.transaction() as db:

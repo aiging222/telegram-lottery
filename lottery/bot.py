@@ -20,7 +20,7 @@ from telegram.ext import (
 )
 
 from lottery.core import MAX_KEYWORD, LotteryError, Store, integer
-from lottery.menu import Menu
+from lottery.menu import MANAGERS, Menu
 from lottery.views import (
     EXPORT_CAPTION,
     card,
@@ -409,7 +409,13 @@ class BotHandlers:
 
     async def member_changed(self, update, context):
         change = update.chat_member
-        if in_group(change.new_chat_member):
+        member = change.new_chat_member
+        if MANAGERS & {change.old_chat_member.status, member.status}:
+            # Promotions and demotions come here too; "我的群" follows them.
+            await asyncio.to_thread(
+                self.store.set_manager, change.chat.id, member.user.id, member.status in MANAGERS
+            )
+        if in_group(member):
             return
         # Judge by when the member left, not when the update arrives: after downtime a
         # leave from before the deadline still cancels the join if the list is not frozen.
@@ -668,6 +674,7 @@ def build_application(settings):
     app.add_handler(ChatMemberHandler(menu.bot_membership, ChatMemberHandler.MY_CHAT_MEMBER))
     for job in (handlers.auto_draw, handlers.cleanup):
         app.job_queue.run_repeating(job, interval=AUTO_DRAW_SECONDS, first=AUTO_DRAW_SECONDS)
+    app.job_queue.run_once(menu.sync_all_admins, when=0)
     app.add_error_handler(on_error)
     return app
 

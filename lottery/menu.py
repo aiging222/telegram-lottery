@@ -143,6 +143,21 @@ class Menu:
         if chat_id is None or not await self.can_manage(bot, user_id, chat_id):
             raise LotteryError(NOT_MANAGER)
 
+    async def sync_admins(self, bot, chat_id):
+        """Record the group's admins as Telegram lists them, so they find it in "我的群"."""
+        try:
+            admins = await bot.get_chat_administrators(chat_id)
+        except TelegramError as exc:
+            LOG.warning("无法获取群 %s 的管理员名单：%s", chat_id, exc)
+            return
+        await asyncio.to_thread(self.store.set_admins, chat_id, [a.user.id for a in admins])
+
+    async def sync_all_admins(self, context):
+        """At startup, since admins may have changed while the bot was away (chat_member
+        updates keep the list current while it runs)."""
+        for chat_id, _ in await asyncio.to_thread(self.store.groups):
+            await self.sync_admins(context.bot, chat_id)
+
     async def my_groups(self, bot, user_id):
         """Groups user_id manages, as (chat_id, title). Only super admins get every group the
         bot is in; anyone else is checked against the groups they were last seen managing,
@@ -221,8 +236,7 @@ class Menu:
         )
         if status in GONE or change.old_chat_member.status not in GONE:
             return  # it left, or only its rights changed
-        # Whoever added the bot finds the group in "我的群" if they manage it.
-        await self.can_manage(context.bot, change.from_user.id, chat.id)
+        await self.sync_admins(context.bot, chat.id)
         if status == ChatMember.ADMINISTRATOR:
             text = "✅ 已就绪。群管理员点击下面按钮发起和管理抽奖。"
         else:

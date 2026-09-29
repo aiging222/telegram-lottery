@@ -31,10 +31,18 @@ def env(tmp_path):
     async def get_chat_member(chat_id, user_id):
         return SimpleNamespace(status=statuses.get((chat_id, user_id), ChatMember.LEFT))
 
+    async def get_chat_administrators(chat_id):
+        return [
+            SimpleNamespace(user=SimpleNamespace(id=user_id))
+            for (chat, user_id), status in statuses.items()
+            if chat == chat_id and status in (ChatMember.OWNER, ChatMember.ADMINISTRATOR)
+        ]
+
     bot = SimpleNamespace(
         id=4242,
         username="lottery_test_bot",
         get_chat_member=AsyncMock(side_effect=get_chat_member),
+        get_chat_administrators=AsyncMock(side_effect=get_chat_administrators),
         send_message=AsyncMock(return_value=SimpleNamespace(message_id=500)),
         edit_message_text=AsyncMock(),
         send_document=AsyncMock(),
@@ -157,6 +165,25 @@ def test_my_groups_drops_a_group_the_user_no_longer_manages(env):
     text, _ = shown(press(env, OWNER, "m:groups"))
     assert text.startswith("还没有你能管理的群")
     assert env.store.managed_groups(OWNER) == []
+
+
+def test_admins_are_recorded_at_startup(env):
+    env.store.remember_group(-200, "二群")
+    env.store.set_manager(GROUP, MEMBER, True)  # an admin once, demoted while the bot was away
+    lookup = env.bot.get_chat_administrators.side_effect
+
+    async def flaky(chat_id):
+        if chat_id == -200:
+            raise TimedOut()
+        return await lookup(chat_id)
+
+    env.bot.get_chat_administrators.side_effect = flaky
+    asyncio.run(env.menu.sync_all_admins(SimpleNamespace(bot=env.bot)))
+    assert env.store.managed_groups(OWNER) == [(GROUP, "测试群")]
+    assert env.store.managed_groups(MEMBER) == []
+    # The owner never pressed the group's button, yet finds the group.
+    _, buttons = shown(press(env, OWNER, "m:groups"))
+    assert buttons["测试群"] == f"m:g:{GROUP}"
 
 
 HEADER = "🎁 发起抽奖（/cancel 退出）\n\n"
@@ -445,9 +472,9 @@ def test_last_join_of_a_full_raffle_draws_at_once(env):
 
 def test_bot_added_to_group_posts_welcome_and_is_remembered(env):
     env.statuses[(-300, OWNER)] = ChatMember.OWNER
+    env.statuses[(-300, MEMBER)] = ChatMember.ADMINISTRATOR
     change = SimpleNamespace(
         chat=SimpleNamespace(id=-300, type="supergroup", title="新群"),
-        from_user=SimpleNamespace(id=OWNER),
         old_chat_member=SimpleNamespace(status=ChatMember.LEFT),
         new_chat_member=SimpleNamespace(status=ChatMember.ADMINISTRATOR),
     )
@@ -459,7 +486,8 @@ def test_bot_added_to_group_posts_welcome_and_is_remembered(env):
         "⚙️ 管理抽奖": "https://t.me/lottery_test_bot?start=g-300"
     }
     assert (-300, "新群") in env.store.groups()
-    assert env.store.managed_groups(OWNER) == [(-300, "新群")]  # the owner who added it
+    for admin in (OWNER, MEMBER):  # every admin, not only whoever added the bot
+        assert env.store.managed_groups(admin) == [(-300, "新群")]
     change.old_chat_member = change.new_chat_member
     change.new_chat_member = SimpleNamespace(status=ChatMember.LEFT)
     asyncio.run(env.menu.bot_membership(SimpleNamespace(my_chat_member=change), context))
@@ -471,7 +499,6 @@ def test_bot_added_to_group_posts_welcome_and_is_remembered(env):
 def test_bot_added_without_admin_rights_asks_for_them(env):
     change = SimpleNamespace(
         chat=SimpleNamespace(id=-300, type="group", title="新群"),
-        from_user=SimpleNamespace(id=MEMBER),
         old_chat_member=SimpleNamespace(status=ChatMember.LEFT),
         new_chat_member=SimpleNamespace(status=ChatMember.MEMBER),
     )

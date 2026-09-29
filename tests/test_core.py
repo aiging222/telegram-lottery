@@ -445,6 +445,10 @@ def test_managers_are_remembered_per_group(setup):
     assert store.managed_groups(5) == [(-1001, "甲群")]
     store.set_manager(-1001, 5, False)
     assert store.managed_groups(5) == []
+    store.set_manager(-1001, 5, True)
+    store.set_admins(-1001, [6, 7])  # Telegram's list replaces what was known
+    assert store.managed_groups(5) == []
+    assert store.managed_groups(6) == store.managed_groups(7) == [(-1001, "甲群")]
 
 
 def test_weighted_notice_stays_once_set(setup):

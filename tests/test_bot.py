@@ -276,7 +276,8 @@ def test_build_application_offline(tmp_path, monkeypatch):
     assert len(app.handlers[0]) == 10
     assert app.concurrent_updates == 1
     assert {"chat_member", "my_chat_member"} <= set(ALLOWED_UPDATES)
-    assert [job.callback.__name__ for job in app.job_queue.jobs()] == ["auto_draw", "cleanup"]
+    jobs = [job.callback.__name__ for job in app.job_queue.jobs()]
+    assert jobs == ["auto_draw", "cleanup", "sync_all_admins"]
 
 
 def test_missing_configuration_fails_closed(monkeypatch, tmp_path):
@@ -521,13 +522,25 @@ def test_unchanged_settings_are_reported(setup):
     assert len(store.export(rid)["audit"]) == 1
 
 
-def member_update(status, left_at, **fields):
+def member_update(status, left_at, old_status=ChatMember.MEMBER, **fields):
     change = SimpleNamespace(
         chat=SimpleNamespace(id=GROUP["id"]),
         date=datetime.fromtimestamp(left_at, UTC),
+        old_chat_member=SimpleNamespace(status=old_status),
         new_chat_member=SimpleNamespace(status=status, user=SimpleNamespace(id=123), **fields),
     )
     return SimpleNamespace(chat_member=change)
+
+
+def test_promoted_and_demoted_admins_are_followed(setup):
+    store, _, handlers = setup
+    store.remember_group(GROUP["id"], "测试群")
+    promoted = member_update(ChatMember.ADMINISTRATOR, store.clock())
+    asyncio.run(handlers.member_changed(promoted, None))
+    assert store.managed_groups(123) == [(GROUP["id"], "测试群")]
+    demoted = member_update(ChatMember.MEMBER, store.clock(), old_status=ChatMember.ADMINISTRATOR)
+    asyncio.run(handlers.member_changed(demoted, None))
+    assert store.managed_groups(123) == []
 
 
 @pytest.mark.parametrize(
