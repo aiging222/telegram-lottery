@@ -1541,7 +1541,7 @@ def test_wizard_creates_an_invite_draw_that_ends_once_enough_reach_it(env):
     card = env.bot.send_message.await_args
     assert "🪁 邀请满 3 人即可参与，抽 2 人" in card.args[1]
     assert "👉 用「添加成员」把好友拉进群即可参与" in card.args[1]
-    assert list(labels(card.kwargs["reply_markup"])) == ["📊 查看我的邀请"]
+    assert list(labels(card.kwargs["reply_markup"])) == ["📊 查看邀请进度"]
 
 
 def test_members_get_their_invite_link_in_private(env):

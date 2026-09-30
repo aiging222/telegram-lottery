@@ -10,7 +10,13 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
-from telegram import BotCommand, BotCommandScopeAllGroupChats, ChatMember, Update
+from telegram import (
+    BotCommand,
+    BotCommandScopeAllChatAdministrators,
+    BotCommandScopeAllGroupChats,
+    ChatMember,
+    Update,
+)
 from telegram.error import BadRequest, ChatMigrated, Forbidden, TelegramError
 from telegram.ext import (
     Application,
@@ -23,6 +29,7 @@ from telegram.ext import (
 
 from lottery.core import MAX_KEYWORD, LotteryError, NotEnoughPoints, Store, integer
 from lottery.menu import MANAGERS, Menu, one_at_a_time, presser, sender
+from lottery.moderation import Moderation
 from lottery.points import ADJUST, WORDS, Points
 from lottery.views import (
     EXPORT_CAPTION,
@@ -104,6 +111,7 @@ PUBLIC_HELP = """🎁 抽奖机器人
 /id — 查看自己的用户 ID
 /link — 在群里领取自己的专属邀请链接，查看自己邀请了多少人
 /checkin — 在群里每日签到领灵石，和发「签到」一样
+/ban、/unban — 群管理员回复某人的消息（或跟用户 ID）封禁、解除封禁
 在群里发送「签到」领灵石，「灵石」查看自己的灵石，「灵石榜」看排行。"""
 ADMIN_HELP = """
 
@@ -1045,16 +1053,23 @@ class TokenFilter(logging.Filter):
 
 async def register_commands(app):
     # Everything else is done with buttons; the other commands still work when typed.
-    # Groups also list /link and /checkin, which answer only there.
+    # Groups also list /link and /checkin, which answer only there, and their admins see
+    # /ban and /unban besides: the admins' list stands in for the group's, so it has all.
     commands = [BotCommand("start", "打开菜单"), BotCommand("id", "查看我的用户 ID")]
     await app.bot.set_my_commands(commands)
+    in_groups = [
+        *commands,
+        BotCommand("link", "领取专属邀请链接、查看邀请人数"),
+        BotCommand("checkin", "每日签到"),
+    ]
+    await app.bot.set_my_commands(in_groups, scope=BotCommandScopeAllGroupChats())
     await app.bot.set_my_commands(
         [
-            *commands,
-            BotCommand("link", "领取专属邀请链接、查看邀请人数"),
-            BotCommand("checkin", "每日签到"),
+            *in_groups,
+            BotCommand("ban", "封禁用户（回复他的消息，或跟用户 ID）"),
+            BotCommand("unban", "解除封禁（回复他的消息，或跟用户 ID）"),
         ],
-        scope=BotCommandScopeAllGroupChats(),
+        scope=BotCommandScopeAllChatAdministrators(),
     )
 
 
@@ -1083,6 +1098,7 @@ def build_application(settings):
     app.add_handler(CallbackQueryHandler(menu.callback, pattern=r"^m:"))
     points = Points(handlers)
     app.add_handler(CommandHandler("checkin", points.command))
+    app.add_handler(CommandHandler(["ban", "unban"], Moderation(handlers).command))
     app.add_handler(CallbackQueryHandler(points.button, pattern=r"^pts:(checkin|wallet|board)$"))
     app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, handlers.migrate))
     app.add_handler(

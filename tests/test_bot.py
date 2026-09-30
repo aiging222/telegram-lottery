@@ -319,7 +319,7 @@ def test_build_application_offline(tmp_path, monkeypatch):
         "123456:offline-test-token", frozenset({99}), str(tmp_path / "test.sqlite3"), SHANGHAI
     )
     app = build_application(settings)
-    assert len(app.handlers[0]) == 13
+    assert len(app.handlers[0]) == 14
     assert app.concurrent_updates > 1
     assert {"chat_member", "my_chat_member"} <= set(ALLOWED_UPDATES)
     jobs = [job.callback.__name__ for job in app.job_queue.jobs()]
@@ -973,7 +973,7 @@ def test_standing_in_a_reach_raffle_and_its_length():
     assert standing_text(rank, crowd, 8).endswith("你：第 9 名 · 99992 次")
 
 
-def test_the_command_menu_lists_start_and_id_and_link_and_checkin_in_groups():
+def test_the_command_menu_lists_group_commands_and_admin_ones_for_admins():
     bot = SimpleNamespace(set_my_commands=AsyncMock())
     asyncio.run(register_commands(SimpleNamespace(bot=bot)))
     menus = {
@@ -983,6 +983,7 @@ def test_the_command_menu_lists_start_and_id_and_link_and_checkin_in_groups():
     assert menus == {
         "default": ["start", "id"],
         "all_group_chats": ["start", "id", "link", "checkin"],
+        "all_chat_administrators": ["start", "id", "link", "checkin", "ban", "unban"],
     }
 
 
@@ -1296,6 +1297,7 @@ def test_the_card_button_opens_a_private_chat_for_the_link(inviting):
     assert "🪁 按邀请人数排名，前 1 名获奖\n📊 统计 " in text
     assert "起用专属邀请链接进群的新成员\n" in text
     assert [b.callback_data for b in markup.inline_keyboard[0]] == [f"invite:{rid}", f"rank:{rid}"]
+    assert markup.inline_keyboard[0][1].text == "📊 查看邀请排名"
     query = SimpleNamespace(
         data=f"invite:{rid}",
         answer=AsyncMock(),

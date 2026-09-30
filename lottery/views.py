@@ -164,7 +164,9 @@ def card(raffle, timezone):
     if raffle["status"] == "OPEN" and raffle["chat_id"] is not None:
         if kind != "join":
             lines.append(f"👉 {INVITE_HINTS.get(raffle.get('invite_via'), '在群里发言即可参与')}")
-            label = "📊 查看我的邀请" if raffle.get("invite_via") else "📊 查看我的排名"
+            label = "📊 查看我的排名"
+            if raffle.get("invite_via"):  # the pop-up shows the ranking, or how close one is
+                label = "📊 查看邀请排名" if kind == "rank" else "📊 查看邀请进度"
             row = [InlineKeyboardButton(label, callback_data=f"rank:{raffle['id']}")]
             if raffle.get("invite_via") == "link":
                 link = InlineKeyboardButton(
