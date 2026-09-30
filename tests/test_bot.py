@@ -13,6 +13,7 @@ from telegram.error import BadRequest, ChatMigrated, Forbidden, TimedOut
 
 from lottery.bot import (
     ALLOWED_UPDATES,
+    GROUP_BUDGET,
     BotHandlers,
     Settings,
     TokenFilter,
@@ -123,6 +124,18 @@ def test_admin_flow_and_group_draw(setup):
     second = run_command(handlers, f"/draw {rid}", chat_type="supergroup")
     assert first.reply_text.call_args == second.reply_text.call_args
     assert "Alice" in first.reply_text.call_args.args[0]
+
+
+def test_replies_in_a_group_count_against_its_budget(setup):
+    _, rid, handlers = setup
+    run_command(handlers, f"/publish {rid}", chat_type="supergroup")  # the card
+    run_command(handlers, f"/freeze {rid}")  # a private chat has no budget
+    run_command(handlers, f"/draw {rid}", chat_type="supergroup")  # the result
+    for _ in range(GROUP_BUDGET - 3):
+        run_command(handlers, f"/result {rid}", chat_type="supergroup")
+    assert handlers.room(GROUP["id"])
+    run_command(handlers, f"/result {rid}", chat_type="supergroup")
+    assert not handlers.room(GROUP["id"])
 
 
 def test_bad_arguments_do_not_modify_data(setup):

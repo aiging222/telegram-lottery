@@ -235,16 +235,16 @@ class BotHandlers:
             return
         try:
             if command == "help":
-                await reply(
+                await self.say(
                     message, PUBLIC_HELP + (ADMIN_HELP if user.id in self.admin_ids else "")
                 )
                 return
             if command == "id":
-                await reply(message, f"你的 Telegram 用户 ID：{user.id}")
+                await self.say(message, f"你的 Telegram 用户 ID：{user.id}")
                 return
             if command == "raffles":
                 rows = await asyncio.to_thread(self.store.recent)
-                await reply(
+                await self.say(
                     message,
                     "\n".join(f"{r['id']}｜{r['title']}｜{status_text(r)}" for r in rows)
                     or "暂无抽奖。",
@@ -256,7 +256,9 @@ class BotHandlers:
                 rid = await asyncio.to_thread(
                     self.store.create, user.id, " ".join(args[2:]), int(args[0]), int(args[1])
                 )
-                await reply(message, f"已创建抽奖 {rid}。配置完成后，在目标群发送 /publish {rid}。")
+                await self.say(
+                    message, f"已创建抽奖 {rid}。配置完成后，在目标群发送 /publish {rid}。"
+                )
                 return
             if len(args) != COUNTS[command]:
                 raise LotteryError("用法：" + USAGE[command])
@@ -274,7 +276,7 @@ class BotHandlers:
                     self.store.grant, rid, user.id, int(args[1]), args[2], command == "grant"
                 )
                 if not changed:
-                    await reply(
+                    await self.say(
                         message,
                         "该用户已有此条件，未做修改。"
                         if command == "grant"
@@ -297,7 +299,7 @@ class BotHandlers:
                     )
                 else:
                     text = f"抽奖 {rid} 报名已截止。它还没有发布到群，不会自动开奖，请用 /draw {rid} 开奖。"
-                await reply(message, text)
+                await self.say(message, text)
                 return
             elif command == "draw":
                 async with self._announcing:
@@ -327,19 +329,23 @@ class BotHandlers:
                         await self.post_result(context.bot, message, rid, raffle["result"], user.id)
                 elif command in ("publish", "raffle"):
                     if raffle["result"]:
-                        await reply(message, result_text(raffle["result"], mention=True), html=True)
+                        await self.say(
+                            message, result_text(raffle["result"], mention=True), html=True
+                        )
                     else:
                         text, markup = card(raffle, self.timezone)
-                        sent = await reply(message, text, markup)
+                        sent = await self.say(message, text, markup)
                         if command == "publish" and raffle["chat_id"] == chat.id:
                             await self.card_posted(context.bot, raffle, sent[-1].message_id)
                 elif command == "result":
                     if raffle["result"]:
-                        await reply(message, result_text(raffle["result"], mention=True), html=True)
+                        await self.say(
+                            message, result_text(raffle["result"], mention=True), html=True
+                        )
                     else:
-                        await reply(message, "尚未开奖，到开奖时间会自动公布。")
+                        await self.say(message, "尚未开奖，到开奖时间会自动公布。")
                 elif command == "rules":
-                    await reply(
+                    await self.say(
                         message,
                         f"默认权重 {raffle['default_weight']}，上限 {raffle['weight_cap']}。\n"
                         "个人覆盖值优先，规则加成由管理员核验后授予。\n"
@@ -374,14 +380,14 @@ class BotHandlers:
                         )
                 if command == "preview":
                     lines.append("展示前 30 人。完整名单和记录使用 /export。")
-                    await reply(message, "\n".join(lines))
+                    await self.say(message, "\n".join(lines))
                 return
             if not changed:
-                await reply(message, "与现有设置相同，未做修改。")
+                await self.say(message, "与现有设置相同，未做修改。")
                 return
             # A first bonus or personal weight must show up on the group card.
             self.refresh_card_soon(context, rid)
-            await reply(message, f"抽奖 {rid} 的配置已保存，可用 /preview {rid} 查看。")
+            await self.say(message, f"抽奖 {rid} 的配置已保存，可用 /preview {rid} 查看。")
         except LotteryError as exc:
             await self.notice(context.bot, message, str(exc))
         except (ValueError, OverflowError):
@@ -460,6 +466,13 @@ class BotHandlers:
         """Count messages just sent to chat_id against its budget."""
         self._sent.setdefault(chat_id, []).extend([self.store.clock()] * count)
 
+    async def say(self, message, text, markup=None, html=False):
+        """reply(), counting what it sends a group against the group's budget."""
+        sent = await reply(message, text, markup, html)
+        if message.chat.type in ("group", "supergroup"):
+            self.spent(message.chat.id, len(sent))
+        return sent
+
     async def ranking(self, rid):
         """An open activity raffle and its ranking, for the card's 📊 button. Working it out
         reads every message counted, a second or so in a big group, and many may press at
@@ -512,8 +525,7 @@ class BotHandlers:
             except TelegramError as exc:
                 LOG.info("报名成功的表情回应失败：%s", exc)
         if notes:
-            sent = await reply(message, "\n".join(notes))
-            self.spent(message.chat.id, len(sent))
+            sent = await self.say(message, "\n".join(notes))
             ids = [part.message_id for part in sent]
             await self.tidy(context.bot, message.chat.id, ids, "delete_notices")
         await self.tidy(context.bot, message.chat.id, [message.message_id], "delete_keyword")
@@ -626,7 +638,7 @@ class BotHandlers:
         if message is None or user is None or user.is_bot or message.sender_chat:
             return
         if chat.type not in ("group", "supergroup"):
-            await reply(message, "请在群里发送 /link，或点抽奖卡片上的「🔗 领取我的邀请链接」。")
+            await self.say(message, "请在群里发送 /link，或点抽奖卡片上的「🔗 领取我的邀请链接」。")
             return
         # Whoever writes in the group is in it: no need to ask Telegram.
         text = await self.invite_link_text(context.bot, chat.id, user, check=False)
@@ -679,7 +691,7 @@ class BotHandlers:
     async def post_result(self, bot, message, rid, result, actor):
         """Reply with a result. Posted in the raffle's own group, it is the announcement
         there, so the deadline job need not send it; callers hold self._announcing."""
-        sent = await reply(message, result_text(result, mention=True), html=True)
+        sent = await self.say(message, result_text(result, mention=True), html=True)
         chat_id = message.chat.id
         if await asyncio.to_thread(self.store.mark_announced, rid, actor, chat_id):
             await self.refresh_card(bot, rid)
@@ -768,9 +780,8 @@ class BotHandlers:
     async def notice(self, bot, message, text, markup=None, at_least=0):
         """Answer a command; in a group both the command and the answer are tidied away, no
         sooner than `at_least` seconds."""
-        sent = await reply(message, text, markup)
+        sent = await self.say(message, text, markup)
         if message.chat.type in ("group", "supergroup"):
-            self.spent(message.chat.id, len(sent))
             ids = [message.message_id, *(part.message_id for part in sent)]
             await self.tidy(bot, message.chat.id, ids, "delete_notices", at_least)
 

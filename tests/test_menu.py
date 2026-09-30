@@ -9,7 +9,7 @@ import pytest
 from telegram import ChatMember
 from telegram.error import BadRequest, ChatMigrated, Forbidden, TimedOut
 
-from lottery.bot import BotHandlers
+from lottery.bot import GROUP_BUDGET, BotHandlers
 from lottery.core import LotteryError, Store
 from lottery.menu import NOT_MANAGER, STALE, Menu, parse_time
 
@@ -639,6 +639,15 @@ def test_a_long_list_of_winners_is_cut_to_fit_one_message(env):
     assert len(text.encode("utf-16-le")) // 2 <= 4096
     assert "\n中奖：😀" in text
     assert text.endswith("…等 100 人，完整名单见开奖公告")
+
+
+def test_what_the_menu_posts_in_a_group_counts_against_its_budget(env):
+    rid = env.store.create(OWNER, "耳机", 1, 60, chat_id=GROUP)
+    env.handlers.spent(GROUP, GROUP_BUDGET - 2)
+    start(env, OWNER, chat_type="supergroup")  # the welcome with its button
+    assert env.handlers.room(GROUP)
+    press(env, OWNER, f"m:do:cancel:{rid}")  # the notice that the raffle is called off
+    assert not env.handlers.room(GROUP)
 
 
 def test_cancel_from_records(env):

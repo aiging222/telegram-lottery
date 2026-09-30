@@ -415,6 +415,7 @@ class Menu:
         except TelegramError as exc:
             LOG.warning("群 %s 的欢迎消息发送失败：%s", chat_id, exc)
             return
+        self.handlers.spent(chat_id)
         ids = [sent.message_id] if trigger is None else [trigger, sent.message_id]
         # Left a minute at least, for an admin to press its button.
         await self.handlers.tidy(bot, chat_id, ids, "delete_notices", at_least=60)
@@ -1727,6 +1728,7 @@ class Menu:
                 except TelegramError as exc:
                     LOG.warning("抽奖 %s 的取消通知发送失败：%s", rid, exc)
                 else:
+                    self.handlers.spent(chat_id)
                     await self.handlers.tidy(bot, chat_id, [sent.message_id], "delete_notices")
                 if raffle["card_message_id"] is not None:
                     await self.handlers.restore_panel(bot, chat_id)
