@@ -1608,3 +1608,187 @@ def test_a_typed_report_group_must_be_the_admins_own(env):
     )
     env.statuses[(-300, 4242)] = ChatMember.ADMINISTRATOR
     assert type_text(env, OWNER, "@xxxx")[0] == "只能选你管理的群作报道群。"
+
+
+def test_invite_links_are_renewed_when_the_bot_may_no_longer_invite(env):
+    env.store.save_invite_link(GROUP, MEMBER, "https://t.me/+old", "user6")
+
+    def rights(status, invite):
+        change = SimpleNamespace(
+            chat=SimpleNamespace(id=GROUP, type="supergroup", title="测试群"),
+            old_chat_member=SimpleNamespace(status=ChatMember.ADMINISTRATOR),
+            new_chat_member=SimpleNamespace(status=status, can_invite_users=invite),
+        )
+        context = SimpleNamespace(bot=env.bot)
+        asyncio.run(env.menu.bot_membership(SimpleNamespace(my_chat_member=change), context))
+
+    rights(ChatMember.ADMINISTRATOR, True)  # other rights changed: the links stay
+    assert env.store.invite_link(GROUP, MEMBER)["link"] == "https://t.me/+old"
+    rights(ChatMember.ADMINISTRATOR, False)  # Telegram may have voided them
+    assert env.store.invite_link(GROUP, MEMBER) is None
+    assert env.store.link_owner(GROUP, "https://t.me/+old") == (MEMBER, "user6")
+
+
+def test_admins_reset_the_invite_links(env):
+    env.store.save_invite_link(GROUP, MEMBER, "https://t.me/+old", "user6")
+    _, buttons = shown(press(env, OWNER, f"m:is:{GROUP}"))
+    text, buttons = shown(press(env, OWNER, buttons["🔗 重置邀请链接"]))
+    assert text.startswith("🔗 重置「测试群」的邀请链接？\n\n")
+    assert list(buttons) == ["✅ 确定重置", "⬅️ 返回"]
+    assert (
+        env.store.invite_link(GROUP, MEMBER)["link"] == "https://t.me/+old"
+    )  # not before confirming
+    text, _ = shown(press(env, OWNER, buttons["✅ 确定重置"]))
+    assert text.startswith(
+        "✅ 已重置 1 条邀请链接，群友再领取会拿到新链接。\n\n🔗 测试群 · 邀请设置"
+    )
+    assert env.store.invite_link(GROUP, MEMBER) is None
+    env.bot.create_chat_invite_link = AsyncMock(
+        return_value=SimpleNamespace(invite_link="https://t.me/+new")
+    )
+    reply = start(env, MEMBER, f"inv{GROUP}").reply_text.await_args.args[0]
+    assert "https://t.me/+new" in reply
+    # Joining by the old link still counts for its owner.
+    assert env.store.link_owner(GROUP, "https://t.me/+old") == (MEMBER, "user6")
+    assert env.store.link_owner(GROUP, "https://t.me/+new") == (MEMBER, "user6")
+    assert press(env, MEMBER, f"m:irk:{GROUP}").answer.await_args.args[0] == NOT_MANAGER
+
+
+def test_invite_settings_page(env):
+    _, buttons = shown(press(env, OWNER, f"m:g:{GROUP}"))
+    assert buttons["🔗 邀请设置"] == f"m:is:{GROUP}"
+    text, buttons = shown(press(env, OWNER, f"m:is:{GROUP}"))
+    assert text == (
+        "🔗 测试群 · 邀请设置\n"
+        "开启后群友在群里发送 /link，机器人自动生成他的专属邀请链接，并告诉他邀请了多少人。\n"
+        "🛡 防作弊：只有第一次进群的人算有效邀请；进过本群的人退群后再用别人的链接进群不算，"
+        "被邀请的人退群了也不算。\n\n"
+        "状态：✅ 开启\n"
+        "邀请提醒：❌ 关闭\n"
+        "总邀请人数：0\n"
+        "链接有效期：无限制\n"
+        "每条链接最多邀请：无限制\n"
+        "生成数量上限：无限制\n"
+        "已生成数量：0 条\n\n"
+        "修改有效期或最多邀请人数后，群友再领取会拿到按新设置生成的链接；"
+        "已经发出去的旧链接不受影响。\n"
+        "机器人权限：管理员并能邀请用户 ❌\n"
+        "没有这个权限时，机器人生成不了链接，也认不出谁邀请了谁。"
+    )
+    assert list(buttons) == [
+        "🔗 /link 领取链接：开",
+        "📣 邀请提醒：关",
+        "🔧 链接有效期：无限制",
+        "🔧 每条链接最多邀请：无限制",
+        "🔧 生成数量上限：无限制",
+        "👥 邀请明细",
+        "🖨 导出",
+        "🔗 重置邀请链接",
+        "🗑 清空数据",
+        "📜 修改记录",
+        "⬅️ 返回",
+    ]
+    text, buttons = shown(press(env, OWNER, buttons["📣 邀请提醒：关"]))
+    assert "\n邀请提醒：✅ 开启\n" in text
+    assert "\n🕘 最近修改：01-15 16:00 用户 5：📣 邀请提醒 关 → 开" in text
+    text, buttons = shown(press(env, OWNER, buttons["🔗 /link 领取链接：开"]))
+    assert "关闭时 /link 不生成链接；进行中的专属链接邀请抽奖照常可以领取。" in text
+    assert not env.store.group_settings(GROUP)["invite_links"]
+    assert press(env, MEMBER, f"m:is:{GROUP}").answer.await_args.args[0] == NOT_MANAGER
+
+
+def test_admins_limit_new_invite_links(env):
+    env.store.save_invite_link(GROUP, MEMBER, "https://t.me/+old", "user6")
+    text, buttons = shown(press(env, OWNER, f"m:isk:{GROUP}:link_days"))
+    assert text == (
+        "⏳ 链接有效期：无限制\n新生成的邀请链接多少天后过期？\n"
+        "点按钮或直接发送数字（0～365，0 表示无限制）："
+    )
+    assert list(buttons) == ["无限制", "1 天", "7 天", "30 天", "⬅️ 返回"]
+    text, buttons = shown(press(env, OWNER, buttons["7 天"]))
+    assert "\n链接有效期：7 天\n" in text
+    assert buttons["🔧 链接有效期：7 天"] == f"m:isk:{GROUP}:link_days"
+    assert env.store.invite_link(GROUP, MEMBER) is None  # handed out anew, by the new rules
+    press(env, OWNER, f"m:isk:{GROUP}:link_members")
+    assert (
+        type_text(env, OWNER, "100000")[0] == "每条链接最多邀请需为 0～99999 的整数，请重新输入。"
+    )
+    text, _ = type_text(env, OWNER, "50")
+    assert "\n每条链接最多邀请：50 人\n" in text
+    env.store.save_invite_link(GROUP, MEMBER, "https://t.me/+new", "user6")
+    press(env, OWNER, f"m:isk:{GROUP}:link_cap")
+    text, _ = type_text(env, OWNER, "300")
+    assert "\n生成数量上限：300 条\n已生成数量：2 条\n" in text
+    assert env.store.invite_link(GROUP, MEMBER)["link"] == "https://t.me/+new"  # still good
+    env.statuses[(GROUP, OWNER)] = ChatMember.MEMBER  # no longer an admin
+    env.menu._managers.clear()
+    assert press(env, OWNER, f"m:isk:{GROUP}:link_cap").answer.await_args.args[0] == NOT_MANAGER
+
+
+def test_admins_clear_and_export_the_invite_statistics(env):
+    env.store.joined(GROUP, 11, NOW - 10, MEMBER, "user6", "link", invitee_name="Ann")
+    _, buttons = shown(press(env, OWNER, f"m:is:{GROUP}"))
+    press(env, OWNER, buttons["🖨 导出"])
+    call = env.bot.send_document.await_args
+    assert call.args[0] == OWNER
+    assert call.kwargs["filename"] == f"invites{GROUP}.json"
+    exported = json.loads(call.kwargs["document"].getvalue())
+    assert [i["invitee_name"] for i in exported["invites"]] == ["Ann"]
+    text, buttons = shown(press(env, OWNER, buttons["🗑 清空数据"]))
+    assert text.startswith("🗑 清空「测试群」的邀请数据？\n\n")
+    assert list(buttons) == ["✅ 确定清空", "⬅️ 返回"]
+    assert env.store.group_settings(GROUP)["invite_since"] == 0  # not before confirming
+    env.now[0] += 60
+    text, _ = shown(press(env, OWNER, buttons["✅ 确定清空"]))
+    assert text.startswith("✅ 已清空邀请数据，从现在起重新统计。\n\n🔗 测试群 · 邀请设置\n")
+    assert "\n总邀请人数：0\n" in text
+    assert "\n🗑 2027-01-15 16:01（UTC+08:00） 清空过数据，以上人数和链接数从那时起统计。\n" in text
+    text, _ = shown(press(env, OWNER, f"m:log:{GROUP}:is"))
+    assert text == "📜 测试群 · 邀请设置的修改记录\n01-15 16:01 用户 5：🗑 清空了邀请数据"
+    # Anti-cheating outlives it: someone brought in before is not new again.
+    assert not env.store.joined(GROUP, 11, NOW + 120, OWNER, "owner", "link")
+
+
+def test_admins_see_who_invited_whom(env):
+    env.store.joined(GROUP, 11, NOW - 10, MEMBER, "user6", "link", invitee_name="Ann")
+    rid = env.store.create(
+        OWNER, "邀请榜", 1, 60, chat_id=GROUP, kind="rank", prizes=[["a", 1]], invite_via="link"
+    )
+    env.store.joined(GROUP, 12, NOW + 5, MEMBER, "user6", "link", invitee_name="Bob")
+    env.store.joined(GROUP, 13, NOW + 6, MEMBER, "user6", "add", invitee_name="Cat")
+    env.store.leave_group(GROUP, 12, NOW + 9)
+    _, buttons = shown(press(env, OWNER, f"m:is:{GROUP}"))
+    text, buttons = shown(press(env, OWNER, buttons["👥 邀请明细"]))
+    assert text == (
+        "👥 测试群 · 邀请明细\n"
+        "全部记录，只算第一次进群的新成员；人数是现在还在群里的，退群的另外标出。\n"
+        "点一个人，查看他邀请了谁。"
+    )
+    assert list(buttons.items()) == [
+        ("1. user6 · 2 人（退群 1）", f"m:ip:{GROUP}:0:{MEMBER}:0"),
+        ("⬅️ 返回", f"m:is:{GROUP}"),
+    ]
+    text, buttons = shown(press(env, OWNER, buttons["1. user6 · 2 人（退群 1）"]))
+    assert text == (
+        "👥 user6（ID：6）邀请的人\n"
+        "有效 2 人，已退群 1 人（不算）\n"
+        "1. Cat（13）01-15 16:00 被拉进群\n"
+        "2. Bob（12）01-15 16:00 用链接进群 · 已退群，不算\n"
+        "3. Ann（11）01-15 15:59 用链接进群"
+    )
+    assert list(buttons.items()) == [("⬅️ 返回", f"m:il:{GROUP}:0:0")]
+    # An invite raffle's own: from its start, by its way of inviting only.
+    _, buttons = shown(press(env, OWNER, f"m:r:{rid}"))
+    assert buttons["👥 邀请明细"] == f"m:il:{GROUP}:{rid}:0"
+    text, buttons = shown(press(env, OWNER, buttons["👥 邀请明细"]))
+    assert text.startswith(
+        f"👥 邀请榜  #{rid} · 邀请明细\n按本场规则：统计 2027-01-15 16:00（UTC+08:00）"
+        " 起用专属邀请链接进群的新成员，开奖前退群的不算；"
+    )
+    assert list(buttons.items()) == [
+        ("1. user6 · 0 人（退群 1）", f"m:ip:{GROUP}:{rid}:{MEMBER}:0"),
+        ("⬅️ 返回", f"m:r:{rid}"),
+    ]
+    join = env.store.create(OWNER, "口令", 1, 60, chat_id=GROUP)
+    assert press(env, OWNER, f"m:il:{GROUP}:{join}:0").answer.await_args.args[0] == "按钮已失效。"
+    assert press(env, MEMBER, f"m:il:{GROUP}:0:0").answer.await_args.args[0] == NOT_MANAGER

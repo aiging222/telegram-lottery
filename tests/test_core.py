@@ -1161,7 +1161,7 @@ def test_invite_raffles_have_their_own_rules(setup):
 def test_invite_links_and_a_supergroup_upgrade(setup):
     store, _, now = setup
     store.save_invite_link(-100, 1, "https://t.me/+abc", "Eve")
-    assert store.invite_link(-100, 1) == "https://t.me/+abc"
+    assert store.invite_link(-100, 1)["link"] == "https://t.me/+abc"
     assert store.link_owner(-100, "https://t.me/+abc") == (1, "Eve")
     assert store.link_owner(-100, "https://t.me/+other") is None
     rid = invite_raffle(store, winners=1)
@@ -1199,3 +1199,84 @@ def test_report_raffles(setup):
     ):
         with pytest.raises(LotteryError, match="指定群报道抽奖"):
             store.create(99, "x", 1, 60, **({"chat_id": -100} | options))
+
+
+def test_retired_invite_links_still_credit_their_owners(setup):
+    store, _, now = setup
+    rid = store.create(
+        99, "链接榜", 1, 60, chat_id=-100, kind="rank", prizes=[["a", 1]], invite_via="link"
+    )
+    store.save_invite_link(-100, 1, "https://t.me/+one", "Eve")
+    assert store.retire_invite_links(-100) == 1
+    assert store.retire_invite_links(-100) == 0
+    assert store.invite_link(-100, 1) is None
+    store.save_invite_link(-100, 1, "https://t.me/+two", "Eve")
+    assert store.invite_link(-100, 1)["link"] == "https://t.me/+two"
+    for link, invitee in (("https://t.me/+one", 11), ("https://t.me/+two", 12)):
+        owner, name = store.link_owner(-100, link)
+        store.joined(-100, invitee, now[0] + 10, owner, name, "link")
+    assert [(e["user_id"], e["invites"]) for e in store.ranking(rid)[1]] == [(1, 2)]
+
+
+def test_invite_links_expire_and_fill_up(setup):
+    store, _, now = setup
+    store.save_invite_link(-100, 1, "https://t.me/+day", "Eve", now[0] + 86400, 2)
+    assert store.invite_link(-100, 1) == {
+        "link": "https://t.me/+day",
+        "expires_at": now[0] + 86400,
+        "member_limit": 2,
+    }
+    store.joined(-100, 11, now[0] + 10, 1, "Eve", "link", link="https://t.me/+day")
+    store.joined(-100, 12, now[0] + 20, link="https://t.me/+day")  # known or not, it counts
+    assert store.invite_link(-100, 1) is None  # used up: a new one is made
+    store.save_invite_link(-100, 1, "https://t.me/+next", "Eve", now[0] + 86400)
+    now[0] += 86400 - 3599
+    assert store.invite_link(-100, 1) is None  # about to expire
+    assert store.links_made(-100) == 2
+    assert store.links_made(-100, now[0]) == 0
+    assert store.link_owner(-100, "https://t.me/+day") == (1, "Eve")  # still credits Eve
+
+
+def test_invite_statistics_and_details(setup):
+    store, _, now = setup
+    start = now[0]
+    store.joined(-100, 10, start - 60, 1, "Eve", "link", invitee_name="Old")
+    rid = invite_raffle(store, winners=1)
+    store.joined(-100, 11, start + 10, 1, "Eve", "link", invitee_name="Ann")
+    store.joined(-100, 12, start + 20, 1, "Eve", "add", invitee_name="Bob")
+    store.joined(-100, 13, start + 30, 2, "Frank", "link")  # no name: the one they speak under
+    store.count_message(-100, 13, "Cat", start + 40)
+    store.flush_activity()
+    store.leave_group(-100, 11, start + 50)
+    assert store.invite_stats(-100) == {"counted": 3, "left": 1, "links": 0}
+    assert store.invite_count(-100, 1) == 2
+    assert store.invite_count(-100, 1, since=start) == 1
+    rows, more = store.inviters(-100, 0, 10)
+    assert not more
+    assert [(r["inviter_id"], r["counted"], r["left"], r["gone"]) for r in rows] == [
+        (1, 2, 1, 0),
+        (2, 1, 0, 0),
+    ]
+    # As the raffle counts: from publish, by link only, those still there at the deadline.
+    scope = {"since": start, "until": start + 3600, "via": "link"}
+    rows, _ = store.inviters(-100, 0, 10, **scope)
+    assert [(r["inviter_id"], r["counted"], r["left"]) for r in rows] == [(2, 1, 0), (1, 0, 1)]
+    found = store.invitees(-100, 1, 0, 10)
+    assert (found["name"], found["counted"], found["left"], found["gone"]) == ("Eve", 2, 1, False)
+    assert [(r["invitee_name"], r["via"], r["counted"]) for r in found["rows"]] == [
+        ("Bob", "add", True),
+        ("Ann", "link", False),
+        ("Old", "link", True),
+    ]
+    assert store.invitees(-100, 2, 0, 10)["rows"][0]["invitee_name"] == "Cat"
+    store.leave_group(-100, 2, start + 60)
+    assert store.inviters(-100, 0, 10)[0][-1]["gone"]
+    assert store.invitees(-100, 2, 0, 10)["gone"]
+    rows, more = store.inviters(-100, 0, 1)
+    assert more and len(rows) == 1
+    assert store.invite_raffles(-100) == [
+        {"id": rid, "title": "邀请榜", "kind": "rank", "invite_via": "link", "min_messages": None}
+    ]
+    exported = store.export_invites(-100)
+    assert [i["invitee_id"] for i in exported["invites"]] == [10, 11, 12, 13]
+    assert exported["counting_since"] == 0

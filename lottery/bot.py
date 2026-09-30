@@ -1,6 +1,7 @@
 """Telegram command interface. Configuration is loaded only at startup."""
 
 import asyncio
+import functools
 import logging
 import os
 import weakref
@@ -36,6 +37,7 @@ from lottery.views import (
     result_text,
     standing_text,
     status_text,
+    when_text,
 )
 
 LOG = logging.getLogger(__name__)
@@ -100,7 +102,7 @@ PUBLIC_HELP = """🎁 抽奖机器人
 /raffle 抽奖ID — 在发布群里查看抽奖
 /result 抽奖ID — 在发布群里查看开奖结果
 /id — 查看自己的用户 ID
-/link — 在群里领取自己的专属邀请链接（邀请抽奖用）
+/link — 在群里领取自己的专属邀请链接，查看自己邀请了多少人
 在群里发送「签到」领灵石，「灵石」查看自己的灵石，「灵石榜」看排行。"""
 ADMIN_HELP = """
 
@@ -574,21 +576,25 @@ class BotHandlers:
         if user.is_bot:
             return
         chat_id = change.chat.id
-        inviter, name, via = None, "", None
+        inviter, name, via, used = None, "", None, None
         link = change.invite_link
         adder = change.from_user
         if link is not None:
             # Only links the bot made are shown in full, so only those are found.
             owner = await asyncio.to_thread(self.store.link_owner, chat_id, link.invite_link)
             if owner is not None:
-                (inviter, name), via = owner, "link"
+                (inviter, name), via, used = owner, "link", link.invite_link
         elif adder is not None and adder.id != user.id and not adder.is_bot:
             if not change.via_join_request:  # else it is the admin who let them in
                 inviter, name, via = adder.id, name_text(adder.full_name), "add"
+        joined = functools.partial(
+            self.store.joined, invitee_name=name_text(user.full_name), link=used
+        )
         counted = await asyncio.to_thread(
-            self.store.joined, chat_id, user.id, change.date.timestamp(), inviter, name, via
+            joined, chat_id, user.id, change.date.timestamp(), inviter, name, via
         )
         if counted:
+            await self.tell_invite(context.bot, chat_id, user, inviter, name, via)
             for rid in await asyncio.to_thread(self.store.full_invite_raffles, chat_id):
                 await self.announce(context.bot, rid, chat_id)
         await self.report_in(context, chat_id, user)
@@ -610,9 +616,34 @@ class BotHandlers:
             if added:
                 await self.after_join(context, rid)
 
+    async def tell_invite(self, bot, chat_id, user, inviter, inviter_name, via):
+        """Tell the group who brought a new member in, if it asked to hear and the bot has
+        not used up its messages to it for the minute."""
+        settings = await asyncio.to_thread(self.store.group_settings, chat_id)
+        if not settings["invite_notice"] or not self.room(chat_id):
+            return
+        count = await asyncio.to_thread(
+            self.store.invite_count, chat_id, inviter, settings["invite_since"]
+        )
+        newcomer = name_text(user.full_name) or f"用户 {user.id}"
+        inviter_name = inviter_name or f"用户 {inviter}"
+        if via == "link":
+            text = f"🎉 {newcomer} 通过 {inviter_name} 的邀请链接进群，"
+        else:
+            text = f"🎉 {inviter_name} 把 {newcomer} 拉进了群，"
+        text += f"{inviter_name} 已邀请 {count} 人。"
+        try:
+            sent = await bot.send_message(chat_id, text)
+        except TelegramError as exc:
+            LOG.info("群 %s 的邀请提醒发送失败：%s", chat_id, exc)
+            return
+        self.spent(chat_id)
+        await self.tidy(bot, chat_id, [sent.message_id], "delete_notices", READ_SECONDS)
+
     async def invite_link_text(self, bot, chat_id, user, check=True):
         """The answer to asking for one's own invite link to chat_id: the link, made once
-        and kept, or why there is none. With `check`, only a member of the group gets one."""
+        and handed out again until it expires or is used up, and how many they invited; or
+        why there is none. With `check`, only a member of the group gets one."""
         if check:
             try:
                 member = await self.group_member(bot, chat_id, user.id)
@@ -621,23 +652,78 @@ class BotHandlers:
                 return "暂时无法确认你的群成员身份，请稍后重试。"
             if not member:
                 return "只有群成员才能领取这个群的邀请链接。"
-        link = await asyncio.to_thread(self.store.invite_link, chat_id, user.id)
-        if link is None:
-            name = name_text(user.full_name)
+        settings = await asyncio.to_thread(self.store.group_settings, chat_id)
+        raffles = await asyncio.to_thread(self.store.invite_raffles, chat_id)
+        # An invite raffle by link needs links, whatever the group's settings.
+        if not settings["invite_links"] and all(r["invite_via"] != "link" for r in raffles):
+            return "本群没有开启邀请链接。"
+        found = await asyncio.to_thread(self.store.invite_link, chat_id, user.id)
+        if found is None:
             try:
-                made = await bot.create_chat_invite_link(chat_id, name=(name or str(user.id))[:32])
-            except TelegramError as exc:
-                LOG.warning("群 %s 生成邀请链接失败：%s", chat_id, exc)
-                return (
-                    "没能生成邀请链接：机器人需要是群管理员并有「邀请用户」权限，请联系群管理员。"
-                )
-            link = made.invite_link
-            await asyncio.to_thread(self.store.save_invite_link, chat_id, user.id, link, name)
+                found = await self.make_invite_link(bot, chat_id, user, settings)
+            except LotteryError as exc:
+                return str(exc)
         title = await asyncio.to_thread(self.store.group_title, chat_id)
-        return (
-            f"🔗 你在「{title}」的专属邀请链接：\n{link}\n\n"
-            "把它发给好友，好友通过这条链接进群，就算你邀请的。"
+        lines = [f"🔗 你在「{title}」的专属邀请链接：", found["link"]]
+        limits = []
+        if found["expires_at"]:
+            limits.append(f"有效期至 {when_text(found['expires_at'], self.timezone)}")
+        if found["member_limit"]:
+            limits.append(f"最多 {found['member_limit']} 人通过它进群")
+        if limits:
+            lines.append("；".join(limits) + "。到期或用满后再领取，会拿到新链接。")
+        lines += ["", "把它发给好友，好友通过这条链接进群，就算你邀请的。", ""]
+        count = await asyncio.to_thread(
+            self.store.invite_count, chat_id, user.id, settings["invite_since"]
         )
+        lines.append(f"📊 你已邀请 {count} 人（只算第一次进群、现在还在群里的）")
+        for raffle in raffles:
+            line = await self.invites_in(raffle, user.id)
+            if line:
+                lines.append(line)
+        return "\n".join(lines)
+
+    async def make_invite_link(self, bot, chat_id, user, settings):
+        """A new invite link to chat_id for user, as the group's settings say. LotteryError
+        says why there is none."""
+        cap = settings["link_cap"]
+        if cap:
+            made = await asyncio.to_thread(self.store.links_made, chat_id, settings["invite_since"])
+            if made >= cap:
+                raise LotteryError("本群的邀请链接已达到生成数量上限，请联系群管理员。")
+        name = name_text(user.full_name)
+        options = {"name": (name or str(user.id))[:32]}
+        expires_at = limit = None
+        if settings["link_days"]:
+            expires_at = int(self.store.clock()) + settings["link_days"] * 86400
+            options["expire_date"] = expires_at
+        if settings["link_members"]:
+            limit = options["member_limit"] = settings["link_members"]
+        try:
+            made = await bot.create_chat_invite_link(chat_id, **options)
+        except TelegramError as exc:
+            LOG.warning("群 %s 生成邀请链接失败：%s", chat_id, exc)
+            raise LotteryError(
+                "没能生成邀请链接：机器人需要是群管理员并有「邀请用户」权限，请联系群管理员。"
+            ) from None
+        link = made.invite_link
+        await asyncio.to_thread(
+            self.store.save_invite_link, chat_id, user.id, link, name, expires_at, limit
+        )
+        return {"link": link, "expires_at": expires_at, "member_limit": limit}
+
+    async def invites_in(self, raffle, user_id):
+        """How many user_id has invited so far in an open invite raffle, as a line."""
+        try:
+            raffle, ranked = await asyncio.to_thread(self.store.ranking, raffle["id"])
+        except LotteryError:
+            return None  # it stopped counting a moment ago
+        count = next((e["invites"] for e in ranked if e["user_id"] == user_id), 0)
+        line = f"🪁「{raffle['title']}」已邀请 {count} 人"
+        if raffle["kind"] == "reach":
+            need = raffle["min_messages"] - count
+            line += "，已达标" if need <= 0 else f"，还差 {need} 人达标"
+        return line
 
     @one_at_a_time(sender)
     async def link(self, update, context):
@@ -960,7 +1046,7 @@ async def register_commands(app):
     commands = [BotCommand("start", "打开菜单"), BotCommand("id", "查看我的用户 ID")]
     await app.bot.set_my_commands(commands)
     await app.bot.set_my_commands(
-        [*commands, BotCommand("link", "领取我的专属邀请链接")],
+        [*commands, BotCommand("link", "领取专属邀请链接、查看邀请人数")],
         scope=BotCommandScopeAllGroupChats(),
     )
 

@@ -334,6 +334,30 @@ MIGRATIONS = [
     ALTER TABLE raffles ADD COLUMN report_link TEXT;
     CREATE INDEX IF NOT EXISTS raffles_by_report ON raffles(report_chat)
     """,
+    # 19: a member may have had several invite links to a group: the one handed out now,
+    # and retired ones, which are no longer handed out but still credit whoever they were
+    # made for when someone joins by them. A link may expire or let in at most member_limit
+    # (joins counts those who came by it); invites keeps the new member's name too.
+    """
+    CREATE TABLE invite_links_19 (
+        chat_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        link TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        retired INTEGER NOT NULL DEFAULT 0,
+        created_at REAL NOT NULL DEFAULT 0,
+        expires_at REAL,
+        member_limit INTEGER,
+        joins INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (chat_id, link)
+    );
+    INSERT INTO invite_links_19(chat_id,user_id,link,display_name)
+        SELECT chat_id,user_id,link,display_name FROM invite_links;
+    DROP TABLE invite_links;
+    ALTER TABLE invite_links_19 RENAME TO invite_links;
+    CREATE INDEX invite_links_by_user ON invite_links(chat_id, user_id);
+    ALTER TABLE invites ADD COLUMN invitee_name TEXT NOT NULL DEFAULT ''
+    """,
 ]
 # Deletion delays are seconds after posting: 0 deletes at once, None keeps the message.
 GROUP_DEFAULTS = {
@@ -355,6 +379,17 @@ GROUP_DEFAULTS = {
     # characters besides spaces and comes at least cooldown seconds after the last that did.
     "min_chars": 3,
     "cooldown": 5,
+    # Invite links: /link hands members their own (links are handed out for an open invite
+    # raffle by link either way), and with invite_notice the group hears who brought each
+    # new member in. New links expire after link_days and let in at most link_members; at
+    # most link_cap are made. 0 means no limit. Invites and links count from invite_since,
+    # set when an admin clears the statistics.
+    "invite_links": True,
+    "invite_notice": False,
+    "link_days": 0,
+    "link_members": 0,
+    "link_cap": 0,
+    "invite_since": 0,
 }
 SETTING_LIMITS = {
     "checkin_points": (0, 10_000),
@@ -365,6 +400,10 @@ SETTING_LIMITS = {
     "crit_times": (2, 10),
     "min_chars": (1, 100),
     "cooldown": (0, 3_600),
+    "link_days": (0, 365),
+    "link_members": (0, 99_999),  # as Telegram allows
+    "link_cap": (0, 100_000),
+    "invite_since": (0, 2**53),
 }
 # Telegram lets bots delete group messages for 48 hours; older ones are given up on.
 DELETE_WINDOW = 47 * 3600
@@ -375,6 +414,8 @@ KINDS = ("join", "rank", "reach")
 INVITE_WAYS = ("link", "add")  # an invite raffle counts joins by invite link, or by adding
 LOOK_BACK_DAYS = 30  # how far back an activity raffle may start counting
 KEEP_ACTIVITY = 31 * 86400
+LINK_FRESH = 3600  # an invite link due to expire sooner than this is not handed out again
+FOREVER = 2.0**62  # a time after anything else
 
 
 class Store:
@@ -1253,11 +1294,28 @@ class Store:
             ranked = [e for e in ranked if e["invites"] >= raffle["min_messages"]]
         return ranked
 
-    def joined(self, chat_id, user_id, at, inviter_id=None, inviter_name="", via=None):
+    def joined(
+        self,
+        chat_id,
+        user_id,
+        at,
+        inviter_id=None,
+        inviter_name="",
+        via=None,
+        *,
+        invitee_name="",
+        link=None,
+    ):
         """user_id joined chat_id at `at`, brought in by inviter_id `via` "link" or "add" if
-        known. It counts as an invite only the first time the bot sees them join, never for
-        someone it saw there before, and never for bringing oneself in. Whether it counted."""
+        known; by the bot's invite `link`, if so. It counts as an invite only the first time
+        the bot sees them join, never for someone it saw there before, and never for bringing
+        oneself in. Whether it counted."""
         with self.transaction() as db:
+            if link is not None:  # Telegram counts every join towards the link's member_limit
+                db.execute(
+                    "UPDATE invite_links SET joins=joins+1 WHERE chat_id=? AND link=?",
+                    (chat_id, link),
+                )
             known = any(
                 db.execute(
                     f"SELECT 1 FROM {table} WHERE chat_id=? AND {column}=?", (chat_id, user_id)
@@ -1273,9 +1331,9 @@ class Store:
             if known or inviter_id is None or inviter_id == user_id or via not in INVITE_WAYS:
                 return False
             db.execute(
-                "INSERT INTO invites(chat_id,invitee_id,inviter_id,inviter_name,via,joined_at) "
-                "VALUES(?,?,?,?,?,?)",
-                (chat_id, user_id, inviter_id, inviter_name[:128], via, at),
+                "INSERT INTO invites(chat_id,invitee_id,inviter_id,inviter_name,via,joined_at,"
+                "invitee_name) VALUES(?,?,?,?,?,?,?)",
+                (chat_id, user_id, inviter_id, inviter_name[:128], via, at, invitee_name[:128]),
             )
             return True
 
@@ -1294,18 +1352,186 @@ class Store:
             ]
 
     def invite_link(self, chat_id, user_id):
+        """The invite link to chat_id handed out to user_id now, as {"link", "expires_at",
+        "member_limit"}; None if none is: it was retired, expires within LINK_FRESH or has
+        let in as many as it may."""
         with self.reading() as db:
             row = db.execute(
-                "SELECT link FROM invite_links WHERE chat_id=? AND user_id=?", (chat_id, user_id)
+                "SELECT link,expires_at,member_limit FROM invite_links "
+                "WHERE chat_id=? AND user_id=? AND retired=0 "
+                "AND (expires_at IS NULL OR expires_at>?) "
+                "AND (member_limit IS NULL OR joins<member_limit)",
+                (chat_id, user_id, self.clock() + LINK_FRESH),
             ).fetchone()
-        return row[0] if row else None
+        return dict(row) if row else None
 
-    def save_invite_link(self, chat_id, user_id, link, display_name):
+    def save_invite_link(
+        self, chat_id, user_id, link, display_name, expires_at=None, member_limit=None
+    ):
+        made = (chat_id, user_id, link, display_name[:128], self.clock(), expires_at, member_limit)
         with self.transaction() as db:
             db.execute(
-                "INSERT OR REPLACE INTO invite_links VALUES(?,?,?,?)",
-                (chat_id, user_id, link, display_name[:128]),
+                "UPDATE invite_links SET retired=1 WHERE chat_id=? AND user_id=?",
+                (chat_id, user_id),
             )
+            db.execute(
+                "INSERT OR REPLACE INTO invite_links(chat_id,user_id,link,display_name,"
+                "created_at,expires_at,member_limit) VALUES(?,?,?,?,?,?,?)",
+                made,
+            )
+
+    def links_made(self, chat_id, since=0):
+        """How many invite links to chat_id the bot has made since `since`."""
+        with self.reading() as db:
+            return db.execute(
+                "SELECT COUNT(*) FROM invite_links WHERE chat_id=? AND created_at>=?",
+                (chat_id, since),
+            ).fetchone()[0]
+
+    def retire_invite_links(self, chat_id):
+        """Hand out new invite links to chat_id from now on; the old ones still credit whoever
+        they were made for. Returns how many were retired."""
+        with self.transaction() as db:
+            return db.execute(
+                "UPDATE invite_links SET retired=1 WHERE chat_id=? AND retired=0", (chat_id,)
+            ).rowcount
+
+    def invite_stats(self, chat_id, since=0):
+        """Members brought into chat_id since `since`: {"counted": those still there, "left":
+        those who have left, "links": invite links made}."""
+        with self.reading() as db:
+            counted, left = db.execute(
+                "SELECT COALESCE(SUM(left_at IS NULL),0),COALESCE(SUM(left_at IS NOT NULL),0) "
+                "FROM invites WHERE chat_id=? AND joined_at>=?",
+                (chat_id, since),
+            ).fetchone()
+        return {"counted": counted, "left": left, "links": self.links_made(chat_id, since)}
+
+    def invite_count(self, chat_id, inviter_id, since=0):
+        """How many inviter_id brought into chat_id since `since` who are still there."""
+        with self.reading() as db:
+            return db.execute(
+                "SELECT COUNT(*) FROM invites WHERE chat_id=? AND inviter_id=? AND joined_at>=? "
+                "AND left_at IS NULL",
+                (chat_id, inviter_id, since),
+            ).fetchone()[0]
+
+    def inviters(self, chat_id, page, size, since=0, until=None, via=None):
+        """One page of those who brought members into chat_id from `since` until `until`
+        (by `via` only, if given), and whether another page follows. For each: "counted",
+        those still there at `until` (or now); "left", the others; "gone", whether the
+        inviter had left by then. Most counted first, those gone last."""
+        until = FOREVER if until is None else until
+        with self.reading() as db:
+            rows = [
+                dict(row)
+                for row in db.execute(
+                    "SELECT i.inviter_id,i.inviter_name,MAX(i.joined_at) AS last_at,"
+                    "SUM(i.left_at IS NULL OR i.left_at>=:until) AS counted,"
+                    "SUM(i.left_at IS NOT NULL AND i.left_at<:until) AS left,"
+                    "EXISTS(SELECT 1 FROM departed d WHERE d.chat_id=i.chat_id "
+                    "AND d.user_id=i.inviter_id AND d.at<:until) AS gone "
+                    "FROM invites i WHERE i.chat_id=:chat AND i.joined_at>=:since "
+                    "AND i.joined_at<:until AND (:via IS NULL OR i.via=:via) "
+                    "GROUP BY i.inviter_id ORDER BY gone,counted DESC,left DESC,i.inviter_id "
+                    "LIMIT :limit OFFSET :offset",
+                    {
+                        "chat": chat_id,
+                        "since": since,
+                        "until": until,
+                        "via": via,
+                        "limit": size + 1,
+                        "offset": page * size,
+                    },
+                )
+            ]
+        return rows[:size], len(rows) > size
+
+    def invitees(self, chat_id, inviter_id, page, size, since=0, until=None, via=None):
+        """The members inviter_id brought into chat_id, as inviters() counts them: {"name",
+        "counted", "left", "gone", "more", "rows"}, rows being one page of them, the latest
+        first, each with whether it counts."""
+        until = FOREVER if until is None else until
+        scope = (chat_id, inviter_id, since, until, via, via)
+        where = (
+            "WHERE chat_id=? AND inviter_id=? AND joined_at>=? AND joined_at<? "
+            "AND (? IS NULL OR via=?)"
+        )
+        with self.reading() as db:
+            name, counted, left = db.execute(
+                "SELECT inviter_name,COALESCE(SUM(left_at IS NULL OR left_at>=?),0),"
+                "COALESCE(SUM(left_at<?),0),MAX(joined_at) FROM invites " + where,
+                (until, until, *scope),
+            ).fetchone()[:3]
+            gone = db.execute(
+                "SELECT 1 FROM departed WHERE chat_id=? AND user_id=? AND at<?",
+                (chat_id, inviter_id, until),
+            ).fetchone()
+            rows = [
+                dict(row)
+                for row in db.execute(
+                    "SELECT invitee_id,invitee_name,via,joined_at,left_at FROM invites "
+                    + where
+                    + " ORDER BY joined_at DESC,invitee_id LIMIT ? OFFSET ?",
+                    (*scope, size + 1, page * size),
+                )
+            ]
+            for row in rows:
+                row["counted"] = row["left_at"] is None or row["left_at"] >= until
+                # Those who joined before the bot kept names: the name they last wrote under.
+                row["invitee_name"] = row["invitee_name"] or self._holder_name(
+                    db, chat_id, row["invitee_id"]
+                )
+        return {
+            "name": name or "",
+            "counted": counted,
+            "left": left,
+            "gone": gone is not None,
+            "more": len(rows) > size,
+            "rows": rows[:size],
+        }
+
+    def invite_raffles(self, chat_id):
+        """chat_id's invite raffles still counting, the oldest first."""
+        with self.reading() as db:
+            return [
+                dict(row)
+                for row in db.execute(
+                    "SELECT id,title,kind,invite_via,min_messages FROM raffles WHERE chat_id=? "
+                    "AND status='OPEN' AND invite_via IS NOT NULL AND deadline>? ORDER BY id",
+                    (chat_id, self.clock()),
+                )
+            ]
+
+    def export_invites(self, chat_id):
+        """Everyone brought into chat_id, the invite links made to it and the changes to its
+        settings."""
+        title = self.group_title(chat_id)
+        with self.reading() as db:
+            invites = [
+                dict(r)
+                for r in db.execute(
+                    "SELECT inviter_id,inviter_name,invitee_id,invitee_name,via,joined_at,"
+                    "left_at FROM invites WHERE chat_id=? ORDER BY joined_at,invitee_id",
+                    (chat_id,),
+                )
+            ]
+            links = [
+                dict(r)
+                for r in db.execute(
+                    "SELECT user_id,display_name,link,created_at,expires_at,member_limit,joins,"
+                    "retired FROM invite_links WHERE chat_id=? ORDER BY created_at,user_id",
+                    (chat_id,),
+                )
+            ]
+        return {
+            "chat_id": chat_id,
+            "title": title,
+            "counting_since": self.group_settings(chat_id)["invite_since"],
+            "invites": invites,
+            "links": links,
+            "setting_changes": self.setting_changes(chat_id),
+        }
 
     def link_owner(self, chat_id, link):
         """Whose invite link to chat_id `link` is, as (user_id, name), or None."""
@@ -1771,6 +1997,13 @@ class Store:
             if row:
                 return dict(row)
             return {"display_name": self._speaker_name(db, chat_id, user_id), "balance": 0}
+
+    def _holder_name(self, db, chat_id, user_id):
+        """The name user_id has in chat_id's 灵石 or, failing that, last wrote under."""
+        row = db.execute(
+            "SELECT display_name FROM points WHERE chat_id=? AND user_id=?", (chat_id, user_id)
+        ).fetchone()
+        return row[0] if row and row[0] else self._speaker_name(db, chat_id, user_id)
 
     def _speaker_name(self, db, chat_id, user_id):
         row = db.execute(

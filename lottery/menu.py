@@ -31,6 +31,7 @@ from lottery.views import (
     draw_rule,
     export_file,
     holder_name,
+    invites_file,
     join_text,
     name_text,
     place,
@@ -111,8 +112,38 @@ POINT_SETTINGS = {
 }
 # How a 0 reads where it means more than the number.
 ZERO_TEXT = {"checkin_points": "关", "reward_points": "关", "reward_daily": "不限"}
+# Invite settings: switches, as their button label; and limits on the links made from then
+# on, as for 灵石 above, 0 meaning none.
+INVITE_SWITCHES = {"invite_links": "🔗 /link 领取链接", "invite_notice": "📣 邀请提醒"}
+INVITE_SETTINGS = {
+    "link_days": (
+        "⏳ 链接有效期",
+        "{} 天",
+        (0, 1, 7, 30),
+        "新生成的邀请链接多少天后过期？",
+    ),
+    "link_members": (
+        "🎟 每条链接最多邀请",
+        "{} 人",
+        (0, 10, 50, 100, 500),
+        "每条邀请链接最多能让多少人进群？",
+    ),
+    "link_cap": (
+        "🔢 生成数量上限",
+        "{} 条",
+        (0, 100, 500, 1000),
+        "本群最多生成多少条邀请链接？清空数据后重新计数。",
+    ),
+}
+INVITE_KEYS = (*INVITE_SWITCHES, *INVITE_SETTINGS, "invite_since")  # on the 邀请设置 page
+CHANGE_PAGES = {  # the settings each page's 修改记录 lists, and the page's name
+    "set": (tuple(SETTINGS), "抽奖设置"),
+    "pt": (("points", *POINT_SETTINGS), "灵石设置"),
+    "is": (INVITE_KEYS, "邀请设置"),
+}
+INVITEES_SHOWN = 20
 BALANCE_STEPS = (10, 50, 100, -10, -50, -100)
-POINT_KEYS = ("points", *POINT_SETTINGS)  # the settings on the 灵石 page
+POINT_KEYS = CHANGE_PAGES["pt"][0]  # the settings on the 灵石 page
 CHANGES_SHOWN = 15
 NOT_MANAGER = "只有该群的管理员可以管理抽奖。"
 NOT_SUPER = "只有超级管理员可以设置中奖加成。"
@@ -259,16 +290,24 @@ def point_value(key, value):
     return POINT_SETTINGS[key][1].format(value)
 
 
+def invite_value(key, value):
+    return INVITE_SETTINGS[key][1].format(value) if value else "无限制"
+
+
 def change_text(change, timezone):
     """One change to a group setting, as "01-15 16:00 张三：🎲 奖励概率 5% → 8%"."""
     key = change["key"]
-    if key in POINT_SETTINGS:
-        label, shown = POINT_SETTINGS[key][0], functools.partial(point_value, key)
-    else:
-        label = SETTINGS[key][0] if key in SETTINGS else "💎 灵石功能"
-        shown = setting_text
     who = name_text(change["actor_name"]) or f"用户 {change['actor_id']}"
     when = datetime.fromtimestamp(change["at"], timezone)
+    if key == "invite_since":
+        return f"{when:%m-%d %H:%M} {who}：🗑 清空了邀请数据"
+    if key in POINT_SETTINGS:
+        label, shown = POINT_SETTINGS[key][0], functools.partial(point_value, key)
+    elif key in INVITE_SETTINGS:
+        label, shown = INVITE_SETTINGS[key][0], functools.partial(invite_value, key)
+    else:
+        label = SETTINGS[key][0] if key in SETTINGS else INVITE_SWITCHES.get(key, "💎 灵石功能")
+        shown = setting_text
     before, after = shown(change["before"]), shown(change["after"])
     return f"{when:%m-%d %H:%M} {who}：{label} {before} → {after}"
 
@@ -350,7 +389,8 @@ class Menu:
         self._names[user.id] = name_text(getattr(user, "full_name", "") or "")
 
     async def set_setting(self, user_id, chat_id, key, value):
-        """Change a group setting as user_id, who goes into the record of changes."""
+        """Change a group setting as user_id, who goes into the record of changes; False if
+        it was so already."""
         change = functools.partial(
             self.store.set_group_setting,
             chat_id,
@@ -359,7 +399,7 @@ class Menu:
             actor=user_id,
             actor_name=self._names.get(user_id, ""),
         )
-        await asyncio.to_thread(change)
+        return await asyncio.to_thread(change)
 
     # Permissions
 
@@ -498,6 +538,11 @@ class Menu:
         await asyncio.to_thread(
             self.store.remember_group, chat.id, chat.title or str(chat.id), status not in GONE
         )
+        if status != ChatMember.ADMINISTRATOR or not getattr(
+            change.new_chat_member, "can_invite_users", False
+        ):
+            # Telegram may void the invite links it made: members get new ones once it can.
+            await asyncio.to_thread(self.store.retire_invite_links, chat.id)
         if status in GONE or change.old_chat_member.status not in GONE:
             return  # it left, or only its rights changed
         await self.sync_admins(context.bot, chat.id)
@@ -573,10 +618,16 @@ class Menu:
                 delay = None if arg(args, 2) == "n" else int_arg(args, 2)
                 await self.set_setting(user_id, chat_id, choice(key, DELAY_QUESTIONS), delay)
             return await self.settings(bot, chat_id)
+        if action in ("is", "isv", "isk", "ir", "irk", "ic", "ick", "ix"):
+            chat_id = int_arg(args, 0)
+            await self.require(bot, user_id, chat_id)
+            return await self.invite_action(bot, user_id, action, chat_id, args[1:])
+        if action in ("il", "ip"):
+            return await self.invite_details(bot, user_id, action, args)
         if action == "log":
             chat_id = int_arg(args, 0)
             await self.require(bot, user_id, chat_id)
-            return await self.changes(chat_id, choice(arg(args, 1), ("set", "pt")))
+            return await self.changes(chat_id, choice(arg(args, 1), CHANGE_PAGES))
         if action in ("w", "wu", "ws", "wd", "wid", "wc", "export"):
             self.require_super(user_id)
             return await self.weight_action(bot, user_id, action, args)
@@ -619,7 +670,7 @@ class Menu:
                 button("📜 抽奖记录", f"m:list:{chat_id}:0"),
             ),
             (button("⚙️ 抽奖设置", f"m:set:{chat_id}"), button("💎 灵石设置", f"m:pt:{chat_id}")),
-            (button("🔄 切换群", "m:groups"),),
+            (button("🔗 邀请设置", f"m:is:{chat_id}"), button("🔄 切换群", "m:groups")),
         )
 
     # Creation wizard. The draft survives restarts. Every question shows what is filled in so
@@ -711,7 +762,7 @@ class Menu:
         # A group admin's question may have waited while they stopped being one.
         if (
             asking
-            and asking[0] in ("delay", "setting")
+            and asking[0] in ("delay", "setting", "invite")
             and not await self.can_manage(context.bot, user.id, asking[1])
         ):
             self._asking.pop(user.id, None)
@@ -722,6 +773,8 @@ class Menu:
             typed = self.points_typed if points else self.weight_typed
             if asking[0] == "delay":
                 typed = self.delay_typed
+            elif asking[0] == "invite":
+                typed = self.invite_typed
             await typed(context.bot, message, user.id, asking)
             return
         found = await asyncio.to_thread(self.store.draft, user.id)
@@ -1358,11 +1411,10 @@ class Menu:
         return [f"🕘 最近修改：{change_text(found[0], self.handlers.timezone)}"] if found else []
 
     async def changes(self, chat_id, page):
-        """The latest changes to the settings on the 抽奖设置 ("set") or 灵石 ("pt") page."""
-        keys = {"set": list(SETTINGS), "pt": list(POINT_KEYS)}[page]
+        """The latest changes to the settings on a page of CHANGE_PAGES."""
+        keys, name = CHANGE_PAGES[page]
         title = await asyncio.to_thread(self.store.group_title, chat_id)
         found = await asyncio.to_thread(self.store.setting_changes, chat_id, keys, CHANGES_SHOWN)
-        name = {"set": "抽奖设置", "pt": "灵石设置"}[page]
         lines = [f"📜 {title} · {name}的修改记录"]
         lines += [change_text(change, self.handlers.timezone) for change in found] or [
             "还没有修改过。"
@@ -1658,6 +1710,258 @@ class Menu:
             text, markup = await self.balance_page(chat_id, uid, page)
         await message.reply_text(text, reply_markup=markup)
 
+    # Invite settings, for group admins (route() checks): members' own invite links, and
+    # who brought whom into the group.
+
+    async def invite_action(self, bot, user_id, action, chat_id, args):
+        done = None
+        if action == "isk":
+            return await self.invite_prompt(user_id, chat_id, choice(arg(args, 0), INVITE_SETTINGS))
+        if action == "ir":
+            return await self.reset_links_prompt(chat_id)
+        if action == "ic":
+            return await self.clear_invites_prompt(chat_id)
+        if action == "isv":
+            key = arg(args, 0)
+            if key in INVITE_SWITCHES:
+                await self.set_setting(user_id, chat_id, key, bool(int_arg(args, 1)))
+            else:
+                await self.set_link_limit(
+                    user_id, chat_id, choice(key, INVITE_SETTINGS), int_arg(args, 1)
+                )
+        elif action == "irk":
+            count = await asyncio.to_thread(self.store.retire_invite_links, chat_id)
+            done = f"✅ 已重置 {count} 条邀请链接，群友再领取会拿到新链接。"
+        elif action == "ick":
+            await self.set_setting(user_id, chat_id, "invite_since", int(self.store.clock()))
+            done = "✅ 已清空邀请数据，从现在起重新统计。"
+        elif action == "ix":
+            exported = await asyncio.to_thread(self.store.export_invites, chat_id)
+            document, filename = invites_file(exported)
+            await bot.send_document(
+                user_id,
+                document=document,
+                filename=filename,
+                caption="本群的全部邀请记录（含清空前的）和机器人生成的邀请链接。",
+            )
+        text, markup = await self.invite_page(bot, chat_id)
+        return (f"{done}\n\n{text}" if done else text), markup
+
+    async def set_link_limit(self, user_id, chat_id, key, value):
+        """Change a limit on new invite links. Links already handed out keep theirs, so
+        members are handed new ones, made by the new rules, from now on."""
+        changed = await self.set_setting(user_id, chat_id, key, value)
+        if changed and key != "link_cap":
+            await asyncio.to_thread(self.store.retire_invite_links, chat_id)
+
+    async def invite_page(self, bot, chat_id):
+        title = await asyncio.to_thread(self.store.group_title, chat_id)
+        v = await asyncio.to_thread(self.store.group_settings, chat_id)
+        stats = await asyncio.to_thread(self.store.invite_stats, chat_id, v["invite_since"])
+        total = f"总邀请人数：{stats['counted']}"
+        if stats["left"]:
+            total += f"（另有 {stats['left']} 人已退群，不算）"
+        lines = [
+            f"🔗 {title} · 邀请设置",
+            "开启后群友在群里发送 /link，机器人自动生成他的专属邀请链接，并告诉他邀请了多少人。",
+            (
+                "🛡 防作弊：只有第一次进群的人算有效邀请；进过本群的人退群后再用别人的链接"
+                "进群不算，被邀请的人退群了也不算。"
+            ),
+            "",
+            f"状态：{'✅ 开启' if v['invite_links'] else '❌ 关闭'}",
+            f"邀请提醒：{'✅ 开启' if v['invite_notice'] else '❌ 关闭'}",
+            total,
+            *(
+                f"{label.split(' ', 1)[1]}：{invite_value(key, v[key])}"
+                for key, (label, *_) in INVITE_SETTINGS.items()
+            ),
+            f"已生成数量：{stats['links']} 条",
+        ]
+        if v["invite_since"]:
+            since = when_text(v["invite_since"], self.handlers.timezone)
+            lines.append(f"🗑 {since} 清空过数据，以上人数和链接数从那时起统计。")
+        lines.append("")
+        if not v["invite_links"]:
+            lines.append("关闭时 /link 不生成链接；进行中的专属链接邀请抽奖照常可以领取。")
+        if v["invite_notice"]:
+            lines.append(
+                "邀请提醒：有人通过群友的链接进群（或被群友拉进群）时，机器人在群里说一声。"
+            )
+        lines.append(
+            "修改有效期或最多邀请人数后，群友再领取会拿到按新设置生成的链接；"
+            "已经发出去的旧链接不受影响。"
+        )
+        try:
+            me = await bot.get_chat_member(chat_id, bot.id)
+        except TelegramError as exc:
+            LOG.warning("无法查询机器人在群 %s 的权限：%s", chat_id, exc)
+        else:
+            invite = me.status == ChatMember.ADMINISTRATOR and getattr(
+                me, "can_invite_users", False
+            )
+            lines.append(f"机器人权限：管理员并能邀请用户 {'✅' if invite else '❌'}")
+            if not invite:
+                lines.append("没有这个权限时，机器人生成不了链接，也认不出谁邀请了谁。")
+        lines += await self.last_change(chat_id, list(INVITE_KEYS))
+        rows = [
+            (
+                button(
+                    f"{label}：{'开' if v[key] else '关'}",
+                    f"m:isv:{chat_id}:{key}:{int(not v[key])}",
+                ),
+            )
+            for key, label in INVITE_SWITCHES.items()
+        ]
+        rows += [
+            (
+                button(
+                    f"🔧 {label.split(' ', 1)[1]}：{invite_value(key, v[key])}",
+                    f"m:isk:{chat_id}:{key}",
+                ),
+            )
+            for key, (label, *_) in INVITE_SETTINGS.items()
+        ]
+        return "\n".join(lines), keyboard(
+            *rows,
+            (button("👥 邀请明细", f"m:il:{chat_id}:0:0"), button("🖨 导出", f"m:ix:{chat_id}")),
+            (button("🔗 重置邀请链接", f"m:ir:{chat_id}"), button("🗑 清空数据", f"m:ic:{chat_id}")),
+            (button("📜 修改记录", f"m:log:{chat_id}:is"), button("⬅️ 返回", f"m:g:{chat_id}")),
+        )
+
+    async def invite_prompt(self, user_id, chat_id, key):
+        label, _, presets, question = INVITE_SETTINGS[key]
+        low, high = SETTING_LIMITS[key]
+        value = (await asyncio.to_thread(self.store.group_settings, chat_id))[key]
+        self._asking[user_id] = ("invite", chat_id, key, 0)
+        text = (
+            f"{label}：{invite_value(key, value)}\n{question}\n"
+            f"点按钮或直接发送数字（{low}～{high}，0 表示无限制）："
+        )
+        choices = [button(invite_value(key, n), f"m:isv:{chat_id}:{key}:{n}") for n in presets]
+        return text, keyboard(*in_rows(choices, 3), (button("⬅️ 返回", f"m:is:{chat_id}"),))
+
+    async def invite_typed(self, bot, message, user_id, asking):
+        _, chat_id, key, _ = asking
+        try:
+            name = INVITE_SETTINGS[key][0].split(" ", 1)[1]
+            value = number(message.text.strip(), name, *SETTING_LIMITS[key])
+            await self.set_link_limit(user_id, chat_id, key, value)
+        except LotteryError as exc:
+            back = keyboard((button("⬅️ 返回", f"m:is:{chat_id}"),))
+            await message.reply_text(str(exc), reply_markup=back)
+            return
+        self._asking.pop(user_id, None)
+        text, markup = await self.invite_page(bot, chat_id)
+        await message.reply_text(text, reply_markup=markup)
+
+    async def reset_links_prompt(self, chat_id):
+        title = await asyncio.to_thread(self.store.group_title, chat_id)
+        text = (
+            f"🔗 重置「{title}」的邀请链接？\n\n"
+            "重置后，群友再领取专属邀请链接（点抽奖卡片上的按钮或发 /link）会拿到新链接。\n"
+            "群主在群设置里撤销了机器人生成的链接后，点这里让大家换上新链接。\n"
+            "机器人不会撤销旧链接：旧链接要是还能用，通过它进群照样算原来那个人邀请的；"
+            "已经算上的邀请人数也不受影响。"
+        )
+        return text, keyboard(
+            (button("✅ 确定重置", f"m:irk:{chat_id}"), button("⬅️ 返回", f"m:is:{chat_id}"))
+        )
+
+    async def clear_invites_prompt(self, chat_id):
+        title = await asyncio.to_thread(self.store.group_title, chat_id)
+        text = (
+            f"🗑 清空「{title}」的邀请数据？\n\n"
+            "清空后，总邀请人数、已生成数量、每个群友 /link 里看到的邀请人数和邀请明细，"
+            "都从现在起重新统计。\n"
+            "防作弊的记录会保留：以前进过群的人再进群，仍然不算有效邀请。\n"
+            "进行中的邀请抽奖按各自的规则统计，不受影响；已经发出去的链接照常能用。\n"
+            "清空前的记录仍在「🖨 导出」的文件里。"
+        )
+        return text, keyboard(
+            (button("✅ 确定清空", f"m:ick:{chat_id}"), button("⬅️ 返回", f"m:is:{chat_id}"))
+        )
+
+    async def invite_details(self, bot, user_id, action, args):
+        """Who brought members in, since the statistics were last cleared or (with a raffle
+        ID) as an invite raffle counts them: "il" lists the inviters, "ip" whom one brought."""
+        chat_id, rid = int_arg(args, 0), int_arg(args, 1)
+        await self.require(bot, user_id, chat_id)
+        zone = self.handlers.timezone
+        if rid:
+            raffle = await asyncio.to_thread(self.store.view, rid)
+            if raffle["chat_id"] != chat_id or not raffle["invite_via"]:
+                raise BadButton(rid)
+            scope = {
+                "since": raffle["count_from"],
+                "until": raffle["deadline"],
+                "via": raffle["invite_via"],
+            }
+            heading = f"👥 {raffle['title']}  #{rid} · 邀请明细"
+            counting = counting_text(raffle["count_from"], zone, raffle["invite_via"])
+            rule = (
+                f"按本场规则：{counting.split(' ', 1)[1]}，开奖前退群的不算；"
+                "邀请人自己退群的，他的邀请都不算。"
+            )
+            back = f"m:r:{rid}"
+        else:
+            since = (await asyncio.to_thread(self.store.group_settings, chat_id))["invite_since"]
+            scope = {"since": since}
+            title = await asyncio.to_thread(self.store.group_title, chat_id)
+            heading = f"👥 {title} · 邀请明细"
+            start = f"{when_text(since, zone)} 清空数据后的记录" if since else "全部记录"
+            rule = f"{start}，只算第一次进群的新成员；人数是现在还在群里的，退群的另外标出。"
+            back = f"m:is:{chat_id}"
+        if action == "il":
+            return await self.inviter_list(
+                chat_id, rid, heading, rule, scope, back, int_arg(args, 2)
+            )
+        return await self.invitee_list(chat_id, rid, scope, int_arg(args, 2), int_arg(args, 3))
+
+    async def inviter_list(self, chat_id, rid, heading, rule, scope, back, page):
+        rows, more = await asyncio.to_thread(self.store.inviters, chat_id, page, PAGE_SIZE, **scope)
+        lines = [heading, rule, "点一个人，查看他邀请了谁。" if rows else "还没有邀请记录。"]
+        people = []
+        for rank, row in enumerate(rows, page * PAGE_SIZE + 1):
+            name = name_text(row["inviter_name"]) or f"用户 {row['inviter_id']}"
+            label = f"{rank}. {name[:16]} · {row['counted']} 人"
+            if row["left"]:
+                label += f"（退群 {row['left']}）"
+            if row["gone"]:
+                label += " · 本人已退群"
+            people.append((button(label, f"m:ip:{chat_id}:{rid}:{row['inviter_id']}:0"),))
+        nav = []
+        if page:
+            nav.append(button("◂ 上一页", f"m:il:{chat_id}:{rid}:{page - 1}"))
+        if more:
+            nav.append(button("下一页 ▸", f"m:il:{chat_id}:{rid}:{page + 1}"))
+        return "\n".join(lines), keyboard(*people, nav, (button("⬅️ 返回", back),))
+
+    async def invitee_list(self, chat_id, rid, scope, uid, page):
+        found = await asyncio.to_thread(
+            self.store.invitees, chat_id, uid, page, INVITEES_SHOWN, **scope
+        )
+        name = name_text(found["name"]) or f"用户 {uid}"
+        counted = f"有效 {found['counted']} 人"
+        if found["left"]:
+            counted += f"，已退群 {found['left']} 人（不算）"
+        lines = [f"👥 {name}（ID：{uid}）邀请的人", counted]
+        if found["gone"]:
+            lines.append("⚠️ 他本人已退群" + ("，本场的邀请都不算。" if rid else "。"))
+        for index, row in enumerate(found["rows"], page * INVITEES_SHOWN + 1):
+            who = name_text(row["invitee_name"]) or "（没有名字）"
+            when = datetime.fromtimestamp(row["joined_at"], self.handlers.timezone)
+            how = "用链接" if row["via"] == "link" else "被拉"
+            gone = "" if row["counted"] else " · 已退群，不算"
+            lines.append(f"{index}. {who}（{row['invitee_id']}）{when:%m-%d %H:%M} {how}进群{gone}")
+        nav = []
+        if page:
+            nav.append(button("◂ 上一页", f"m:ip:{chat_id}:{rid}:{uid}:{page - 1}"))
+        if found["more"]:
+            nav.append(button("下一页 ▸", f"m:ip:{chat_id}:{rid}:{uid}:{page + 1}"))
+        back = (button("⬅️ 返回", f"m:il:{chat_id}:{rid}:0"),)
+        return "\n".join(lines), keyboard(nav, back)
+
     # Records
 
     async def records(self, chat_id, page):
@@ -1736,6 +2040,8 @@ class Menu:
                 rows.append((button("✏️ 修改发言次数", f"m:ac:{rid}:0"), export))
             else:
                 rows.append((export,))
+        if raffle["invite_via"]:
+            rows.append((button("👥 邀请明细", f"m:il:{raffle['chat_id']}:{rid}:0"),))
         rows.append((button("⬅️ 返回", f"m:list:{raffle['chat_id']}:0"),))
         return "\n".join(lines), keyboard(*rows)
 

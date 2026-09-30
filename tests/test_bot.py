@@ -1356,3 +1356,86 @@ def test_members_join_a_report_raffle_by_joining_its_report_group(inviting):
 
     assert join_click(handlers, rid, AsyncMock(side_effect=both)) == "报名成功！"
     assert [e["user_id"] for e in store.view(rid)["entries"]] == [11, 123]
+
+
+def test_invite_links_follow_the_group_settings(inviting):
+    store, now, handlers = inviting
+    store.set_group_setting(GROUP["id"], "link_days", 7)
+    store.set_group_setting(GROUP["id"], "link_members", 50)
+    made = AsyncMock(return_value=SimpleNamespace(invite_link="https://t.me/+alice"))
+    bot = fake_bot(create_chat_invite_link=made)
+    alice = SimpleNamespace(id=123, full_name="Alice")
+    text = asyncio.run(handlers.invite_link_text(bot, GROUP["id"], alice, check=False))
+    assert made.await_args.kwargs == {
+        "name": "Alice",
+        "expire_date": int(now[0]) + 7 * 86400,
+        "member_limit": 50,
+    }
+    assert text.startswith(
+        "🔗 你在「测试群」的专属邀请链接：\nhttps://t.me/+alice\n"
+        "有效期至 2027-01-22 16:00（UTC+08:00）；最多 50 人通过它进群。"
+        "到期或用满后再领取，会拿到新链接。\n"
+    )
+    store.set_group_setting(GROUP["id"], "link_cap", 1)
+    bob = SimpleNamespace(id=124, full_name="Bob")
+    text = asyncio.run(handlers.invite_link_text(bot, GROUP["id"], bob, check=False))
+    assert text == "本群的邀请链接已达到生成数量上限，请联系群管理员。"
+    assert made.await_count == 1
+    store.set_group_setting(GROUP["id"], "invite_links", False)
+    text = asyncio.run(handlers.invite_link_text(bot, GROUP["id"], alice, check=False))
+    assert text == "本群没有开启邀请链接。"
+    # An invite raffle by link needs the links all the same.
+    store.create(
+        99, "链接榜", 1, 60, chat_id=GROUP["id"], kind="rank", prizes=[["a", 1]], invite_via="link"
+    )
+    text = asyncio.run(handlers.invite_link_text(bot, GROUP["id"], alice, check=False))
+    assert "https://t.me/+alice" in text
+
+
+def test_the_link_answer_counts_invites(inviting):
+    store, now, handlers = inviting
+    store.save_invite_link(GROUP["id"], 123, "https://t.me/+alice", "Alice")
+    context = SimpleNamespace(bot=fake_bot(), job_queue=None)
+    asyncio.run(handlers.member_changed(arrival(11, now[0] - 10, by=123), context))
+    store.create(
+        99,
+        "拉满三人",
+        1,
+        deadline=now[0] + 3600,
+        chat_id=GROUP["id"],
+        kind="reach",
+        prizes=[["a", 1]],
+        invite_via="link",
+        min_messages=3,
+    )
+    asyncio.run(handlers.member_changed(arrival(12, now[0] + 10, "https://t.me/+alice"), context))
+    alice = SimpleNamespace(id=123, full_name="Alice")
+    text = asyncio.run(handlers.invite_link_text(fake_bot(), GROUP["id"], alice, check=False))
+    assert text.endswith(
+        "\n\n📊 你已邀请 2 人（只算第一次进群、现在还在群里的）\n🪁「拉满三人」已邀请 1 人，还差 2 人达标"
+    )
+
+
+def test_the_group_hears_who_brought_members_in(inviting):
+    store, now, handlers = inviting
+    store.save_invite_link(GROUP["id"], 1, "https://t.me/+eve", "Eve")
+    bot = fake_bot()
+    bot.send_message.side_effect = [SimpleNamespace(message_id=i) for i in (88, 89)]
+    context = SimpleNamespace(bot=bot, job_queue=None)
+    asyncio.run(handlers.member_changed(arrival(11, now[0], "https://t.me/+eve"), context))
+    bot.send_message.assert_not_awaited()  # not asked for
+    store.set_group_setting(GROUP["id"], "invite_notice", True)
+    asyncio.run(handlers.member_changed(arrival(12, now[0] + 1, "https://t.me/+eve"), context))
+    asyncio.run(handlers.member_changed(arrival(13, now[0] + 2, by=2), context))
+    asyncio.run(handlers.member_changed(arrival(12, now[0] + 3, by=2), context))  # not new
+    assert [call.args[1] for call in bot.send_message.await_args_list] == [
+        "🎉 u12 通过 Eve 的邀请链接进群，Eve 已邀请 2 人。",
+        "🎉 u2 把 u13 拉进了群，u2 已邀请 1 人。",
+    ]
+    assert store.due_deletions() == {}  # left a minute to be read
+    now[0] += 60
+    assert store.due_deletions() == {GROUP["id"]: [88, 89]}
+    found = store.invitees(GROUP["id"], 1, 0, 10)
+    assert [r["invitee_name"] for r in found["rows"]] == ["u12", "u11"]
+    with store.reading() as db:
+        assert db.execute("SELECT joins FROM invite_links").fetchone()[0] == 2

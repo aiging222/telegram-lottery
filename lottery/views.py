@@ -327,6 +327,12 @@ def points_file(exported):
     return BytesIO(raw), f"points{exported['chat_id']}.json"
 
 
+def invites_file(exported):
+    """The invite export attachment as (file, file name)."""
+    raw = json.dumps(exported, ensure_ascii=False, indent=2).encode()
+    return BytesIO(raw), f"invites{exported['chat_id']}.json"
+
+
 def chunks(text, limit=1500):
     """Split a long message at line breaks, so an HTML link is never cut in half.
 
