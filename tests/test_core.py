@@ -690,6 +690,51 @@ def test_activity_raffles_have_their_own_rules(setup):
             operation()
 
 
+def test_the_ranking_is_shown_while_counting(setup):
+    store, rid, now = setup
+    ranked = ranking(store, winners=1, kind="reach", prizes=[["奖", 1]], min_messages=3)
+    store.count_message(-100, 1, "a", now[0] + 1)
+    now[0] += 60
+    _, everyone = store.ranking(ranked)
+    assert [e["messages"] for e in everyone] == [1]  # short of the minimum, still listed
+    with pytest.raises(LotteryError, match="不按发言次数"):
+        store.ranking(rid)
+    now[0] += 3600
+    with pytest.raises(LotteryError, match="统计已截止"):
+        store.ranking(ranked)
+
+
+def test_counts_can_be_corrected_for_messages_the_bot_missed(setup):
+    store, rid, now = setup
+    start = now[0]
+    ranked = ranking(store, winners=2)
+    for uid, at in ((1, 10), (1, 20), (2, 30), (4, 5)):
+        store.count_message(-100, uid, f"u{uid}", start + at)
+    store.leave_group(-100, 4, start + 50)
+    now[0] = start + 60
+    assert store.adjust(ranked, 99, 2, by=5)  # one counted, five missed
+    assert not store.adjust(ranked, 99, 2, to=6)  # so already
+    assert store.adjust(ranked, 99, 3, to=4)  # never counted at all
+    assert store.adjust(ranked, 99, 4, by=10)  # left the group: stays out
+    with pytest.raises(LotteryError, match="不能小于 0"):
+        store.adjust(ranked, 99, 1, by=-3)
+    with pytest.raises(LotteryError, match="只有群活跃抽奖"):
+        store.adjust(rid, 99, 1, by=1)
+    store.count_message(-100, 2, "u2", start + 40)  # later messages still count
+    assert store.counted(ranked, 2) == (2, 5)
+    now[0] = start + 3600
+    with pytest.raises(LotteryError, match="统计已截止"):
+        store.adjust(ranked, 99, 1, by=1)
+    winners = store.draw(ranked, 99)["winners"]
+    assert [(w["user_id"], w["messages"], w.get("adjusted")) for w in winners] == [
+        (2, 7, 5),
+        (3, 4, 4),
+    ]
+    assert winners[1]["display_name"] == "用户 3"
+    actions = [e["action"] for e in store.export(ranked)["audit"]]
+    assert actions.count("adjust") == 3
+
+
 def test_message_counts_follow_a_supergroup_upgrade(setup):
     store, _, now = setup
     start = now[0]

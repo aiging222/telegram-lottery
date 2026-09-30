@@ -227,6 +227,17 @@ MIGRATIONS = [
         PRIMARY KEY (chat_id, user_id)
     )
     """,
+    # 12: super admins' corrections to members' message counts in an activity raffle, for
+    # messages the bot missed: delta is added to what it counts; at is when it was set.
+    """
+    CREATE TABLE IF NOT EXISTS adjustments (
+        raffle_id INTEGER NOT NULL REFERENCES raffles(id),
+        user_id INTEGER NOT NULL,
+        delta INTEGER NOT NULL,
+        at REAL NOT NULL,
+        PRIMARY KEY (raffle_id, user_id)
+    )
+    """,
 ]
 # Deletion delays are seconds after posting: 0 deletes at once, None keeps the message.
 GROUP_DEFAULTS = {"pin_card": True, "pin_result": True, "delete_keyword": 60, "delete_notices": 600}
@@ -785,13 +796,118 @@ class Store:
         minutes = [minute for minute in (first, *waiting) if minute is not None]
         return min(minutes) * 60 if minutes else None
 
-    def _speakers(self, db, raffle):
-        """Who wrote in the raffle's group from count_from until the deadline (or now): the
-        most messages first and, among equals, whoever got to that number first. Members
-        who left after their last message there are out; "reach" keeps those with enough."""
+    def ranking(self, raffle_id):
+        """An open activity raffle and everyone ranked in it so far, including those still
+        short of a "reach" raffle's minimum."""
+        with self.reading() as db:
+            raffle = self._get(db, raffle_id)
+            if raffle["kind"] == "join":
+                raise LotteryError("这场抽奖不按发言次数。")
+            if not self._open(raffle):
+                raise LotteryError("统计已截止，结果以开奖公告为准。")
+            return raffle, self._speakers(db, raffle, everyone=True)
+
+    def adjust(self, raffle_id, actor, user_id, *, by=None, to=None):
+        """Correct a member's message count in an open activity raffle for messages the bot
+        missed: add `by` (or take it away), or make the total `to`. The correction stays on
+        top of whatever is counted later. False if nothing changed."""
+        integer(user_id, "用户 ID", 1, 2**63 - 1)
+        with self.transaction() as db:
+            raffle = self._get(db, raffle_id)
+            if raffle["kind"] == "join":
+                raise LotteryError("只有群活跃抽奖能修改发言次数。")
+            if not self._open(raffle):
+                raise LotteryError("统计已截止，不能再修改发言次数。")
+            counted = self._tally(db, raffle).get(user_id, [0])[0]
+            row = db.execute(
+                "SELECT delta FROM adjustments WHERE raffle_id=? AND user_id=?",
+                (raffle_id, user_id),
+            ).fetchone()
+            before = row[0] if row else 0
+            if to is not None:
+                after = integer(to, "发言次数", 0, 1_000_000) - counted
+            else:
+                after = before + integer(by, "修改的次数", -1_000_000, 1_000_000)
+            if counted + after < 0:
+                raise LotteryError("发言次数不能小于 0。")
+            if after == before:
+                return False
+            if after:
+                db.execute(
+                    "INSERT INTO adjustments VALUES(?,?,?,?) ON CONFLICT(raffle_id,user_id) "
+                    "DO UPDATE SET delta=excluded.delta,at=excluded.at",
+                    (raffle_id, user_id, after, self.clock()),
+                )
+            else:
+                db.execute(
+                    "DELETE FROM adjustments WHERE raffle_id=? AND user_id=?", (raffle_id, user_id)
+                )
+            self.audit(
+                db,
+                raffle_id,
+                actor,
+                "adjust",
+                {"user_id": user_id, "counted": counted, "before": before, "after": after},
+            )
+            return True
+
+    def counted(self, raffle_id, user_id):
+        """A member's messages in an activity raffle so far: (as counted, correction)."""
+        with self.reading() as db:
+            raffle = self._get(db, raffle_id)
+            counted = self._tally(db, raffle).get(user_id, [0])[0]
+            row = db.execute(
+                "SELECT delta FROM adjustments WHERE raffle_id=? AND user_id=?",
+                (raffle_id, user_id),
+            ).fetchone()
+        return counted, row[0] if row else 0
+
+    def _speakers(self, db, raffle, everyone=False):
+        """Who wrote in the raffle's group from count_from until the deadline (or now), with
+        the corrections of adjust() on top: the most messages first and, among equals,
+        whoever got to that number first. Members who left after their last message there
+        are out; "reach" keeps those with enough unless `everyone` is asked for."""
+        if raffle["chat_id"] is None:
+            return []
+        tally = self._tally(db, raffle)
+        corrections = {
+            row[0]: (row[1], row[2])
+            for row in db.execute(
+                "SELECT user_id,delta,at FROM adjustments WHERE raffle_id=?", (raffle["id"],)
+            )
+        }
+        for uid in corrections.keys() - tally.keys():  # added by hand only
+            row = db.execute(
+                "SELECT display_name,left_at FROM speakers WHERE chat_id=? AND user_id=?",
+                (raffle["chat_id"], uid),
+            ).fetchone()
+            tally[uid] = [0, 0.0, *(row or (None, None))]
+        entries = []
+        for uid, (count, last, name, left) in tally.items():
+            delta, at = corrections.get(uid, (0, 0.0))
+            if count + delta <= 0 or (left is not None and left >= last):
+                continue
+            entry = {
+                "user_id": uid,
+                "display_name": name or f"用户 {uid}",
+                "messages": count + delta,
+                "reached_at": max(last, at),
+                "weight": 1,
+            }
+            if delta:
+                entry["adjusted"] = delta
+            entries.append(entry)
+        entries.sort(key=lambda e: (-e["messages"], e["reached_at"], e["user_id"]))
+        if raffle["kind"] == "reach" and not everyone:
+            entries = [e for e in entries if e["messages"] >= raffle["min_messages"]]
+        return entries
+
+    def _tally(self, db, raffle):
+        """Each member's messages in the raffle's window as the bot counted them, saved or
+        not: user_id -> [count, last message time, name, when they last left]."""
         chat_id = raffle["chat_id"]
         if chat_id is None:
-            return []
+            return {}
         start = int(raffle["count_from"] // 60)
         stop = math.ceil(min(raffle["deadline"], self.clock()) / 60)
         tally = {
@@ -809,22 +925,10 @@ class Store:
                     spoken = tally.setdefault(uid, [0, 0.0, None, None])
                     spoken[0] += count
                     spoken[1] = max(spoken[1], last)
-            names = {uid: name for (chat, uid), name in self._names.items() if chat == chat_id}
-        entries = [
-            {
-                "user_id": uid,
-                "display_name": names.get(uid) or name or str(uid),
-                "messages": count,
-                "reached_at": last,
-                "weight": 1,
-            }
-            for uid, (count, last, name, left) in tally.items()
-            if left is None or left < last
-        ]
-        entries.sort(key=lambda e: (-e["messages"], e["reached_at"], e["user_id"]))
-        if raffle["kind"] == "reach":
-            entries = [e for e in entries if e["messages"] >= raffle["min_messages"]]
-        return entries
+            for (chat, uid), name in self._names.items():
+                if chat == chat_id and uid in tally:
+                    tally[uid][2] = name
+        return tally
 
     def presets(self, raffle_id):
         """Personal weights of people who have not joined, as (user_id, weight)."""

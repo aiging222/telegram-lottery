@@ -100,6 +100,9 @@ def card(raffle, timezone):
     if raffle["status"] == "OPEN" and raffle["chat_id"] is not None:
         if kind != "join":
             lines.append("👉 在群里发言即可参与")
+            markup = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("📊 查看我的排名", callback_data=f"rank:{raffle['id']}")]]
+            )
         elif raffle["keyword"]:
             lines.append(f"👉 {join_text(raffle['keyword'])}")
         else:
@@ -111,6 +114,32 @@ def card(raffle, timezone):
     else:
         lines.append(status_text(raffle))
     return "\n".join(lines), markup
+
+
+def standing_text(raffle, ranked, user_id):
+    """A member's standing in an open activity raffle, shown only to them when they press
+    the card's button. Telegram shows at most 200 characters."""
+    mine = next((i for i, e in enumerate(ranked) if e["user_id"] == user_id), None)
+    spoken = ranked[mine]["messages"] if mine is not None else 0
+    if raffle["kind"] == "rank":
+        lines = [f"📊 发言排名 · 前 {raffle['winner_count']} 名获奖"]
+        lines += [
+            f"{place}. {name_text(e['display_name'])[:8]} · {e['messages']} 次"
+            for place, e in enumerate(ranked[:5], 1)
+        ]
+        if mine is None:
+            lines.append("你还没有发言，发言即可参与排名")
+        else:
+            lines.append(f"你：第 {mine + 1} 名 · {spoken} 次")
+    else:
+        need = raffle["min_messages"]
+        enough = sum(1 for e in ranked if e["messages"] >= need)
+        lines = [f"📊 发言满 {need} 次即可参与抽奖", f"已达标 {enough} 人"]
+        if spoken >= need:
+            lines.append(f"你已发言 {spoken} 次，已达标")
+        else:
+            lines.append(f"你已发言 {spoken} 次，还差 {need - spoken} 次")
+    return "\n".join(lines)[:200]
 
 
 def result_text(result, mention=False):

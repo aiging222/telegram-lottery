@@ -18,9 +18,10 @@ from lottery.bot import (
     TokenFilter,
     build_application,
     main,
+    register_commands,
 )
 from lottery.core import LotteryError, Store
-from lottery.views import card, chunks, result_text
+from lottery.views import card, chunks, result_text, standing_text
 
 TOKEN = "123456:SECRET-token"
 USER = {"id": 123, "is_bot": False, "first_name": "Alice"}
@@ -828,13 +829,60 @@ def test_group_text_counts_for_activity_raffles(due):
     now[0] += 60
     text, markup = card(store.view(ranked), SHANGHAI)
     assert "🏆 第一名 a、第二名 b\n💬 按发言次数排名，前 2 名获奖" in text
-    assert text.endswith("👉 在群里发言即可参与") and markup is None
+    assert text.endswith("👉 在群里发言即可参与")
+    assert markup.inline_keyboard[0][0].callback_data == f"rank:{ranked}"
+
+    def standing(user_id):
+        query = SimpleNamespace(
+            data=f"rank:{ranked}",
+            answer=AsyncMock(),
+            from_user=SimpleNamespace(id=user_id, full_name="x", is_bot=False),
+        )
+        context = SimpleNamespace(bot=fake_bot())
+        asyncio.run(handlers.callback(SimpleNamespace(callback_query=query), context))
+        return query.answer.await_args.args[0]
+
+    assert standing(124) == (
+        "📊 发言排名 · 前 2 名获奖\n1. u123 · 2 次\n2. u124 · 1 次\n你：第 2 名 · 1 次"
+    )
+    assert standing(999).endswith("你还没有发言，发言即可参与排名")
     preview = run_command(handlers, f"/preview {ranked}").reply_text.call_args.args[0]
     assert "u123 / 123：发言 2 次\nu124 / 124：发言 1 次\n展示前 30 人" in preview
     now[0] += 3600
     announcement = run_auto_draw(handlers).await_args.args[1]
     assert '1. <a href="tg://user?id=123">u123</a> — a（发言 2 次）' in announcement
     assert '2. <a href="tg://user?id=124">u124</a> — b（发言 1 次）' in announcement
+
+
+def test_standing_in_a_reach_raffle_and_its_length():
+    reach = {"kind": "reach", "min_messages": 10, "winner_count": 2}
+    ranked = [
+        {"user_id": 1, "display_name": "A", "messages": 12},
+        {"user_id": 2, "display_name": "B", "messages": 7},
+    ]
+    assert standing_text(reach, ranked, 2) == (
+        "📊 发言满 10 次即可参与抽奖\n已达标 1 人\n你已发言 7 次，还差 3 次"
+    )
+    assert standing_text(reach, ranked, 1).endswith("你已发言 12 次，已达标")
+    assert standing_text(reach, ranked, 3).endswith("你已发言 0 次，还差 10 次")
+    rank = {"kind": "rank", "min_messages": None, "winner_count": 10}
+    crowd = [{"user_id": i, "display_name": "名" * 128, "messages": 100_000 - i} for i in range(9)]
+    assert len(standing_text(rank, crowd, 8)) <= 200  # Telegram's limit for the alert
+    assert standing_text(rank, crowd, 8).endswith("你：第 9 名 · 99992 次")
+
+
+def test_only_start_and_id_are_in_the_command_menu():
+    bot = SimpleNamespace(set_my_commands=AsyncMock())
+    asyncio.run(register_commands(SimpleNamespace(bot=bot)))
+    assert [c.command for c in bot.set_my_commands.await_args.args[0]] == ["start", "id"]
+
+
+def test_preview_shows_corrections(setup):
+    store, _, handlers = setup
+    rid = store.create(99, "话痨榜", 1, 60, chat_id=GROUP["id"], kind="rank", prizes=[["a", 1]])
+    store.adjust(rid, 99, 123, to=4)
+    preview = run_command(handlers, f"/preview {rid}").reply_text.call_args.args[0]
+    assert "用户 123 / 123：发言 4 次（手动 +4）" in preview
 
 
 def test_activity_raffles_take_no_joins(setup):

@@ -30,6 +30,7 @@ from lottery.views import (
     export_file,
     name_text,
     result_text,
+    standing_text,
     status_text,
 )
 
@@ -321,9 +322,10 @@ class BotHandlers:
                 elif command == "preview" and raffle["kind"] != "join":
                     lines = [f"抽奖 {rid}｜{status_text(raffle)}｜按发言次数"]
                     for p in raffle["entries"][:30]:
+                        correction = f"（手动 {p['adjusted']:+d}）" if p.get("adjusted") else ""
                         lines.append(
                             f"{name_text(p['display_name'])} / {p['user_id']}："
-                            f"发言 {p['messages']} 次"
+                            f"发言 {p['messages']} 次{correction}"
                         )
                 elif command == "preview":
                     odds = chances(raffle["entries"], raffle["winner_count"])
@@ -376,6 +378,9 @@ class BotHandlers:
                 text = "报名成功！" if added else "你已报名，无需重复报名。"
                 if added:
                     await self.after_join(context, rid)
+            elif action == "rank":
+                raffle, ranked = await asyncio.to_thread(self.store.ranking, rid)
+                text = standing_text(raffle, ranked, query.from_user.id)
             else:
                 # Cards published before weights became private still carry this button.
                 text = "该功能已下线。"
@@ -692,15 +697,9 @@ class TokenFilter(logging.Filter):
 
 
 async def register_commands(app):
+    # Everything else is done with buttons; the other commands still work when typed.
     await app.bot.set_my_commands(
-        [
-            BotCommand("start", "打开菜单"),
-            BotCommand("cancel", "退出正在进行的操作"),
-            BotCommand("help", "使用说明"),
-            BotCommand("raffle", "查看抽奖"),
-            BotCommand("result", "查看开奖结果"),
-            BotCommand("id", "查看我的用户 ID"),
-        ]
+        [BotCommand("start", "打开菜单"), BotCommand("id", "查看我的用户 ID")]
     )
 
 
@@ -722,7 +721,9 @@ def build_application(settings):
     app.add_handler(CommandHandler("start", menu.start))
     app.add_handler(CommandHandler("cancel", menu.cancel, filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler(commands, handlers.command))
-    app.add_handler(CallbackQueryHandler(handlers.callback, pattern=r"^(join|weight):[0-9]{1,19}$"))
+    app.add_handler(
+        CallbackQueryHandler(handlers.callback, pattern=r"^(join|rank|weight):[0-9]{1,19}$")
+    )
     app.add_handler(CallbackQueryHandler(menu.callback, pattern=r"^m:"))
     app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, handlers.migrate))
     app.add_handler(

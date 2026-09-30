@@ -39,6 +39,7 @@ DURATIONS = (("1小时", 60), ("6小时", 360), ("1天", 1440), ("3天", 4320), 
 TARGETS = (10, 50, 100)
 MINIMUMS = (5, 10, 20, 50, 100)
 WEIGHTS = (0, 1, 2, 3, 5, 10)
+CORRECTIONS = (1, 5, 10, -1, -5, -10)
 UNITS = {"分钟": 1, "分": 1, "m": 1, "小时": 60, "时": 60, "h": 60, "天": 1440, "d": 1440}
 CONFIRM = {
     "draw": "确定现在开奖？",
@@ -372,6 +373,10 @@ class Menu:
         if action in ("w", "wu", "ws", "wd", "wid", "wc", "export"):
             self.require_super(user_id)
             return await self.weight_action(bot, user_id, action, args)
+        if action in ("ac", "au", "as", "aid"):
+            if not self.is_super(user_id):
+                raise LotteryError("只有超级管理员可以修改发言次数。")
+            return await self.count_action(user_id, action, args)
         raise ValueError(action)
 
     # Group menu
@@ -933,7 +938,11 @@ class Menu:
         if self.is_super(user_id) and kind == "join":
             rows.append((button("⚖️ 中奖加成", f"m:w:{rid}:0"),))
         elif self.is_super(user_id):
-            rows.append((button("📄 导出记录", f"m:export:{rid}:0"),))
+            export = button("📄 导出记录", f"m:export:{rid}:0")
+            if raffle["status"] == "OPEN":
+                rows.append((button("✏️ 修改发言次数", f"m:ac:{rid}:0"), export))
+            else:
+                rows.append((export,))
         rows.append((button("⬅️ 返回", f"m:list:{raffle['chat_id']}:0"),))
         return "\n".join(lines), keyboard(*rows)
 
@@ -1126,6 +1135,82 @@ class Menu:
             (button("⬅️ 返回", f"m:w:{rid}:{page}"),),
         )
 
+    # Message counts of activity raffles, for super admins (route() checks): corrections
+    # for messages the bot missed, say while its network was down.
+
+    async def count_action(self, user_id, action, args):
+        rid, page = int(args[0]), int(args[-1])
+        if action == "ac":
+            return await self.counts(rid, page)
+        if action == "aid":
+            await asyncio.to_thread(self.store.ranking, rid)  # raises once counting is over
+            self._asking[user_id] = ("count_id", rid, None, page)
+            back = keyboard((button("⬅️ 返回", f"m:ac:{rid}:{page}"),))
+            return "发送用户 ID 和正确的发言次数，用空格分开，例如：123456789 30", back
+        uid = int(args[1])
+        if action == "as" and args[2] == "x":
+            counted, _ = await asyncio.to_thread(self.store.counted, rid, uid)
+            self._asking[user_id] = ("count", rid, uid, page)
+            back = keyboard((button("⬅️ 返回", f"m:au:{rid}:{uid}:{page}"),))
+            return f"请发送正确的发言次数（机器人记录 {counted} 次）：", back
+        if action == "as":
+            by = int(args[2])
+            await asyncio.to_thread(functools.partial(self.store.adjust, rid, user_id, uid, by=by))
+        return await self.speaker(rid, uid, page)
+
+    async def counts(self, rid, page):
+        raffle, ranked = await asyncio.to_thread(self.store.ranking, rid)
+        adjusted = sum(1 for e in ranked if e.get("adjusted"))
+        lines = [
+            f"✏️ 发言次数 · {raffle['title']}  #{rid}",
+            f"已发言 {len(ranked)} 人 · 已修改 {adjusted} 人",
+            (
+                "机器人漏记时（比如网络中断），可以在这里补上。"
+                "修改加在机器人统计的次数上，之后的发言照常累计。"
+            ),
+        ]
+        if not ranked:
+            lines.append("还没有人发言。")
+        rows = []
+        first = page * PAGE_SIZE
+        for rank, e in enumerate(ranked[first : first + PAGE_SIZE], first + 1):
+            label = f"{rank}. {name_text(e['display_name'])[:16]}"
+            label += f" · {e['messages']} 次"
+            if e.get("adjusted"):
+                label += f"（手动 {e['adjusted']:+d}）"
+            rows.append((button(label, f"m:au:{rid}:{e['user_id']}:{page}"),))
+        nav = []
+        if page:
+            nav.append(button("◂ 上一页", f"m:ac:{rid}:{page - 1}"))
+        if len(ranked) > (page + 1) * PAGE_SIZE:
+            nav.append(button("下一页 ▸", f"m:ac:{rid}:{page + 1}"))
+        return "\n".join(lines), keyboard(
+            *rows,
+            nav,
+            (button("➕ 按用户 ID 修改", f"m:aid:{rid}:{page}"),),
+            (button("⬅️ 返回", f"m:r:{rid}"),),
+        )
+
+    async def speaker(self, rid, uid, page):
+        """One member's message count, with buttons to correct it."""
+        _, ranked = await asyncio.to_thread(self.store.ranking, rid)
+        counted, delta = await asyncio.to_thread(self.store.counted, rid, uid)
+        entry = next((e for e in ranked if e["user_id"] == uid), None)
+        name = name_text(entry["display_name"]) if entry else f"用户 {uid}"
+        count = f"发言 {counted + delta} 次 · 机器人记录 {counted} 次"
+        if delta:
+            count += f" · 手动 {delta:+d}"
+        lines = [f"{name}（ID：{uid}）", count]
+        if entry:
+            lines.append(f"当前第 {ranked.index(entry) + 1} 名")
+        choices = [button(f"{n:+d}", f"m:as:{rid}:{uid}:{n}:{page}") for n in CORRECTIONS]
+        return "\n".join(lines), keyboard(
+            *in_rows(choices, 3),
+            (button("✏️ 改为…", f"m:as:{rid}:{uid}:x:{page}"),),
+            (button("↩️ 清除修改", f"m:as:{rid}:{uid}:{-delta}:{page}"),) if delta else (),
+            (button("⬅️ 返回", f"m:ac:{rid}:{page}"),),
+        )
+
     async def weight_typed(self, bot, message, user_id, asking):
         kind, rid, uid, page = asking
         parts = message.text.split()
@@ -1141,18 +1226,32 @@ class Menu:
                 weight = number(parts[1], "权重", 0, cap)
                 target = integer(int(parts[0]), "用户 ID", 1, 2**63 - 1)
                 await asyncio.to_thread(self.store.override, rid, user_id, target, weight)
-            else:
+            elif kind == "config":
                 if len(parts) != 2:
                     raise LotteryError("请发送默认权重和上限，用空格分开，例如：1 100")
                 default = number(parts[0], "默认权重", 0, 1_000_000)
                 cap = number(parts[1], "权重上限", 1, 1_000_000)
                 await asyncio.to_thread(self.store.configure, rid, user_id, default, cap)
+            else:  # a message count, for a member picked from the list or by user ID
+                if kind == "count":
+                    total = number(message.text.strip(), "发言次数", 0, 1_000_000)
+                elif len(parts) != 2 or not parts[0].isdigit():
+                    raise LotteryError("请发送用户 ID 和发言次数，用空格分开，例如：123456789 30")
+                else:
+                    uid = integer(int(parts[0]), "用户 ID", 1, 2**63 - 1)
+                    total = number(parts[1], "发言次数", 0, 1_000_000)
+                adjust = functools.partial(self.store.adjust, rid, user_id, uid, to=total)
+                await asyncio.to_thread(adjust)
         except LotteryError as exc:
-            back = keyboard((button("⬅️ 返回", f"m:w:{rid}:{page}"),))
+            counting = kind in ("count", "count_id")
+            back = keyboard((button("⬅️ 返回", f"m:{'ac' if counting else 'w'}:{rid}:{page}"),))
             await message.reply_text(str(exc), reply_markup=back)
             return
         self._asking.pop(user_id, None)
-        if kind != "config":
-            await self.weights_changed(bot, raffle)
-        text, markup = await self.weights(rid, page)
+        if kind in ("count", "count_id"):
+            text, markup = await self.speaker(rid, uid, page)
+        else:
+            if kind != "config":
+                await self.weights_changed(bot, raffle)
+            text, markup = await self.weights(rid, page)
         await message.reply_text(text, reply_markup=markup)

@@ -331,7 +331,8 @@ def test_wizard_creates_an_activity_ranking(env):
     assert raffle["count_from"] == datetime(2027, 1, 15, 12, tzinfo=SHANGHAI).timestamp()
     assert raffle["deadline"] == NOW + 3600
     card = env.bot.send_message.await_args
-    assert "👉 在群里发言即可参与" in card.args[1] and card.kwargs["reply_markup"] is None
+    assert "👉 在群里发言即可参与" in card.args[1]
+    assert labels(card.kwargs["reply_markup"]) == {"📊 查看我的排名": "rank:1"}
 
 
 def test_wizard_creates_an_activity_draw(env):
@@ -367,6 +368,38 @@ def test_activity_raffles_in_the_records(env):
     env.bot.send_document.assert_awaited_once()
     query = press(env, ADMIN, f"m:w:{rid}:0")
     assert query.answer.await_args.args[0].startswith("群活跃抽奖按发言次数决定")
+
+
+def test_super_admins_correct_message_counts(env):
+    rid = env.store.create(
+        OWNER, "话痨榜", 2, 60, chat_id=GROUP, kind="rank", prizes=[["a", 1], ["b", 1]]
+    )
+    env.store.count_message(GROUP, 7, "Tom", NOW + 30)
+    env.now[0] += 90
+    _, buttons = shown(press(env, OWNER, f"m:r:{rid}"))
+    assert "✏️ 修改发言次数" not in buttons
+    denied = press(env, OWNER, f"m:ac:{rid}:0").answer.await_args.args[0]
+    assert denied == "只有超级管理员可以修改发言次数。"
+    _, buttons = shown(press(env, ADMIN, f"m:r:{rid}"))
+    text, buttons = shown(press(env, ADMIN, buttons["✏️ 修改发言次数"]))
+    assert "已发言 1 人 · 已修改 0 人" in text
+    text, buttons = shown(press(env, ADMIN, buttons["1. Tom · 1 次"]))
+    assert text == "Tom（ID：7）\n发言 1 次 · 机器人记录 1 次\n当前第 1 名"
+    text, buttons = shown(press(env, ADMIN, buttons["+5"]))
+    assert text.startswith("Tom（ID：7）\n发言 6 次 · 机器人记录 1 次 · 手动 +5")
+    text, _ = shown(press(env, ADMIN, buttons["✏️ 改为…"]))
+    assert text == "请发送正确的发言次数（机器人记录 1 次）："
+    text, _ = type_text(env, ADMIN, "10")
+    assert "发言 10 次 · 机器人记录 1 次 · 手动 +9" in text
+    shown(press(env, ADMIN, f"m:aid:{rid}:0"))
+    assert type_text(env, ADMIN, "8")[0].startswith("请发送用户 ID 和发言次数")
+    text, _ = type_text(env, ADMIN, "8 3")
+    assert text.startswith("用户 8（ID：8）\n发言 3 次 · 机器人记录 0 次 · 手动 +3")
+    text, buttons = shown(press(env, ADMIN, f"m:ac:{rid}:0"))
+    assert {"1. Tom · 10 次（手动 +9）", "2. 用户 8 · 3 次（手动 +3）"} <= set(buttons)
+    _, buttons = shown(press(env, ADMIN, buttons["1. Tom · 10 次（手动 +9）"]))
+    text, _ = shown(press(env, ADMIN, buttons["↩️ 清除修改"]))
+    assert text == "Tom（ID：7）\n发言 1 次 · 机器人记录 1 次\n当前第 2 名"
 
 
 def test_wizard_typed_deadline(env):
