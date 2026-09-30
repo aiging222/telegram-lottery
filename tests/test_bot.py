@@ -21,6 +21,7 @@ from lottery.bot import (
     register_commands,
 )
 from lottery.core import LotteryError, Store
+from lottery.points import Points
 from lottery.views import card, chunks, result_text, standing_text
 
 TOKEN = "123456:SECRET-token"
@@ -809,20 +810,29 @@ def test_group_text_counts_for_activity_raffles(due):
         prizes=[["a", 1], ["b", 1]],
     )
 
-    def say(user_id, **fields):
+    points = Points(handlers)
+
+    def say(user_id, at=5, text="大家好", **fields):
         message = SimpleNamespace(
-            chat=SimpleNamespace(id=GROUP["id"]),
-            date=datetime.fromtimestamp(now[0] + 5, UTC),
+            chat=SimpleNamespace(id=GROUP["id"], type="supergroup"),
+            date=datetime.fromtimestamp(now[0] + at, UTC),
+            text=text,
+            caption=None,
+            message_id=12,
+            reply_text=AsyncMock(return_value=SimpleNamespace(message_id=13)),
             sender_chat=fields.pop("sender_chat", None),
         )
         user = SimpleNamespace(
             **{"id": user_id, "full_name": f"u{user_id}", "is_bot": False} | fields
         )
         update = SimpleNamespace(effective_message=message, effective_user=user)
-        asyncio.run(handlers.count_message(update, None))
+        asyncio.run(points.message(update, SimpleNamespace(bot=fake_bot())))
 
-    for user_id in (123, 123, 124):
-        say(user_id)
+    for user_id, at in ((123, 5), (123, 15), (124, 5)):
+        say(user_id, at)
+    say(123, 17)  # two seconds after the last: too quick to count
+    say(124, 25, "好的")  # too short
+    say(124, 35, "灵石榜")  # a 灵石 word
     say(125, is_bot=True)
     say(126, sender_chat=SimpleNamespace(id=GROUP["id"]))  # an anonymous admin
     asyncio.run(handlers.save_activity(None))

@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -105,7 +106,10 @@ def test_start_offers_to_add_the_bot_to_a_group(env):
     call = start(env, MEMBER).reply_text.await_args
     assert call.args[0].startswith("🎁 抽奖助手")
     assert labels(call.kwargs["reply_markup"]) == {
-        "➕ 添加到群组": "https://t.me/lottery_test_bot?startgroup=menu&admin=delete_messages+pin_messages",
+        "➕ 添加到群组": (
+            "https://t.me/lottery_test_bot?startgroup=menu"
+            "&admin=delete_messages+pin_messages+restrict_members"
+        ),
         "📋 我的群": "m:groups",
     }
 
@@ -975,3 +979,97 @@ def test_failed_deletions_are_retried_only_when_worth_it(env):
     env.bot.delete_messages.side_effect = Forbidden("not enough rights")
     run_cleanup(env)
     assert env.store.due_deletions() == {}  # no right to delete: give up
+
+
+def test_points_settings_for_group_admins(env):
+    _, buttons = shown(press(env, OWNER, f"m:g:{GROUP}"))
+    assert buttons["💎 灵石设置"] == f"m:pt:{GROUP}"
+    text, buttons = shown(press(env, OWNER, f"m:pt:{GROUP}"))
+    assert text == (
+        "💎 测试群 · 灵石设置\n"
+        "群友在群里发送「签到」「灵石」「灵石榜」使用，机器人的回复按抽奖设置里"
+        "「删除机器人通知」的时间删除。\n"
+        "📅 签到：每天 10 灵石\n"
+        "💬 发言奖励：每 20 条有效发言 5 灵石，每天最多 5 次；10% 的概率暴击，得 2 倍\n"
+        "✍️ 有效发言：至少 3 个字，距上一条有效发言 5 秒以上。群活跃抽奖也只统计有效发言。\n"
+        "机器人权限：封禁用户 ❌（签到刷屏时禁言）\n"
+        "没有这个权限时，刷屏只警告、不禁言。"
+    )
+    assert list(buttons) == [
+        "💎 灵石功能：开",
+        "📅 签到：10 灵石",
+        "💬 发言：每 20 条",
+        "🎁 发言奖励：5 灵石",
+        "🔁 每天最多：5 次",
+        "⚡ 暴击率：10%",
+        "✖️ 暴击倍数：2 倍",
+        "✍️ 最少字数：3 字",
+        "⏱ 发言间隔：5 秒",
+        "⬅️ 返回",
+    ]  # balances are for super admins
+    text, buttons = shown(press(env, OWNER, buttons["📅 签到：10 灵石"]))
+    assert text == (
+        "📅 签到：10 灵石\n每天签到得多少灵石？0 表示关闭签到。\n点按钮或直接发送数字（0～10000）："
+    )
+    assert list(buttons) == ["5 灵石", "10 灵石", "20 灵石", "50 灵石", "⬅️ 返回"]
+    assert type_text(env, OWNER, "abc")[0] == "签到需为 0～10000 的整数，请重新输入。"
+    text, buttons = type_text(env, OWNER, "15")
+    assert "📅 签到：每天 15 灵石" in text
+    assert "📅 签到：15 灵石" in buttons
+    _, buttons = shown(press(env, OWNER, f"m:pk:{GROUP}:reward_points"))
+    text, _ = shown(press(env, OWNER, buttons["关"]))
+    assert "💬 发言奖励：关闭" in text
+    text, buttons = shown(press(env, OWNER, f"m:pv:{GROUP}:points:0"))
+    assert "灵石功能已关闭" in text
+    assert list(buttons) == ["💎 灵石功能：关", "✍️ 最少字数：3 字", "⏱ 发言间隔：5 秒", "⬅️ 返回"]
+    assert not env.store.group_settings(GROUP)["points"]
+    assert press(env, MEMBER, f"m:pv:{GROUP}:points:1").answer.await_args.args[0] == NOT_MANAGER
+    assert not env.store.group_settings(GROUP)["points"]
+
+
+def test_points_settings_show_whether_the_bot_can_mute(env):
+    env.statuses[(GROUP, 4242)] = ChatMember.ADMINISTRATOR
+    lookup = env.bot.get_chat_member.side_effect
+
+    async def rights(chat_id, user_id):
+        member = await lookup(chat_id, user_id)
+        return SimpleNamespace(status=member.status, can_restrict_members=True)
+
+    env.bot.get_chat_member.side_effect = rights
+    text, _ = shown(press(env, OWNER, f"m:pt:{GROUP}"))
+    assert text.endswith("机器人权限：封禁用户 ✅（签到刷屏时禁言）")
+
+
+def test_super_admins_adjust_balances(env):
+    env.store.check_in(GROUP, 7, "Tom", "2027-01-15", 10)
+    _, buttons = shown(press(env, OWNER, f"m:pt:{GROUP}"))
+    assert "✏️ 修改余额" not in buttons
+    denied = press(env, OWNER, f"m:pb:{GROUP}:0").answer.await_args.args[0]
+    assert denied == "只有超级管理员可以修改余额和导出流水。"
+    _, buttons = shown(press(env, ADMIN, f"m:pt:{GROUP}"))
+    _, buttons = shown(press(env, ADMIN, buttons["✏️ 修改余额"]))
+    assert buttons["1. Tom · 10"] == f"m:pu:{GROUP}:7:0"
+    text, buttons = shown(press(env, ADMIN, buttons["1. Tom · 10"]))
+    assert text == "Tom（ID：7）\n💎 10 灵石"
+    assert list(buttons)[:6] == ["+10", "+50", "+100", "-10", "-50", "-100"]
+    text, _ = shown(press(env, ADMIN, buttons["+50"]))
+    assert text == "Tom（ID：7）\n💎 60 灵石"
+    refused = press(env, ADMIN, f"m:pa:{GROUP}:7:-100:0").answer.await_args.args[0]
+    assert refused == "余额不足：当前 60 灵石，最多扣 60。"
+    shown(press(env, ADMIN, f"m:pa:{GROUP}:7:x:0"))
+    assert type_text(env, ADMIN, "-20")[0] == "Tom（ID：7）\n💎 40 灵石"
+    shown(press(env, ADMIN, f"m:pid:{GROUP}:0"))
+    assert type_text(env, ADMIN, "8")[0].startswith("请发送用户 ID 和要加减的灵石")
+    assert type_text(env, ADMIN, "8 +30")[0] == "用户 8（ID：8）\n💎 30 灵石"
+    text, _ = shown(press(env, ADMIN, f"m:px:{GROUP}"))
+    assert text.startswith("💎 测试群 · 灵石设置")
+    call = env.bot.send_document.await_args
+    assert call.args == (ADMIN,)
+    assert call.kwargs["filename"] == f"points{GROUP}.json"
+    exported = json.loads(call.kwargs["document"].getvalue())
+    assert [(e["user_id"], e["delta"], e["reason"]) for e in exported["ledger"]] == [
+        (7, 10, "checkin"),
+        (7, 50, "adjust"),
+        (7, -20, "adjust"),
+        (8, 30, "adjust"),
+    ]

@@ -22,6 +22,7 @@ from telegram.ext import (
 
 from lottery.core import MAX_KEYWORD, LotteryError, Store, integer
 from lottery.menu import MANAGERS, Menu, one_at_a_time, presser, sender
+from lottery.points import Points
 from lottery.views import (
     EXPORT_CAPTION,
     card,
@@ -87,7 +88,8 @@ PUBLIC_HELP = """🎁 抽奖机器人
 群管理员私聊我发送 /start，用按钮发起和管理抽奖。
 /raffle 抽奖ID — 在发布群里查看抽奖
 /result 抽奖ID — 在发布群里查看开奖结果
-/id — 查看自己的用户 ID"""
+/id — 查看自己的用户 ID
+在群里发送「签到」领灵石，「灵石」查看自己的灵石，「灵石榜」看排行。"""
 ADMIN_HELP = """
 
 超级管理员命令（除发布和开奖外均在私聊使用）。
@@ -425,16 +427,6 @@ class BotHandlers:
                 LOG.info("报名成功的表情回应失败：%s", exc)
         await self.tidy(context.bot, message.chat.id, [message.message_id], "delete_keyword")
 
-    async def count_message(self, update, context):
-        """Count a member's text message in a group, for group activity raffles. Channels,
-        anonymous admins and bots do not count."""
-        message, user = update.effective_message, update.effective_user
-        if message is None or user is None or user.is_bot or message.sender_chat:
-            return
-        self.store.count_message(
-            message.chat.id, user.id, name_text(user.full_name), message.date.timestamp()
-        )
-
     async def save_activity(self, _context):
         """Save the message counts kept in memory; also run when the bot stops."""
         await asyncio.to_thread(self.store.flush_activity)
@@ -732,9 +724,11 @@ def build_application(settings):
     app.add_handler(
         MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, handlers.keyword)
     )
-    # A handler group of its own, so text is counted for activity raffles besides the above.
+    # A handler group of its own, so that group text is also counted for activity raffles
+    # and 灵石 besides the above. 「/签到」 is no command to Telegram, which allows only
+    # Latin letters, digits and underscores in those, so it arrives as text.
     texts = filters.ChatType.GROUPS & (filters.TEXT | filters.CAPTION) & ~filters.COMMAND
-    app.add_handler(MessageHandler(texts, handlers.count_message), group=1)
+    app.add_handler(MessageHandler(texts, Points(handlers).message), group=1)
     app.add_handler(ChatMemberHandler(handlers.member_changed, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(ChatMemberHandler(menu.bot_membership, ChatMemberHandler.MY_CHAT_MEMBER))
     for job in (handlers.auto_draw, handlers.cleanup):

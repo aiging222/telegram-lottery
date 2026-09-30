@@ -12,7 +12,14 @@ from datetime import datetime
 from telegram import ChatMember, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest, ChatMigrated, Forbidden, TelegramError
 
-from lottery.core import LOOK_BACK_DAYS, MAX_PRIZES, LotteryError, check_keyword, integer
+from lottery.core import (
+    LOOK_BACK_DAYS,
+    MAX_PRIZES,
+    SETTING_LIMITS,
+    LotteryError,
+    check_keyword,
+    integer,
+)
 from lottery.views import (
     EXPORT_CAPTION,
     activity_rule,
@@ -20,9 +27,11 @@ from lottery.views import (
     counting_text,
     draw_rule,
     export_file,
+    holder_name,
     join_text,
     name_text,
     place,
+    points_file,
     prize_text,
     status_text,
     when_text,
@@ -53,8 +62,32 @@ SETTINGS = {
     "delete_keyword": ("🧹 删除口令消息", (60, 0, 300, None)),
     "delete_notices": ("🗑 删除机器人通知", (600, 60, 3600, None)),
 }
+# 灵石 settings: button label, how a value reads, preset buttons and the question asked.
+POINT_SETTINGS = {
+    "checkin_points": (
+        "📅 签到",
+        "{} 灵石",
+        (5, 10, 20, 50),
+        "每天签到得多少灵石？0 表示关闭签到。",
+    ),
+    "reward_every": ("💬 发言", "每 {} 条", (10, 20, 50, 100), "每多少条有效发言奖励一次？"),
+    "reward_points": ("🎁 发言奖励", "{} 灵石", (0, 1, 5, 10), "每次奖励多少灵石？0 表示不奖励。"),
+    "reward_daily": ("🔁 每天最多", "{} 次", (1, 3, 5, 10), "每人每天最多领几次发言奖励？"),
+    "crit_percent": ("⚡ 暴击率", "{}%", (0, 5, 10, 20), "发言奖励暴击的概率是百分之几？"),
+    "crit_times": ("✖️ 暴击倍数", "{} 倍", (2, 3, 5), "暴击时奖励是平时的几倍？"),
+    "min_chars": ("✍️ 最少字数", "{} 字", (1, 2, 3, 5), "一条发言至少几个字才算有效发言？"),
+    "cooldown": (
+        "⏱ 发言间隔",
+        "{} 秒",
+        (0, 3, 5, 10),
+        "距上一条有效发言至少几秒，才算新的一条？0 表示不限。",
+    ),
+}
+OFF_AT_ZERO = {"checkin_points", "reward_points"}
+BALANCE_STEPS = (10, 50, 100, -10, -50, -100)
 NOT_MANAGER = "只有该群的管理员可以管理抽奖。"
 NOT_SUPER = "只有超级管理员可以设置中奖加成。"
+NOT_BANKER = "只有超级管理员可以修改余额和导出流水。"
 EXPIRED = "操作已过期，请重新开始。"
 STALE = "这个按钮已过期，请用最新一条消息里的按钮。"
 # The question each creation wizard button answers. Buttons left on earlier messages count
@@ -163,6 +196,12 @@ def setting_text(value):
     return f"{value // 3600}小时后" if value >= 3600 else f"{value // 60}分钟后"
 
 
+def point_value(key, value):
+    if value == 0 and key in OFF_AT_ZERO:
+        return "关"
+    return POINT_SETTINGS[key][1].format(value)
+
+
 def number(text, name, low, high):
     try:
         return integer(int(text), name, low, high)
@@ -175,8 +214,8 @@ class Menu:
         self.handlers = handlers
         self.store = handlers.store
         self._managers = {}  # (chat_id, user_id) -> (expires_at, allowed)
-        # user_id -> (kind, raffle_id, user_id or None, page): a weight page waiting for a
-        # typed answer. Any button press or /start drops it; a restart forgets it.
+        # user_id -> (kind, raffle_id or chat_id, user_id or setting or None, page): a page
+        # waiting for a typed answer. Any button press or /start drops it; a restart forgets it.
         self._asking = {}
 
     def user_lock(self, user_id):
@@ -249,7 +288,10 @@ class Menu:
     @staticmethod
     def add_button(bot):
         # startgroup opens Telegram's group picker; admin= pre-selects the rights we ask for.
-        url = f"https://t.me/{bot.username}?startgroup=menu&admin=delete_messages+pin_messages"
+        url = (
+            f"https://t.me/{bot.username}?startgroup=menu"
+            "&admin=delete_messages+pin_messages+restrict_members"
+        )
         return InlineKeyboardButton("➕ 添加到群组", url=url)
 
     async def welcome(self, bot, chat_id, text, trigger=None):
@@ -311,7 +353,7 @@ class Menu:
         if status == ChatMember.ADMINISTRATOR:
             text = "✅ 已就绪。群管理员点击下面按钮发起和管理抽奖。"
         else:
-            text = "请把我设为管理员（需要：删除消息、置顶消息），否则无法正常工作。"
+            text = "请把我设为管理员（需要：删除消息、置顶消息、封禁用户），否则无法正常工作。"
         await self.welcome(context.bot, chat.id, text)
 
     # Button presses
@@ -377,6 +419,14 @@ class Menu:
             if not self.is_super(user_id):
                 raise LotteryError("只有超级管理员可以修改发言次数。")
             return await self.count_action(user_id, action, args)
+        if action in ("pt", "pk", "pv"):
+            chat_id = int(args[0])
+            await self.require(bot, user_id, chat_id)
+            return await self.points_action(bot, user_id, action, chat_id, args[1:])
+        if action in ("pb", "pu", "pa", "pid", "px"):
+            if not self.is_super(user_id):
+                raise LotteryError(NOT_BANKER)
+            return await self.balance_action(bot, user_id, action, int(args[0]), args[1:])
         raise ValueError(action)
 
     # Group menu
@@ -403,7 +453,8 @@ class Menu:
                 button("➕ 发起抽奖", f"m:new:{chat_id}"),
                 button("📜 抽奖记录", f"m:list:{chat_id}:0"),
             ),
-            (button("⚙️ 抽奖设置", f"m:set:{chat_id}"), button("🔄 切换群", "m:groups")),
+            (button("⚙️ 抽奖设置", f"m:set:{chat_id}"), button("💎 灵石设置", f"m:pt:{chat_id}")),
+            (button("🔄 切换群", "m:groups"),),
         )
 
     # Creation wizard. The draft survives restarts. Every question shows what is filled in so
@@ -476,7 +527,9 @@ class Menu:
         message, user = update.effective_message, update.effective_user
         asking = self._asking.get(user.id)
         if asking:
-            await self.weight_typed(context.bot, message, user.id, asking)
+            points = asking[0] in ("setting", "balance", "balance_id")
+            typed = self.points_typed if points else self.weight_typed
+            await typed(context.bot, message, user.id, asking)
             return
         found = await asyncio.to_thread(self.store.draft, user.id)
         if not found:
@@ -865,6 +918,192 @@ class Menu:
             else choices[0]
         )
         await asyncio.to_thread(self.store.set_group_setting, chat_id, key, after)
+
+    # 灵石 settings, for group admins (route() checks): how 灵石 are earned, and what counts
+    # as a message for them and for activity raffles.
+
+    async def points_action(self, bot, user_id, action, chat_id, args):
+        if action == "pk":
+            return await self.point_prompt(user_id, chat_id, args[0])
+        if action == "pv":
+            key = args[0]
+            if key == "points":
+                value = bool(int(args[1]))
+            elif key in POINT_SETTINGS:
+                value = int(args[1])
+            else:
+                raise ValueError(key)
+            await asyncio.to_thread(self.store.set_group_setting, chat_id, key, value)
+        return await self.points_page(bot, user_id, chat_id)
+
+    async def points_page(self, bot, user_id, chat_id):
+        title = await asyncio.to_thread(self.store.group_title, chat_id)
+        v = await asyncio.to_thread(self.store.group_settings, chat_id)
+        lines = [f"💎 {title} · 灵石设置"]
+        if v["points"]:
+            checkin = f"每天 {v['checkin_points']} 灵石" if v["checkin_points"] else "关闭"
+            reward = "关闭"
+            if v["reward_points"]:
+                reward = (
+                    f"每 {v['reward_every']} 条有效发言 {v['reward_points']} 灵石，"
+                    f"每天最多 {v['reward_daily']} 次；{v['crit_percent']}% 的概率暴击，"
+                    f"得 {v['crit_times']} 倍"
+                )
+            lines += [
+                (
+                    "群友在群里发送「签到」「灵石」「灵石榜」使用，机器人的回复按抽奖设置里"
+                    "「删除机器人通知」的时间删除。"
+                ),
+                f"📅 签到：{checkin}",
+                f"💬 发言奖励：{reward}",
+            ]
+        else:
+            lines.append("灵石功能已关闭：群友发送「签到」等不会有回应，发言也不奖励灵石。")
+        gap = f"，距上一条有效发言 {v['cooldown']} 秒以上" if v["cooldown"] else ""
+        lines.append(f"✍️ 有效发言：至少 {v['min_chars']} 个字{gap}。群活跃抽奖也只统计有效发言。")
+        try:
+            me = await bot.get_chat_member(chat_id, bot.id)
+        except TelegramError as exc:
+            LOG.warning("无法查询机器人在群 %s 的权限：%s", chat_id, exc)
+        else:
+            mute = me.status == ChatMember.ADMINISTRATOR and getattr(
+                me, "can_restrict_members", False
+            )
+            lines.append(f"机器人权限：封禁用户 {'✅' if mute else '❌'}（签到刷屏时禁言）")
+            if not mute:
+                lines.append("没有这个权限时，刷屏只警告、不禁言。")
+        keys = list(POINT_SETTINGS) if v["points"] else ["min_chars", "cooldown"]
+        choices = [
+            button(f"{POINT_SETTINGS[key][0]}：{point_value(key, v[key])}", f"m:pk:{chat_id}:{key}")
+            for key in keys
+        ]
+        rows = [
+            (
+                button(
+                    f"💎 灵石功能：{'开' if v['points'] else '关'}",
+                    f"m:pv:{chat_id}:points:{int(not v['points'])}",
+                ),
+            ),
+            *in_rows(choices, 2),
+        ]
+        if self.is_super(user_id):
+            rows.append(
+                (
+                    button("✏️ 修改余额", f"m:pb:{chat_id}:0"),
+                    button("📄 导出流水", f"m:px:{chat_id}"),
+                )
+            )
+        rows.append((button("⬅️ 返回", f"m:g:{chat_id}"),))
+        return "\n".join(lines), keyboard(*rows)
+
+    async def point_prompt(self, user_id, chat_id, key):
+        label, _, presets, question = POINT_SETTINGS[key]
+        low, high = SETTING_LIMITS[key]
+        value = (await asyncio.to_thread(self.store.group_settings, chat_id))[key]
+        self._asking[user_id] = ("setting", chat_id, key, 0)
+        text = (
+            f"{label}：{point_value(key, value)}\n{question}\n"
+            f"点按钮或直接发送数字（{low}～{high}）："
+        )
+        choices = [button(point_value(key, n), f"m:pv:{chat_id}:{key}:{n}") for n in presets]
+        return text, keyboard(choices, (button("⬅️ 返回", f"m:pt:{chat_id}"),))
+
+    # 灵石 balances, for super admins only (route() checks).
+
+    async def balance_action(self, bot, user_id, action, chat_id, args):
+        if action == "px":
+            exported = await asyncio.to_thread(self.store.export_points, chat_id)
+            document, filename = points_file(exported)
+            await bot.send_document(
+                user_id, document=document, filename=filename, caption="本群的灵石余额和全部流水。"
+            )
+            return await self.points_page(bot, user_id, chat_id)
+        page = int(args[-1])
+        if action == "pb":
+            return await self.balances(chat_id, page)
+        if action == "pid":
+            self._asking[user_id] = ("balance_id", chat_id, None, page)
+            back = keyboard((button("⬅️ 返回", f"m:pb:{chat_id}:{page}"),))
+            return (
+                "发送用户 ID 和要加减的灵石，用空格分开，例如：123456789 +50 或 123456789 -20",
+                back,
+            )
+        uid = int(args[0])
+        if action == "pa" and args[1] == "x":
+            self._asking[user_id] = ("balance", chat_id, uid, page)
+            back = keyboard((button("⬅️ 返回", f"m:pu:{chat_id}:{uid}:{page}"),))
+            return "发送要加减的灵石，例如 +50 或 -20：", back
+        if action == "pa":
+            await asyncio.to_thread(self.store.adjust_points, chat_id, user_id, uid, int(args[1]))
+        return await self.balance_page(chat_id, uid, page)
+
+    async def balances(self, chat_id, page):
+        title = await asyncio.to_thread(self.store.group_title, chat_id)
+        rows, more = await asyncio.to_thread(self.store.holders, chat_id, page, PAGE_SIZE)
+        lines = [f"✏️ 修改余额 · {title}", "点成员加减灵石，或按用户 ID 修改。每次修改都记入流水。"]
+        if not rows:
+            lines.append("还没有人有灵石。")
+        people = [
+            (
+                button(
+                    f"{rank}. {holder_name(row)[:16]} · {row['balance']}",
+                    f"m:pu:{chat_id}:{row['user_id']}:{page}",
+                ),
+            )
+            for rank, row in enumerate(rows, page * PAGE_SIZE + 1)
+        ]
+        nav = []
+        if page:
+            nav.append(button("◂ 上一页", f"m:pb:{chat_id}:{page - 1}"))
+        if more:
+            nav.append(button("下一页 ▸", f"m:pb:{chat_id}:{page + 1}"))
+        return "\n".join(lines), keyboard(
+            *people,
+            nav,
+            (button("➕ 按用户 ID 修改", f"m:pid:{chat_id}:{page}"),),
+            (button("⬅️ 返回", f"m:pt:{chat_id}"),),
+        )
+
+    async def balance_page(self, chat_id, uid, page):
+        """One member's 灵石, with buttons to add or take away."""
+        row = await asyncio.to_thread(self.store.holder, chat_id, uid)
+        name = name_text(row["display_name"]) or f"用户 {uid}"
+        choices = [button(f"{n:+d}", f"m:pa:{chat_id}:{uid}:{n}:{page}") for n in BALANCE_STEPS]
+        return f"{name}（ID：{uid}）\n💎 {row['balance']} 灵石", keyboard(
+            *in_rows(choices, 3),
+            (button("✏️ 输入数量", f"m:pa:{chat_id}:{uid}:x:{page}"),),
+            (button("⬅️ 返回", f"m:pb:{chat_id}:{page}"),),
+        )
+
+    async def points_typed(self, bot, message, user_id, asking):
+        kind, chat_id, key, page = asking
+        parts = message.text.split()
+        try:
+            if kind == "setting":
+                name = POINT_SETTINGS[key][0].split(" ", 1)[1]
+                value = number(message.text.strip(), name, *SETTING_LIMITS[key])
+                await asyncio.to_thread(self.store.set_group_setting, chat_id, key, value)
+            else:
+                if kind == "balance":
+                    uid, amount = key, message.text.strip()
+                elif len(parts) != 2 or not parts[0].isdigit():
+                    raise LotteryError(
+                        "请发送用户 ID 和要加减的灵石，用空格分开，例如：123456789 +50"
+                    )
+                else:
+                    uid, amount = integer(int(parts[0]), "用户 ID", 1, 2**63 - 1), parts[1]
+                delta = number(amount, "加减的数量", -1_000_000_000, 1_000_000_000)
+                await asyncio.to_thread(self.store.adjust_points, chat_id, user_id, uid, delta)
+        except LotteryError as exc:
+            back = f"m:pt:{chat_id}" if kind == "setting" else f"m:pb:{chat_id}:{page}"
+            await message.reply_text(str(exc), reply_markup=keyboard((button("⬅️ 返回", back),)))
+            return
+        self._asking.pop(user_id, None)
+        if kind == "setting":
+            text, markup = await self.points_page(bot, user_id, chat_id)
+        else:
+            text, markup = await self.balance_page(chat_id, uid, page)
+        await message.reply_text(text, reply_markup=markup)
 
     # Records
 

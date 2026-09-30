@@ -805,3 +805,141 @@ def test_scheduled_deletions(setup):
     assert store.due_deletions() == {}
     with store.transaction() as db:
         assert db.execute("SELECT COUNT(*) FROM deletions").fetchone()[0] == 0
+
+
+def test_check_in_once_a_day(setup):
+    store, _, _ = setup
+    assert store.check_in(-100, 1, "Eve", "2027-01-15", 10) == {
+        "amount": 10,
+        "balance": 10,
+        "place": 1,
+    }
+    assert store.check_in(-100, 1, "Eve", "2027-01-15", 10) is None
+    assert store.check_in(-100, 2, "Frank", "2027-01-15", 10)["place"] == 2
+    assert store.check_in(-200, 1, "Eve", "2027-01-15", 10)["place"] == 1  # each group apart
+    assert store.check_in(-100, 1, "Eve", "2027-01-16", 20) == {
+        "amount": 20,
+        "balance": 30,
+        "place": 1,
+    }
+    assert store.wallet(-100, 1, "2027-01-16") == {"balance": 30, "checked_in": True, "rewards": 0}
+    assert store.wallet(-100, 1, "2027-01-17")["checked_in"] is False
+    assert store.wallet(-100, 9, "2027-01-17") == {"balance": 0, "checked_in": False, "rewards": 0}
+
+
+def test_message_rewards_have_a_daily_limit_and_crits(setup):
+    store, _, _ = setup
+    rolls = iter([10, 9, 50])  # a roll below crit_percent is a crit
+
+    def reward(day):
+        return store.reward_message(
+            -100,
+            1,
+            "Eve",
+            day,
+            amount=5,
+            limit=2,
+            crit_percent=10,
+            crit_times=3,
+            randbelow=lambda total: next(rolls),
+        )
+
+    assert reward("2027-01-15") == {"amount": 5, "crit": False, "balance": 5, "rewards": 1}
+    assert reward("2027-01-15") == {"amount": 15, "crit": True, "balance": 20, "rewards": 2}
+    assert reward("2027-01-15") is None  # the day's limit
+    assert reward("2027-01-16")["rewards"] == 1
+    assert store.wallet(-100, 1, "2027-01-16")["rewards"] == 1
+    ledger = store.export_points(-100)["ledger"]
+    assert [(e["delta"], e["balance"], e["reason"]) for e in ledger] == [
+        (5, 5, "message"),
+        (15, 20, "crit"),
+        (5, 25, "message"),
+    ]
+
+
+def test_super_admins_adjust_balances(setup):
+    store, _, _ = setup
+    store.check_in(-100, 1, "Eve", "2027-01-15", 10)
+    assert store.adjust_points(-100, 99, 1, 50) == 60
+    assert store.adjust_points(-100, 99, 1, -60) == 0
+    with pytest.raises(LotteryError, match="余额不足：当前 0 灵石"):
+        store.adjust_points(-100, 99, 1, -1)
+    with pytest.raises(LotteryError, match="不能为 0"):
+        store.adjust_points(-100, 99, 1, 0)
+    assert store.adjust_points(-100, 99, 7, 30) == 30  # never seen before
+    assert store.holder(-100, 7) == {"display_name": "", "balance": 30}
+    last = store.export_points(-100)["ledger"][-1]
+    assert (last["user_id"], last["delta"], last["reason"], last["actor_id"]) == (
+        7,
+        30,
+        "adjust",
+        99,
+    )
+
+
+def test_leaving_the_group_loses_the_points(setup):
+    store, _, now = setup
+    store.check_in(-100, 1, "Eve", "2027-01-15", 10)
+    store.check_in(-200, 1, "Eve", "2027-01-15", 10)
+    store.leave_group(-100, 1, now[0])
+    assert store.holder(-100, 1)["balance"] == 0
+    assert store.holder(-200, 1)["balance"] == 10  # other groups keep theirs
+    assert store.export_points(-100)["ledger"][-1]["reason"] == "leave"
+    # Back in the group, they start again, but a check-in stays one a day.
+    assert store.check_in(-100, 1, "Eve", "2027-01-15", 10) is None
+    assert store.check_in(-100, 1, "Eve", "2027-01-16", 10)["balance"] == 10
+
+
+def test_points_board(setup):
+    store, _, _ = setup
+    for uid, amount in ((1, 30), (2, 50), (3, 30), (4, 5)):
+        store.adjust_points(-100, 99, uid, amount)
+    store.adjust_points(-100, 99, 4, -5)  # nothing left: off the board
+    top, more = store.holders(-100, 0, 2)
+    assert [(r["user_id"], r["balance"]) for r in top] == [(2, 50), (1, 30)]
+    assert more
+    assert [r["user_id"] for r in store.holders(-100, 1, 2)[0]] == [3]
+    assert store.standing(-100, 3) == {"place": 3, "balance": 30}
+    assert store.standing(-100, 4) is None
+    assert store.standing(-100, 9) is None
+
+
+def test_points_follow_a_supergroup_upgrade(setup):
+    store, _, _ = setup
+    store.check_in(-100, 1, "Eve", "2027-01-15", 10)
+    store.migrate_chat(-100, -1001)
+    assert store.check_in(-1001, 1, "Eve", "2027-01-15", 10) is None
+    assert store.holder(-1001, 1)["balance"] == 10
+    assert len(store.export_points(-1001)["ledger"]) == 1
+
+
+def test_messages_too_quick_do_not_count(setup):
+    store, _, now = setup
+    start = now[0]
+    assert store.count_message(-100, 1, "Eve", start, cooldown=5)
+    assert not store.count_message(-100, 1, "Eve", start + 4, cooldown=5)
+    assert store.count_message(-100, 2, "Frank", start + 4, cooldown=5)  # everyone apart
+    assert store.count_message(-100, 1, "Eve", start + 5, cooldown=5)
+    store.flush_activity()
+    assert store.count_message(-100, 1, "Eve", start + 70, cooldown=5)
+    assert store.messages_since(-100, 1, start) == 3  # saved and not saved yet
+    assert store.messages_since(-100, 1, start + 60) == 1
+    assert store.count_message(-100, 1, "Eve", start + 70)  # no cooldown
+
+
+def test_point_settings(setup):
+    store, _, _ = setup
+    store.remember_group(-100, "甲群")
+    assert store.group_settings(-100)["checkin_points"] == 10
+    store.set_group_setting(-100, "checkin_points", 20)
+    assert store.group_settings(-100)["checkin_points"] == 20
+    for key, value in (("crit_percent", 101), ("reward_every", 0), ("min_chars", "3")):
+        with pytest.raises(LotteryError):
+            store.set_group_setting(-100, key, value)
+    # Settings are read for every message, so they are kept in memory, but not stale.
+    changed = store.group_settings(-100)
+    changed["min_chars"] = 99
+    assert store.group_settings(-100)["min_chars"] == 3
+    store.migrate_chat(-100, -1001)
+    assert store.group_settings(-1001)["checkin_points"] == 20
+    assert store.group_settings(-100)["checkin_points"] == 10

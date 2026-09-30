@@ -238,9 +238,64 @@ MIGRATIONS = [
         PRIMARY KEY (raffle_id, user_id)
     )
     """,
+    # 13: 灵石, points members earn in each group by checking in once a day and by speaking.
+    # points holds each member's balance there, the day they last checked in and the message
+    # rewards taken on reward_day; ledger records every change and the balance after it.
+    """
+    CREATE TABLE IF NOT EXISTS points (
+        chat_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        display_name TEXT NOT NULL,
+        balance INTEGER NOT NULL DEFAULT 0,
+        checkin_day TEXT,
+        reward_day TEXT,
+        rewards INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (chat_id, user_id)
+    );
+    CREATE INDEX IF NOT EXISTS points_by_balance ON points(chat_id, balance);
+    CREATE TABLE IF NOT EXISTS ledger (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        delta INTEGER NOT NULL,
+        balance INTEGER NOT NULL,
+        reason TEXT NOT NULL,
+        actor_id INTEGER NOT NULL,
+        at REAL NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS ledger_by_chat ON ledger(chat_id)
+    """,
 ]
 # Deletion delays are seconds after posting: 0 deletes at once, None keeps the message.
-GROUP_DEFAULTS = {"pin_card": True, "pin_result": True, "delete_keyword": 60, "delete_notices": 600}
+GROUP_DEFAULTS = {
+    "pin_card": True,
+    "pin_result": True,
+    "delete_keyword": 60,
+    "delete_notices": 600,
+    # 灵石: a check-in a day, and a reward for every reward_every messages, at most
+    # reward_daily a day, multiplied by crit_times with a chance of crit_percent in 100.
+    "points": True,
+    "checkin_points": 10,
+    "reward_every": 20,
+    "reward_points": 5,
+    "reward_daily": 5,
+    "crit_percent": 10,
+    "crit_times": 2,
+    # A message counts, for activity raffles and 灵石 alike, if it has at least min_chars
+    # characters besides spaces and comes at least cooldown seconds after the last that did.
+    "min_chars": 3,
+    "cooldown": 5,
+}
+SETTING_LIMITS = {
+    "checkin_points": (0, 10_000),
+    "reward_every": (1, 10_000),
+    "reward_points": (0, 10_000),
+    "reward_daily": (1, 1_000),
+    "crit_percent": (0, 100),
+    "crit_times": (2, 10),
+    "min_chars": (1, 100),
+    "cooldown": (0, 3_600),
+}
 # Telegram lets bots delete group messages for 48 hours; older ones are given up on.
 DELETE_WINDOW = 47 * 3600
 MAX_PRIZES = 10
@@ -259,8 +314,13 @@ class Store:
         # time), and (chat_id, user_id) -> the name last written under. See count_message().
         self._pending = {}
         self._names = {}
+        # (chat_id, user_id) -> when their last counted message was sent, for the cooldown.
+        self._last_counted = {}
         self._pending_lock = threading.Lock()
         self._purged_at = 0.0
+        # chat_id -> its settings, read for every group message; set_group_setting() and
+        # migrate_chat() are the only writers.
+        self._settings = {}
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self.transaction() as db:
             self._migrate(db)
@@ -388,17 +448,23 @@ class Store:
                 "UPDATE OR REPLACE speakers SET chat_id=? WHERE chat_id=?",
                 (new_chat_id, old_chat_id),
             )
+            db.execute(
+                "UPDATE OR REPLACE points SET chat_id=? WHERE chat_id=?", (new_chat_id, old_chat_id)
+            )
+            db.execute("UPDATE ledger SET chat_id=? WHERE chat_id=?", (new_chat_id, old_chat_id))
             for row in rows:
                 self.audit(
                     db, row["id"], 0, "migrate_chat", {"before": old_chat_id, "after": new_chat_id}
                 )
-            return [row["id"] for row in rows if row["card_message_id"] is not None]
+        self._settings.pop(old_chat_id, None)
+        self._settings.pop(new_chat_id, None)
+        return [row["id"] for row in rows if row["card_message_id"] is not None]
 
     def leave_group(self, chat_id, user_id, left_at):
         """Cancel user_id's joins in raffles bound to chat_id that were still open at left_at.
 
         Frozen raffles are untouched: their snapshot is the fixed list of the draw. Activity
-        raffles leave out whoever left after their last message.
+        raffles leave out whoever left after their last message. Their 灵石 there are gone.
         """
         self.flush_activity()  # so that the leave comes after every message saved
         with self.transaction() as db:
@@ -406,6 +472,11 @@ class Store:
                 "UPDATE speakers SET left_at=? WHERE chat_id=? AND user_id=?",
                 (left_at, chat_id, user_id),
             )
+            row = db.execute(
+                "SELECT balance FROM points WHERE chat_id=? AND user_id=?", (chat_id, user_id)
+            ).fetchone()
+            if row and row["balance"]:
+                self._credit(db, chat_id, user_id, -row["balance"], "leave", 0)
             ids = [
                 row["id"]
                 for row in db.execute(
@@ -731,14 +802,37 @@ class Store:
 
     # Group activity: every member's text messages, counted per minute.
 
-    def count_message(self, chat_id, user_id, display_name, at):
-        """Count a member's text message sent at `at`. Counts wait in memory, cheap for every
-        message in every group, until flush_activity() saves them."""
+    def count_message(self, chat_id, user_id, display_name, at, cooldown=0):
+        """Count a member's text message sent at `at`, unless it comes within `cooldown`
+        seconds of the last one counted; returns whether it counted. Counts wait in memory,
+        cheap for every message in every group, until flush_activity() saves them."""
         key = (chat_id, user_id, int(at // 60))
         with self._pending_lock:
+            last_counted = self._last_counted.get((chat_id, user_id))
+            if last_counted is not None and abs(at - last_counted) < cooldown:
+                return False
+            self._last_counted[chat_id, user_id] = max(at, last_counted or 0.0)
             count, last = self._pending.get(key, (0, 0.0))
             self._pending[key] = (count + 1, max(last, at))
             self._names[chat_id, user_id] = display_name[:128]
+        return True
+
+    def messages_since(self, chat_id, user_id, since):
+        """How many of user_id's messages in chat_id were counted from `since` on."""
+        minute = int(since // 60)
+        with self.reading() as db:
+            saved = db.execute(
+                "SELECT COALESCE(SUM(count),0) FROM activity "
+                "WHERE chat_id=? AND user_id=? AND minute>=?",
+                (chat_id, user_id, minute),
+            ).fetchone()[0]
+        # A flush between the query and here may leave out a few messages it was saving.
+        with self._pending_lock:
+            return saved + sum(
+                count
+                for (chat, uid, at), (count, _) in self._pending.items()
+                if chat == chat_id and uid == user_id and at >= minute
+            )
 
     def flush_activity(self):
         """Save the counts waiting in memory. Once an hour, also forget counts older than a
@@ -748,6 +842,10 @@ class Store:
             names, self._names = self._names, {}
         now = self.clock()
         purge = now - self._purged_at >= 3600
+        if purge:
+            cooled = now - SETTING_LIMITS["cooldown"][1]
+            with self._pending_lock:
+                self._last_counted = {k: t for k, t in self._last_counted.items() if t > cooled}
         if not pending and not names and not purge:
             return
         try:
@@ -1210,14 +1308,22 @@ class Store:
             ]
 
     def group_settings(self, chat_id):
-        with self.transaction() as db:
-            row = db.execute("SELECT settings FROM groups WHERE chat_id=?", (chat_id,)).fetchone()
-        stored = json.loads(row["settings"]) if row and row["settings"] else {}
-        return {key: stored.get(key, value) for key, value in GROUP_DEFAULTS.items()}
+        settings = self._settings.get(chat_id)
+        if settings is None:
+            with self.reading() as db:
+                row = db.execute(
+                    "SELECT settings FROM groups WHERE chat_id=?", (chat_id,)
+                ).fetchone()
+            stored = json.loads(row["settings"]) if row and row["settings"] else {}
+            settings = {key: stored.get(key, value) for key, value in GROUP_DEFAULTS.items()}
+            self._settings[chat_id] = settings
+        return dict(settings)
 
     def set_group_setting(self, chat_id, key, value):
         if key not in GROUP_DEFAULTS:
             raise LotteryError("没有这个设置。")
+        if key in SETTING_LIMITS:
+            integer(value, "设置值", *SETTING_LIMITS[key])
         with self.transaction() as db:
             row = db.execute("SELECT settings FROM groups WHERE chat_id=?", (chat_id,)).fetchone()
             if row is None:
@@ -1225,6 +1331,176 @@ class Store:
             stored = json.loads(row["settings"]) if row["settings"] else {}
             stored[key] = value
             db.execute("UPDATE groups SET settings=? WHERE chat_id=?", (encode(stored), chat_id))
+        self._settings.pop(chat_id, None)
+
+    # 灵石: points members earn in each group, kept apart per group. Every change goes into
+    # the ledger with the balance after it. `day` is the local date, as "2027-01-15".
+
+    def _holder(self, db, chat_id, user_id, display_name=None):
+        """user_id's 灵石 row in chat_id, made at 0 if new; the name is updated when given."""
+        db.execute(
+            "INSERT OR IGNORE INTO points(chat_id,user_id,display_name) VALUES(?,?,?)",
+            (chat_id, user_id, display_name or ""),
+        )
+        if display_name:
+            db.execute(
+                "UPDATE points SET display_name=? WHERE chat_id=? AND user_id=?",
+                (display_name[:128], chat_id, user_id),
+            )
+        return db.execute(
+            "SELECT * FROM points WHERE chat_id=? AND user_id=?", (chat_id, user_id)
+        ).fetchone()
+
+    def _credit(self, db, chat_id, user_id, delta, reason, actor):
+        """Add delta to a balance and write it in the ledger; returns the new balance."""
+        db.execute(
+            "UPDATE points SET balance=balance+? WHERE chat_id=? AND user_id=?",
+            (delta, chat_id, user_id),
+        )
+        balance = db.execute(
+            "SELECT balance FROM points WHERE chat_id=? AND user_id=?", (chat_id, user_id)
+        ).fetchone()[0]
+        db.execute(
+            "INSERT INTO ledger(chat_id,user_id,delta,balance,reason,actor_id,at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (chat_id, user_id, delta, balance, reason, actor, self.clock()),
+        )
+        return balance
+
+    def check_in(self, chat_id, user_id, display_name, day, amount):
+        """Give `amount` for checking in on `day`: {"amount", "balance", "place"}, the place
+        being how many checked in that day so far; None if user_id already did."""
+        with self.transaction() as db:
+            if self._holder(db, chat_id, user_id, display_name)["checkin_day"] == day:
+                return None
+            db.execute(
+                "UPDATE points SET checkin_day=? WHERE chat_id=? AND user_id=?",
+                (day, chat_id, user_id),
+            )
+            balance = self._credit(db, chat_id, user_id, amount, "checkin", 0)
+            place = db.execute(
+                "SELECT COUNT(*) FROM points WHERE chat_id=? AND checkin_day=?", (chat_id, day)
+            ).fetchone()[0]
+            return {"amount": amount, "balance": balance, "place": place}
+
+    def reward_message(
+        self,
+        chat_id,
+        user_id,
+        display_name,
+        day,
+        *,
+        amount,
+        limit,
+        crit_percent=0,
+        crit_times=2,
+        randbelow=secrets.randbelow,
+    ):
+        """Reward speaking with `amount`, or crit_times as much with a chance of crit_percent
+        in 100, at most `limit` times on `day`: {"amount", "crit", "balance", "rewards"},
+        rewards counting those of the day; None once the limit is reached."""
+        with self.transaction() as db:
+            row = self._holder(db, chat_id, user_id, display_name)
+            rewards = row["rewards"] if row["reward_day"] == day else 0
+            if rewards >= limit:
+                return None
+            crit = randbelow(100) < crit_percent
+            amount *= crit_times if crit else 1
+            db.execute(
+                "UPDATE points SET reward_day=?,rewards=? WHERE chat_id=? AND user_id=?",
+                (day, rewards + 1, chat_id, user_id),
+            )
+            balance = self._credit(db, chat_id, user_id, amount, "crit" if crit else "message", 0)
+            return {"amount": amount, "crit": crit, "balance": balance, "rewards": rewards + 1}
+
+    def wallet(self, chat_id, user_id, day):
+        """user_id's 灵石 in chat_id, whether they checked in on `day` and the message
+        rewards they took that day."""
+        with self.reading() as db:
+            row = db.execute(
+                "SELECT * FROM points WHERE chat_id=? AND user_id=?", (chat_id, user_id)
+            ).fetchone()
+        if row is None:
+            return {"balance": 0, "checked_in": False, "rewards": 0}
+        return {
+            "balance": row["balance"],
+            "checked_in": row["checkin_day"] == day,
+            "rewards": row["rewards"] if row["reward_day"] == day else 0,
+        }
+
+    def holder(self, chat_id, user_id):
+        """user_id's name and balance in chat_id; the name is empty if never seen."""
+        with self.reading() as db:
+            row = db.execute(
+                "SELECT display_name,balance FROM points WHERE chat_id=? AND user_id=?",
+                (chat_id, user_id),
+            ).fetchone()
+        return dict(row) if row else {"display_name": "", "balance": 0}
+
+    def holders(self, chat_id, page, size):
+        """One page of chat_id's members with 灵石, the richest first, and whether another
+        page follows."""
+        with self.reading() as db:
+            rows = [
+                dict(r)
+                for r in db.execute(
+                    "SELECT user_id,display_name,balance FROM points WHERE chat_id=? "
+                    "AND balance>0 ORDER BY balance DESC,user_id LIMIT ? OFFSET ?",
+                    (chat_id, size + 1, page * size),
+                )
+            ]
+        return rows[:size], len(rows) > size
+
+    def standing(self, chat_id, user_id):
+        """user_id's place among chat_id's members with 灵石 and their balance, or None."""
+        with self.reading() as db:
+            row = db.execute(
+                "SELECT balance FROM points WHERE chat_id=? AND user_id=?", (chat_id, user_id)
+            ).fetchone()
+            if row is None or row["balance"] <= 0:
+                return None
+            balance = row["balance"]
+            ahead = db.execute(
+                "SELECT COUNT(*) FROM points WHERE chat_id=? "
+                "AND (balance>? OR (balance=? AND user_id<?))",
+                (chat_id, balance, balance, user_id),
+            ).fetchone()[0]
+        return {"place": ahead + 1, "balance": balance}
+
+    def adjust_points(self, chat_id, actor, user_id, delta):
+        """A super admin adds delta 灵石 to user_id's balance (takes it away if negative);
+        returns the new balance."""
+        integer(user_id, "用户 ID", 1, 2**63 - 1)
+        integer(delta, "加减的数量", -1_000_000_000, 1_000_000_000)
+        if not delta:
+            raise LotteryError("加减的数量不能为 0。")
+        with self.transaction() as db:
+            balance = self._holder(db, chat_id, user_id)["balance"]
+            if balance + delta < 0:
+                raise LotteryError(f"余额不足：当前 {balance} 灵石，最多扣 {balance}。")
+            return self._credit(db, chat_id, user_id, delta, "adjust", actor)
+
+    def export_points(self, chat_id):
+        """chat_id's balances and its whole ledger."""
+        title = self.group_title(chat_id)
+        with self.reading() as db:
+            balances = [
+                dict(r)
+                for r in db.execute(
+                    "SELECT user_id,display_name,balance FROM points WHERE chat_id=? "
+                    "ORDER BY balance DESC,user_id",
+                    (chat_id,),
+                )
+            ]
+            ledger = [
+                dict(r)
+                for r in db.execute(
+                    "SELECT id,user_id,delta,balance,reason,actor_id,at FROM ledger "
+                    "WHERE chat_id=? ORDER BY id",
+                    (chat_id,),
+                )
+            ]
+        return {"chat_id": chat_id, "title": title, "balances": balances, "ledger": ledger}
 
     def swap_pinned_result(self, chat_id, message_id):
         """Remember the result just pinned in chat_id; returns the one pinned before."""

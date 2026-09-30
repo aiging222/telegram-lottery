@@ -164,6 +164,65 @@ def result_text(result, mention=False):
     return "\n".join(lines)
 
 
+MEDALS = ("🥇", "🥈", "🥉")
+
+
+def holder_name(row):
+    return name_text(row["display_name"]) or f"用户 {row['user_id']}"
+
+
+def checkin_text(got):
+    return (
+        f"✅ 签到成功，获得 {got['amount']} 灵石\n"
+        f"💎 当前 {got['balance']} 灵石 · 今天第 {got['place']} 个签到"
+    )
+
+
+def reward_text(name, got, limit):
+    """The group notice for a message reward."""
+    head = "⚡ 暴击！" if got["crit"] else "💬 "
+    return f"{head}{name} 活跃发言，获得 {got['amount']} 灵石（今日 {got['rewards']}/{limit}）"
+
+
+def wallet_text(name, wallet, settings, spoken):
+    """A member's answer to 「灵石」; spoken is how many of their messages counted today."""
+    lines = [f"💎 {name} 的灵石：{wallet['balance']}"]
+    if settings["checkin_points"]:
+        lines.append(
+            "📅 今日已签到"
+            if wallet["checked_in"]
+            else f"📅 今日未签到，发送「签到」领取 {settings['checkin_points']} 灵石"
+        )
+    if settings["reward_points"]:
+        limit, every = settings["reward_daily"], settings["reward_every"]
+        line = f"💬 今日发言奖励 {wallet['rewards']}/{limit} 次"
+        if wallet["rewards"] < limit:
+            line += f"，再发 {every - spoken % every} 条发言可领下一次"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def board_text(top, mine):
+    """The answer to 「灵石榜」: the richest members and where the asker stands."""
+    if not top:
+        return "💎 灵石榜\n还没有人获得灵石，发送「签到」领取第一笔吧。"
+    lines = ["💎 灵石榜"]
+    for index, row in enumerate(top):
+        rank = MEDALS[index] if index < len(MEDALS) else f"{index + 1}."
+        lines.append(f"{rank} {holder_name(row)[:16]} · {row['balance']}")
+    if mine:
+        lines.append(f"你：第 {mine['place']} 名 · {mine['balance']} 灵石")
+    else:
+        lines.append("你还没有灵石")
+    return "\n".join(lines)
+
+
+def points_file(exported):
+    """The 灵石 export attachment as (file, file name)."""
+    raw = json.dumps(exported, ensure_ascii=False, indent=2).encode()
+    return BytesIO(raw), f"points{exported['chat_id']}.json"
+
+
 def chunks(text, limit=1500):
     """Split a long message at line breaks, so an HTML link is never cut in half.
 
