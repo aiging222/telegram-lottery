@@ -143,6 +143,23 @@ def test_deadline_freezes_on_read(setup):
     assert len(store.draw(rid, 99)["winners"]) == 1
 
 
+def test_a_look_at_a_raffle_waits_for_no_writer(setup):
+    store, rid, now = setup
+    store.join(rid, 1, "one")
+    writer = sqlite3.connect(store.path, isolation_level=None)
+    writer.execute("BEGIN IMMEDIATE")  # a transaction holds the write lock
+    with ThreadPoolExecutor(1) as pool:
+        look = pool.submit(store.view, rid)
+        try:
+            assert len(look.result(timeout=5)["entries"]) == 1
+        finally:
+            writer.rollback()
+            writer.close()
+    now[0] += 3600
+    assert store.view(rid)["status"] == "FROZEN"  # the first look past the deadline
+    assert [e["action"] for e in store.export(rid)["audit"]].count("freeze") == 1
+
+
 def test_parallel_draws_commit_exactly_one_result(setup):
     store, rid, _ = setup
     for uid in range(1, 21):

@@ -440,6 +440,14 @@ class Store:
         finally:
             db.close()
 
+    @contextmanager
+    def snapshot(self):
+        """Like reading(), for queries that must agree with each other: they share one read
+        transaction, which in WAL mode no writer waits for. Closing ends it."""
+        with self.reading() as db:
+            db.execute("BEGIN")
+            yield db
+
     def audit(self, db, raffle_id, actor, action, details):
         db.execute(
             "INSERT INTO audit(raffle_id,actor_id,action,details,at) VALUES(?,?,?,?,?)",
@@ -1414,12 +1422,19 @@ class Store:
             return self._freeze(db, raffle, actor)
 
     def view(self, raffle_id):
+        """A raffle with its entries, rules and result. The first look past the deadline
+        freezes the list, under the write lock; any other look reads a snapshot and holds
+        up no one, even while it works out a big group's message counts."""
+        with self.snapshot() as db:
+            raffle = self._get(db, raffle_id)
+            if raffle["status"] != "OPEN" or self.clock() < raffle["deadline"]:
+                return self._view(db, raffle, freeze=False)
         with self.transaction() as db:
-            return self._view(db, raffle_id)
+            return self._view(db, self._get(db, raffle_id))
 
-    def _view(self, db, raffle_id):
-        raffle = self._get(db, raffle_id)
-        if self.clock() >= raffle["deadline"]:
+    def _view(self, db, raffle, freeze=True):
+        raffle_id = raffle["id"]
+        if freeze and self.clock() >= raffle["deadline"]:
             raffle = self._freeze(db, raffle, 0)
         if raffle["snapshot"]:
             snapshot = json.loads(raffle["snapshot"])
@@ -1949,7 +1964,7 @@ class Store:
 
     def export(self, raffle_id):
         with self.transaction() as db:
-            raffle = self._view(db, raffle_id)
+            raffle = self._view(db, self._get(db, raffle_id))
             audit = [
                 dict(r)
                 for r in db.execute(
