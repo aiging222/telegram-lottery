@@ -482,6 +482,25 @@ def test_command_error_replies_and_is_tidied_away_in_groups(due):
     assert store.due_deletions() == {GROUP["id"]: [5, 88]}  # the command and the reply
 
 
+@pytest.mark.parametrize(
+    "chat, text, answered",
+    [
+        (GROUP, "今天吃什么好呢", False),  # chat the bot only counts
+        (GROUP, None, False),  # a photo, say
+        (GROUP, "签到", True),
+        (GROUP, "/签到", True),
+        (GROUP, "加灵石 50", True),
+        ({"id": 123, "type": "private"}, "123456789 +50", True),
+    ],
+)
+def test_errors_answer_only_messages_that_ask_the_bot(due, chat, text, answered):
+    handlers = due[3]
+    message = {"message_id": 5, "date": 0, "chat": chat, "from": USER}
+    update, bot = telegram_update({"message": message | ({"text": text} if text else {})})
+    asyncio.run(handlers.on_error(update, SimpleNamespace(bot=bot, error=RuntimeError("locked"))))
+    assert bot.send_message.await_count == int(answered)
+
+
 def test_token_filter_masks_message_and_traceback():
     record = logging.LogRecord(
         "t", logging.ERROR, __file__, 1, "GET %s", (f"https://x/bot{TOKEN}/getMe",), None

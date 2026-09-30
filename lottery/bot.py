@@ -22,7 +22,7 @@ from telegram.ext import (
 
 from lottery.core import MAX_KEYWORD, LotteryError, NotEnoughPoints, Store, integer
 from lottery.menu import MANAGERS, Menu, one_at_a_time, presser, sender
-from lottery.points import Points
+from lottery.points import ADJUST, WORDS, Points
 from lottery.views import (
     EXPORT_CAPTION,
     card,
@@ -156,6 +156,17 @@ class Settings:
                 f"TIMEZONE 无效：{zone}。请填写 IANA 时区名，例如 Asia/Shanghai。"
             ) from None
         return cls(token, admins, os.environ.get("DATABASE_PATH", "data/lottery.sqlite3"), timezone)
+
+
+def asks_bot(message):
+    """Whether a message asks the bot for something, so that a failure to handle it is
+    worth an answer: anything in private; in a group a command, a 灵石 word or a super
+    admin's 「加灵石」. Other group messages are read only to be counted, and an error
+    there must not answer someone's chat."""
+    if message.chat.type == "private":
+        return True
+    text = (message.text or "").strip()
+    return text.startswith("/") or text in WORDS or ADJUST.fullmatch(text) is not None
 
 
 def in_group(member):
@@ -849,7 +860,7 @@ class BotHandlers:
             if update.callback_query:
                 # effective_message is the shared group card; tell only the person who clicked.
                 await update.callback_query.answer("操作未能完成，请重试。", show_alert=True)
-            elif update.effective_message:
+            elif update.effective_message and asks_bot(update.effective_message):
                 # In a group it is tidied away with the message it answers.
                 await self.notice(
                     context.bot,
