@@ -673,6 +673,33 @@ def test_a_long_error_still_pops_up(env):
     assert text.startswith("发布失败：") and text.endswith("…") and len(text) <= 200
 
 
+@pytest.mark.parametrize(
+    "data",
+    [
+        "m:nonsense",
+        "m:g:abc",
+        f"m:list:{GROUP}",  # no page
+        "m:ask:explode:1",
+        f"m:sk:{GROUP}:pin_card",  # a switch, not a delay
+        f"m:sd:{GROUP}:delete_notices:soon",
+        f"m:log:{GROUP}:zz",
+        f"m:pk:{GROUP}:nokey",
+        f"m:pv:{GROUP}:nokey:1",
+    ],
+)
+def test_buttons_the_menu_does_not_make_have_expired(env, data):
+    assert press(env, OWNER, data).answer.await_args.args[0] == "按钮已失效。"
+
+
+def test_a_fault_of_the_bots_is_not_passed_off_as_an_old_button(env, monkeypatch):
+    async def broken(chat_id):
+        raise KeyError("oops")
+
+    monkeypatch.setattr(env.menu, "group_menu", broken)
+    with pytest.raises(KeyError):  # for on_error, which logs it and answers the press
+        press(env, OWNER, f"m:g:{GROUP}")
+
+
 def test_cancel_from_records(env):
     rid = env.store.create(OWNER, "耳机", 1, 60, chat_id=GROUP)
     env.store.set_card(rid, 500)

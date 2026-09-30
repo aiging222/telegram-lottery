@@ -293,6 +293,38 @@ def winners_line(winners, room):
     return line + tail
 
 
+class BadButton(Exception):
+    """A button's data this menu does not make: left by an older version of the bot, or
+    forged. Told apart from the bot's own faults, which on_error logs."""
+
+
+def arg(args, index):
+    """One of the values in a button's data."""
+    try:
+        return args[index]
+    except IndexError:
+        raise BadButton(args) from None
+
+
+def whole(text):
+    """A number in a button's data."""
+    try:
+        return int(text)
+    except ValueError:
+        raise BadButton(text) from None
+
+
+def int_arg(args, index):
+    return whole(arg(args, index))
+
+
+def choice(value, choices):
+    """value, if it is one of `choices` (a mapping's keys, say)."""
+    if value not in choices:
+        raise BadButton(value)
+    return value
+
+
 def number(text, name, low, high):
     try:
         return integer(int(text), name, low, high)
@@ -490,7 +522,8 @@ class Menu:
         except LotteryError as exc:
             await query.answer(alert_text(str(exc)), show_alert=True)
             return
-        except (ValueError, IndexError, KeyError):
+        except BadButton:
+            # Anything else raised is a fault of the bot's, for on_error to log and answer.
             await query.answer("按钮已失效。", show_alert=True)
             return
         await query.answer()
@@ -507,44 +540,43 @@ class Menu:
         if action == "groups":
             return await self.groups_menu(bot, user_id)
         if action == "g":
-            await self.require(bot, user_id, int(args[0]))
-            return await self.group_menu(int(args[0]))
+            await self.require(bot, user_id, int_arg(args, 0))
+            return await self.group_menu(int_arg(args, 0))
         if action == "new":
-            return await self.wizard_start(bot, user_id, int(args[0]))
+            return await self.wizard_start(bot, user_id, int_arg(args, 0))
         if action == "quit":
             return await self.wizard_quit(user_id)
         if action in BUTTON_STEPS:
             return await self.wizard_step(bot, user_id, action, args[0] if args else "")
         if action == "list":
-            await self.require(bot, user_id, int(args[0]))
-            return await self.records(int(args[0]), int(args[1]))
+            await self.require(bot, user_id, int_arg(args, 0))
+            return await self.records(int_arg(args, 0), int_arg(args, 1))
         if action == "r":
-            return await self.detail(bot, user_id, int(args[0]))
+            return await self.detail(bot, user_id, int_arg(args, 0))
         if action == "ask":
-            return await self.confirm(bot, user_id, args[0], int(args[1]))
+            return await self.confirm(bot, user_id, choice(arg(args, 0), CONFIRM), int_arg(args, 1))
         if action == "do":
-            return await self.act(bot, user_id, args[0], int(args[1]))
+            return await self.act(bot, user_id, choice(arg(args, 0), CONFIRM), int_arg(args, 1))
         if action == "repost":
-            return await self.repost(bot, user_id, int(args[0]))
+            return await self.repost(bot, user_id, int_arg(args, 0))
         if action in ("set", "sv", "sk", "sd"):
-            chat_id = int(args[0])
+            chat_id = int_arg(args, 0)
             await self.require(bot, user_id, chat_id)
-            if action == "sv" and SETTINGS[args[1]][1] is None:
+            key = None if action == "set" else choice(arg(args, 1), SETTINGS)
+            if action == "sv" and SETTINGS[key][1] is None:
                 action = "sk"  # a delay's button from a menu shown before they were picked
             if action == "sv":
-                await self.cycle_setting(user_id, chat_id, args[1])
+                await self.cycle_setting(user_id, chat_id, key)
             elif action == "sk":
-                return await self.delay_prompt(user_id, chat_id, args[1])
+                return await self.delay_prompt(user_id, chat_id, choice(key, DELAY_QUESTIONS))
             elif action == "sd":
-                if args[1] not in DELAY_QUESTIONS:
-                    raise ValueError(args[1])
-                delay = None if args[2] == "n" else int(args[2])
-                await self.set_setting(user_id, chat_id, args[1], delay)
+                delay = None if arg(args, 2) == "n" else int_arg(args, 2)
+                await self.set_setting(user_id, chat_id, choice(key, DELAY_QUESTIONS), delay)
             return await self.settings(bot, chat_id)
         if action == "log":
-            chat_id = int(args[0])
+            chat_id = int_arg(args, 0)
             await self.require(bot, user_id, chat_id)
-            return await self.changes(chat_id, args[1])
+            return await self.changes(chat_id, choice(arg(args, 1), ("set", "pt")))
         if action in ("w", "wu", "ws", "wd", "wid", "wc", "export"):
             self.require_super(user_id)
             return await self.weight_action(bot, user_id, action, args)
@@ -553,14 +585,14 @@ class Menu:
                 raise LotteryError("只有超级管理员可以修改发言次数。")
             return await self.count_action(user_id, action, args)
         if action in ("pt", "pk", "pv", "pp"):
-            chat_id = int(args[0])
+            chat_id = int_arg(args, 0)
             await self.require(bot, user_id, chat_id)
             return await self.points_action(bot, user_id, action, chat_id, args[1:])
         if action in ("pb", "pu", "pa", "pid", "pf", "px"):
             if not self.is_super(user_id):
                 raise LotteryError(NOT_BANKER)
-            return await self.balance_action(bot, user_id, action, int(args[0]), args[1:])
-        raise ValueError(action)
+            return await self.balance_action(bot, user_id, action, int_arg(args, 0), args[1:])
+        raise BadButton(action)
 
     # Group menu
 
@@ -632,7 +664,7 @@ class Menu:
         if action == "to":
             if not value:
                 return await self.target_groups(bot, user_id, chat_id)
-            chat_id = int(value)
+            chat_id = whole(value)
             await self.require(bot, user_id, chat_id)
         elif action == "wz":
             self.require_super(user_id)
@@ -661,7 +693,7 @@ class Menu:
                 data.pop("report_choices")
             else:
                 chosen = dict(data["report_choices"])
-                report = int(value)
+                report = whole(value)
                 if report not in chosen:
                     raise LotteryError(STALE)
                 await self.require(bot, user_id, report)
@@ -728,13 +760,13 @@ class Menu:
             if value == "back":  # 积分抽奖 asks this first, right after the kind
                 del data["kind"]
             else:
-                data["mode"] = {"t": "t", "f": "f"}[value]
+                data["mode"] = choice(value, ("t", "f"))
         elif step == "time":
             now = self.store.clock()
             if typed:
                 when = parse_time(value, now, self.handlers.timezone)
             else:
-                when = {"minutes": integer(int(value), "报名时长（分钟）", 1, 525600)}
+                when = {"minutes": integer(whole(value), "报名时长（分钟）", 1, 525600)}
             deadline = when["deadline"] if "deadline" in when else now + when["minutes"] * 60
             if deadline < now:
                 raise LotteryError(
@@ -747,24 +779,24 @@ class Menu:
             data.update(when)
         elif step == "kind":
             kinds = ("join", "act", "points", "inv", "rep")
-            data["kind"] = {kind: kind for kind in kinds}[value]
+            data["kind"] = choice(value, kinds)
         elif step == "via":
             if value == "back":
                 del data["kind"]
             else:
-                data["via"] = {"link": "link", "add": "add"}[value]
+                data["via"] = choice(value, ("link", "add"))
         elif step == "ikind":
             if value == "back":
                 del data["via"]
             else:
-                data["kind"] = {"rank": "irank", "reach": "ireach"}[value]
+                data["kind"] = "i" + choice(value, ("rank", "reach"))
                 if value == "rank":
                     data["mode"] = "t"  # drawn at a set time
         elif step == "activity":
             if value == "back":
                 del data["kind"]
             else:
-                data["kind"] = {"rank": "rank", "reach": "reach"}[value]
+                data["kind"] = choice(value, ("rank", "reach"))
                 data["mode"] = "t"  # drawn at a set time
         elif step == "since":
             data["count_from"] = self.since(value)
@@ -782,7 +814,7 @@ class Menu:
         elif step == "target":
             data["target"] = number(value, "满人开奖人数", max(total, 1), 100_000)
         elif step == "join":
-            data["join"] = {"b": "b", "k": "k"}[value]
+            data["join"] = choice(value, ("b", "k"))
         elif step == "keyword":
             data["keyword"] = check_keyword(value)
         else:
@@ -1382,7 +1414,7 @@ class Menu:
 
     async def points_action(self, bot, user_id, action, chat_id, args):
         if action == "pk":
-            return await self.point_prompt(user_id, chat_id, args[0])
+            return await self.point_prompt(user_id, chat_id, choice(arg(args, 0), POINT_SETTINGS))
         if action == "pp":
             try:
                 pinned = await self.handlers.post_panel(bot, chat_id)
@@ -1394,13 +1426,13 @@ class Menu:
             done = "✅ 灵石面板已发到群里，但没能置顶：请给机器人打开「置顶消息」权限。"
             return done + "\n\n" + text, markup
         if action == "pv":
-            key = args[0]
+            key = arg(args, 0)
             if key == "points":
-                value = bool(int(args[1]))
+                value = bool(int_arg(args, 1))
             elif key in POINT_SETTINGS:
-                value = int(args[1])
+                value = int_arg(args, 1)
             else:
-                raise ValueError(key)
+                raise BadButton(key)
             await self.set_setting(user_id, chat_id, key, value)
         return await self.points_page(bot, user_id, chat_id)
 
@@ -1495,7 +1527,7 @@ class Menu:
                 user_id, document=document, filename=filename, caption="本群的灵石余额和全部流水。"
             )
             return await self.points_page(bot, user_id, chat_id)
-        page = int(args[-1])
+        page = int_arg(args, -1)
         if action == "pb":
             return await self.balances(chat_id, page)
         if action == "pf":
@@ -1509,13 +1541,15 @@ class Menu:
                 "发送用户 ID 和要加减的灵石，用空格分开，例如：123456789 +50 或 123456789 -20",
                 back,
             )
-        uid = int(args[0])
-        if action == "pa" and args[1] == "x":
+        uid = int_arg(args, 0)
+        if action == "pa" and arg(args, 1) == "x":
             self._asking[user_id] = ("balance", chat_id, uid, page)
             back = keyboard((button("⬅️ 返回", f"m:pu:{chat_id}:{uid}:{page}"),))
             return "发送要加减的灵石，例如 +50 或 -20：", back
         if action == "pa":
-            await asyncio.to_thread(self.store.adjust_points, chat_id, user_id, uid, int(args[1]))
+            await asyncio.to_thread(
+                self.store.adjust_points, chat_id, user_id, uid, int_arg(args, 1)
+            )
         return await self.balance_page(chat_id, uid, page)
 
     async def balances(self, chat_id, page):
@@ -1739,7 +1773,7 @@ class Menu:
                 if raffle["card_message_id"] is not None:
                     await self.handlers.restore_panel(bot, chat_id)
         else:
-            raise ValueError(action)
+            raise BadButton(action)
         return await self.detail(bot, user_id, rid)
 
     async def repost(self, bot, user_id, rid):
@@ -1756,9 +1790,9 @@ class Menu:
     # the group card only says whether the raffle is weighted.
 
     async def weight_action(self, bot, user_id, action, args):
-        rid = int(args[0])
+        rid = int_arg(args, 0)
         if action == "w":
-            return await self.weights(rid, int(args[1]))
+            return await self.weights(rid, int_arg(args, 1))
         if action == "export":
             exported = await asyncio.to_thread(self.store.export, rid)
             document, filename = export_file(exported)
@@ -1767,11 +1801,11 @@ class Menu:
             )
             if exported["raffle"]["kind"] != "join":  # exported from the records page
                 return await self.detail(bot, user_id, rid)
-            return await self.weights(rid, int(args[1]))
+            return await self.weights(rid, int_arg(args, 1))
         raffle = self.weighs(await asyncio.to_thread(self.store.view, rid))
         if raffle["status"] != "OPEN":
             raise LotteryError(f"{status_text(raffle)}，权重已锁定。")
-        page = int(args[-1])
+        page = int_arg(args, -1)
         back = keyboard((button("⬅️ 返回", f"m:w:{rid}:{page}"),))
         if action == "wid":
             self._asking[user_id] = ("preset", rid, None, page)
@@ -1782,7 +1816,7 @@ class Menu:
                 f"当前默认权重 {raffle['default_weight']}，上限 {raffle['weight_cap']}。\n"
                 "发送新的默认权重和上限，用空格分开，例如：1 100"
             ), back
-        uid = int(args[1])
+        uid = int_arg(args, 1)
         if action == "wu":
             return await self.person(raffle, uid, page)
         if action == "wd":
@@ -1790,12 +1824,12 @@ class Menu:
             chosen = not (entry and entry["designated"])
             await asyncio.to_thread(self.store.designate, rid, user_id, uid, chosen)
             return await self.person(await asyncio.to_thread(self.store.view, rid), uid, page)
-        value = args[2]
+        value = arg(args, 2)
         if value == "x":
             self._asking[user_id] = ("weight", rid, uid, page)
             back = keyboard((button("⬅️ 返回", f"m:wu:{rid}:{uid}:{page}"),))
             return f"请输入权重（0～{raffle['weight_cap']}），0 表示不参与抽取。", back
-        weight = None if value == "a" else int(value)
+        weight = None if value == "a" else whole(value)
         await asyncio.to_thread(self.store.override, rid, user_id, uid, weight)
         await self.weights_changed(bot, raffle)
         return await self.weights(rid, page)
@@ -1904,7 +1938,7 @@ class Menu:
     # for messages the bot missed, say while its network was down.
 
     async def count_action(self, user_id, action, args):
-        rid, page = int(args[0]), int(args[-1])
+        rid, page = int_arg(args, 0), int_arg(args, -1)
         if action == "ac":
             return await self.counts(rid, page)
         if action == "aid":
@@ -1912,14 +1946,14 @@ class Menu:
             self._asking[user_id] = ("count_id", rid, None, page)
             back = keyboard((button("⬅️ 返回", f"m:ac:{rid}:{page}"),))
             return "发送用户 ID 和正确的发言次数，用空格分开，例如：123456789 30", back
-        uid = int(args[1])
-        if action == "as" and args[2] == "x":
+        uid = int_arg(args, 1)
+        if action == "as" and arg(args, 2) == "x":
             counted, _ = await asyncio.to_thread(self.store.counted, rid, uid)
             self._asking[user_id] = ("count", rid, uid, page)
             back = keyboard((button("⬅️ 返回", f"m:au:{rid}:{uid}:{page}"),))
             return f"请发送正确的发言次数（机器人记录 {counted} 次）：", back
         if action == "as":
-            by = int(args[2])
+            by = int_arg(args, 2)
             await asyncio.to_thread(functools.partial(self.store.adjust, rid, user_id, uid, by=by))
         return await self.speaker(rid, uid, page)
 
