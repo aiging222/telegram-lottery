@@ -521,6 +521,17 @@ def test_errors_answer_only_messages_that_ask_the_bot(due, chat, text, answered)
     assert bot.send_message.await_count == int(answered)
 
 
+@pytest.mark.parametrize("text", ["/help", "/id"])
+def test_help_and_id_are_tidied_away_in_groups_after_a_minute(due, text):
+    store, _, now, handlers = due
+    run_command(handlers, text, user_id=123)  # a private chat keeps them
+    run_command(handlers, text, user_id=123, chat_type="supergroup")
+    now[0] += 59  # a minute to read them, although notices go after 3 seconds
+    assert store.due_deletions() == {}
+    now[0] += 1
+    assert store.due_deletions() == {GROUP["id"]: [10, 77]}  # the command and the answer
+
+
 def test_token_filter_masks_message_and_traceback():
     record = logging.LogRecord(
         "t", logging.ERROR, __file__, 1, "GET %s", (f"https://x/bot{TOKEN}/getMe",), None

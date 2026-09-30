@@ -54,6 +54,7 @@ RANKING_SECONDS = 30  # how long a ranking behind the card's 📊 button is show
 GROUP_BUDGET = 15
 # Deletions due sooner than this are timed to the second instead of waiting for the next pass.
 QUICK_DELETE_SECONDS = 60
+READ_SECONDS = 60  # answers to be read or copied stay in a group this long at least
 JOINED_REACTION = "🎉"  # a keyword join is confirmed quietly, with a reaction
 ADMIN_COMMANDS = {
     "new",
@@ -235,13 +236,12 @@ class BotHandlers:
             await self.notice(context.bot, message, "请私聊机器人执行此命令。")
             return
         try:
-            if command == "help":
-                await self.say(
-                    message, PUBLIC_HELP + (ADMIN_HELP if user.id in self.admin_ids else "")
-                )
-                return
-            if command == "id":
-                await self.say(message, f"你的 Telegram 用户 ID：{user.id}")
+            if command in ("help", "id"):
+                if command == "help":
+                    text = PUBLIC_HELP + (ADMIN_HELP if user.id in self.admin_ids else "")
+                else:
+                    text = f"你的 Telegram 用户 ID：{user.id}"
+                await self.notice(context.bot, message, text, at_least=READ_SECONDS)
                 return
             if command == "raffles":
                 rows = await asyncio.to_thread(self.store.recent)
@@ -643,7 +643,7 @@ class BotHandlers:
             return
         # Whoever writes in the group is in it: no need to ask Telegram.
         text = await self.invite_link_text(context.bot, chat.id, user, check=False)
-        await self.notice(context.bot, message, text, at_least=60)
+        await self.notice(context.bot, message, text, at_least=READ_SECONDS)
 
     async def after_join(self, context, rid):
         if await asyncio.to_thread(self.store.is_full, rid):
