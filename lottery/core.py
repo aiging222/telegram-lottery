@@ -385,9 +385,13 @@ class Store:
         # time), and (chat_id, user_id) -> the name last written under. See count_message().
         self._pending = {}
         self._names = {}
+        # The counts and names flush_activity() is saving: still counted until they are.
+        self._flushing = {}
+        self._flushing_names = {}
         # (chat_id, user_id) -> when their last counted message was sent, for the cooldown.
         self._last_counted = {}
         self._pending_lock = threading.Lock()
+        self._flush_lock = threading.Lock()  # one flush at a time
         self._purged_at = 0.0
         # chat_id -> its settings, read for every group message; set_group_setting() and
         # migrate_chat() are the only writers.
@@ -995,10 +999,30 @@ class Store:
 
     def flush_activity(self):
         """Save the counts waiting in memory. Once an hour, also forget counts older than a
-        month, unless an open activity raffle still counts from further back."""
-        with self._pending_lock:
-            pending, self._pending = self._pending, {}
-            names, self._names = self._names, {}
+        month, unless an open activity raffle still counts from further back.
+
+        One flush runs at a time, so whoever calls it finds every count counted so far saved
+        when it returns. Until the counts taken out of memory are saved, _tally() finds them
+        in _flushing: a draw whose transaction is open while they wait for it to end must
+        not lose them."""
+        with self._flush_lock:
+            with self._pending_lock:
+                pending, self._pending = self._pending, {}
+                names, self._names = self._names, {}
+                self._flushing, self._flushing_names = pending, names
+            try:
+                self._save_activity(pending, names)
+            except BaseException:
+                with self._pending_lock:  # keep them for the next try
+                    for key, (count, last) in pending.items():
+                        more, later = self._pending.get(key, (0, 0.0))
+                        self._pending[key] = (count + more, max(last, later))
+                    for key, name in names.items():
+                        self._names.setdefault(key, name)
+                    self._flushing, self._flushing_names = {}, {}
+                raise
+
+    def _save_activity(self, pending, names):
         now = self.clock()
         purge = now - self._purged_at >= 3600
         if purge:
@@ -1007,38 +1031,32 @@ class Store:
                 self._last_counted = {k: t for k, t in self._last_counted.items() if t > cooled}
         if not pending and not names and not purge:
             return
-        try:
-            with self.transaction() as db:
-                db.executemany(
-                    "INSERT INTO activity VALUES(?,?,?,?,?) ON CONFLICT(chat_id,user_id,minute) "
-                    "DO UPDATE SET count=count+excluded.count,last_at=max(last_at,excluded.last_at)",
-                    [(*key, count, last) for key, (count, last) in pending.items()],
+        with self.transaction() as db:
+            db.executemany(
+                "INSERT INTO activity VALUES(?,?,?,?,?) ON CONFLICT(chat_id,user_id,minute) "
+                "DO UPDATE SET count=count+excluded.count,last_at=max(last_at,excluded.last_at)",
+                [(*key, count, last) for key, (count, last) in pending.items()],
+            )
+            db.executemany(
+                "INSERT INTO speakers(chat_id,user_id,display_name) VALUES(?,?,?) "
+                "ON CONFLICT(chat_id,user_id) DO UPDATE SET display_name=excluded.display_name",
+                [(*key, name) for key, name in names.items()],
+            )
+            if purge:
+                oldest = db.execute(
+                    "SELECT MIN(count_from) FROM raffles WHERE kind!='join' AND status='OPEN'"
+                ).fetchone()[0]
+                keep = now - KEEP_ACTIVITY if oldest is None else min(now - KEEP_ACTIVITY, oldest)
+                db.execute("DELETE FROM activity WHERE minute<?", (int(keep // 60),))
+                db.execute(
+                    "DELETE FROM speakers WHERE NOT EXISTS (SELECT 1 FROM activity a "
+                    "WHERE a.chat_id=speakers.chat_id AND a.user_id=speakers.user_id)"
                 )
-                db.executemany(
-                    "INSERT INTO speakers(chat_id,user_id,display_name) VALUES(?,?,?) "
-                    "ON CONFLICT(chat_id,user_id) DO UPDATE SET display_name=excluded.display_name",
-                    [(*key, name) for key, name in names.items()],
-                )
-                if purge:
-                    oldest = db.execute(
-                        "SELECT MIN(count_from) FROM raffles WHERE kind!='join' AND status='OPEN'"
-                    ).fetchone()[0]
-                    keep = (
-                        now - KEEP_ACTIVITY if oldest is None else min(now - KEEP_ACTIVITY, oldest)
-                    )
-                    db.execute("DELETE FROM activity WHERE minute<?", (int(keep // 60),))
-                    db.execute(
-                        "DELETE FROM speakers WHERE NOT EXISTS (SELECT 1 FROM activity a "
-                        "WHERE a.chat_id=speakers.chat_id AND a.user_id=speakers.user_id)"
-                    )
-        except BaseException:
-            with self._pending_lock:  # keep them for the next try
-                for key, (count, last) in pending.items():
-                    more, later = self._pending.get(key, (0, 0.0))
-                    self._pending[key] = (count + more, max(last, later))
-                for key, name in names.items():
-                    self._names.setdefault(key, name)
-            raise
+            # Before the commit, not after: a transaction that reads the counts either began
+            # before this one, and finds them in _flushing, or begins once this one has
+            # committed, and finds them saved. Counted twice they never are.
+            with self._pending_lock:
+                self._flushing, self._flushing_names = {}, {}
         if purge:
             self._purged_at = now
 
@@ -1049,7 +1067,9 @@ class Store:
                 "SELECT MIN(minute) FROM activity WHERE chat_id=?", (chat_id,)
             ).fetchone()[0]
         with self._pending_lock:
-            waiting = [minute for chat, _, minute in self._pending if chat == chat_id]
+            waiting = [
+                minute for chat, _, minute in (*self._flushing, *self._pending) if chat == chat_id
+            ]
         minutes = [minute for minute in (first, *waiting) if minute is not None]
         return min(minutes) * 60 if minutes else None
 
@@ -1178,15 +1198,17 @@ class Store:
                 (chat_id, start, stop),
             )
         }
-        with self._pending_lock:  # counted but not saved yet
-            for (chat, uid, minute), (count, last) in self._pending.items():
-                if chat == chat_id and start <= minute < stop:
-                    spoken = tally.setdefault(uid, [0, 0.0, None, None])
-                    spoken[0] += count
-                    spoken[1] = max(spoken[1], last)
-            for (chat, uid), name in self._names.items():
-                if chat == chat_id and uid in tally:
-                    tally[uid][2] = name
+        with self._pending_lock:  # counted but not saved yet, or being saved
+            for batch in (self._flushing, self._pending):
+                for (chat, uid, minute), (count, last) in batch.items():
+                    if chat == chat_id and start <= minute < stop:
+                        spoken = tally.setdefault(uid, [0, 0.0, None, None])
+                        spoken[0] += count
+                        spoken[1] = max(spoken[1], last)
+            for names in (self._flushing_names, self._names):  # the newer name last
+                for (chat, uid), name in names.items():
+                    if chat == chat_id and uid in tally:
+                        tally[uid][2] = name
         return tally
 
     def _invited(self, db, raffle, everyone=False):

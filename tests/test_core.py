@@ -1,6 +1,8 @@
 import hashlib
 import json
 import sqlite3
+import threading
+import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
@@ -617,6 +619,37 @@ def test_most_messages_win_and_equals_go_by_who_got_there_first(setup):
         (1, "奖1", 3),  # three messages by 30s, before user 2's third at 95s
         (2, "奖2", 3),
     ]
+
+
+def test_a_draw_counts_the_messages_being_saved(setup, monkeypatch):
+    """The periodic flush takes counts out of memory, then waits for the draw's write lock
+    to save them: the draw must count them all the same."""
+    store, _, now = setup
+    start = now[0]
+    rid = ranking(store, winners=1)
+    for at in (10, 20, 30):
+        store.count_message(-100, 2, "u2", start + at)
+    store.flush_activity()
+    for at in (100, 110, 120, 130, 140):
+        store.count_message(-100, 1, "u1", start + at)  # still in memory
+    now[0] = start + 3600
+    flusher = threading.Thread(target=store.flush_activity)
+    tally = store._tally
+
+    def tally_while_flushing(db, raffle):  # draw() holds the write lock here
+        flusher.start()
+        for _ in range(500):
+            if not store._pending:
+                break  # taken out of memory; the flush now waits for the lock
+            time.sleep(0.01)
+        return tally(db, raffle)
+
+    monkeypatch.setattr(store, "_tally", tally_while_flushing)
+    (winner,) = store.draw(rid, 99)["winners"]
+    flusher.join()
+    assert (winner["user_id"], winner["messages"]) == (1, 5)
+    monkeypatch.undo()
+    assert store.counted(rid, 1) == (5, 0)  # saved once, not twice
 
 
 def test_members_who_left_after_speaking_are_not_ranked(setup):
