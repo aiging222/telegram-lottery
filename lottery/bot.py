@@ -46,6 +46,10 @@ AUTO_DRAW_SECONDS = 30  # how often due raffles are drawn and old messages delet
 CARD_REFRESH_SECONDS = 5  # joins arriving within this window share one card edit
 SAVE_ACTIVITY_SECONDS = 10  # message counts wait in memory at most this long
 RANKING_SECONDS = 30  # how long a ranking behind the card's 📊 button is shown again
+# Telegram lets a bot send about 20 messages a minute to one group. The bot keeps count and,
+# past GROUP_BUDGET in the last minute, answers 灵石 with a reaction instead of a message,
+# leaving room for raffle cards and results.
+GROUP_BUDGET = 15
 JOINED_REACTION = "🎉"  # a keyword join is confirmed quietly, with a reaction
 ADMIN_COMMANDS = {
     "new",
@@ -184,6 +188,8 @@ class BotHandlers:
         self._user_locks = weakref.WeakValueDictionary()
         # raffle ID -> (until when, raffle, ranking) for the card's 📊 button; see ranking().
         self._rankings = {}
+        # chat ID -> when the bot sent its messages there in the last minute; see room().
+        self._sent = {}
         self._ranking = asyncio.Lock()
 
     def user_lock(self, user_id):
@@ -400,6 +406,17 @@ class BotHandlers:
             # already saved, so there is nothing to retry and nothing to tell the group.
             LOG.warning("按钮应答失败：%s", exc)
 
+    def room(self, chat_id):
+        """Whether the bot may still send chat_id a message this minute; see GROUP_BUDGET."""
+        now = self.store.clock()
+        sent = [at for at in self._sent.get(chat_id, ()) if now - at < 60]
+        self._sent[chat_id] = sent
+        return len(sent) < GROUP_BUDGET
+
+    def spent(self, chat_id, count=1):
+        """Count messages just sent to chat_id against its budget."""
+        self._sent.setdefault(chat_id, []).extend([self.store.clock()] * count)
+
     async def ranking(self, rid):
         """An open activity raffle and its ranking, for the card's 📊 button. Working it out
         reads every message counted, a second or so in a big group, and many may press at
@@ -453,6 +470,7 @@ class BotHandlers:
                 LOG.info("报名成功的表情回应失败：%s", exc)
         if notes:
             sent = await reply(message, "\n".join(notes))
+            self.spent(message.chat.id, len(sent))
             ids = [part.message_id for part in sent]
             await self.tidy(context.bot, message.chat.id, ids, "delete_notices")
         await self.tidy(context.bot, message.chat.id, [message.message_id], "delete_keyword")
@@ -505,6 +523,7 @@ class BotHandlers:
                 for part in chunks(result_text(result, mention=True))[len(sent) :]:
                     message = await bot.send_message(chat_id, part, parse_mode="HTML")
                     sent.append(message.message_id)
+                    self.spent(chat_id)
             except ChatMigrated as exc:
                 # The group became a supergroup; announce there in full on the next pass.
                 del self._posted_parts[rid]
@@ -539,6 +558,7 @@ class BotHandlers:
         raffle = await asyncio.to_thread(self.store.view, rid)
         text, markup = card(raffle, self.timezone)
         sent = await bot.send_message(raffle["chat_id"], text, reply_markup=markup)
+        self.spent(raffle["chat_id"])
         await self.card_posted(bot, raffle, sent.message_id)
 
     async def card_posted(self, bot, raffle, message_id):
@@ -579,6 +599,7 @@ class BotHandlers:
         """Answer a command; in a group both the command and the answer are tidied away."""
         sent = await reply(message, text, markup)
         if message.chat.type in ("group", "supergroup"):
+            self.spent(message.chat.id, len(sent))
             ids = [message.message_id, *(part.message_id for part in sent)]
             await self.tidy(bot, message.chat.id, ids, "delete_notices")
 
@@ -748,6 +769,8 @@ def build_application(settings):
         CallbackQueryHandler(handlers.callback, pattern=r"^(join|rank|weight):[0-9]{1,19}$")
     )
     app.add_handler(CallbackQueryHandler(menu.callback, pattern=r"^m:"))
+    points = Points(handlers)
+    app.add_handler(CallbackQueryHandler(points.button, pattern=r"^pts:(checkin|wallet|board)$"))
     app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, handlers.migrate))
     app.add_handler(
         MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, menu.text)
@@ -759,7 +782,7 @@ def build_application(settings):
     # and 灵石 besides the above. 「/签到」 is no command to Telegram, which allows only
     # Latin letters, digits and underscores in those, so it arrives as text.
     texts = filters.ChatType.GROUPS & (filters.TEXT | filters.CAPTION) & ~filters.COMMAND
-    app.add_handler(MessageHandler(texts, Points(handlers).message), group=1)
+    app.add_handler(MessageHandler(texts, points.message), group=1)
     app.add_handler(ChatMemberHandler(handlers.member_changed, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(ChatMemberHandler(menu.bot_membership, ChatMemberHandler.MY_CHAT_MEMBER))
     for job in (handlers.auto_draw, handlers.cleanup):

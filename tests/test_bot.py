@@ -298,7 +298,7 @@ def test_build_application_offline(tmp_path, monkeypatch):
         "123456:offline-test-token", frozenset({99}), str(tmp_path / "test.sqlite3"), SHANGHAI
     )
     app = build_application(settings)
-    assert len(app.handlers[0]) == 10
+    assert len(app.handlers[0]) == 11
     assert app.concurrent_updates > 1
     assert {"chat_member", "my_chat_member"} <= set(ALLOWED_UPDATES)
     jobs = [job.callback.__name__ for job in app.job_queue.jobs()]

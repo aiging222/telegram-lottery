@@ -201,9 +201,10 @@ def reward_text(name, got, limit):
     return f"{head}{name} 活跃发言，获得 {got['amount']} 灵石（{count}）"
 
 
-def wallet_text(name, wallet, settings):
-    """A member's answer to 「灵石」."""
-    lines = [f"💎 {name} 的灵石：{wallet['balance']}"]
+def wallet_text(wallet, settings, name=None):
+    """A member's answer to 「灵石」, or to the panel's button without their name."""
+    whose = f"{name} 的" if name else "你的"
+    lines = [f"💎 {whose}灵石：{wallet['balance']}"]
     if settings["checkin_points"]:
         lines.append(
             "📅 今日已签到"
@@ -222,19 +223,39 @@ def wallet_text(name, wallet, settings):
     return "\n".join(lines)
 
 
-def board_text(top, mine):
-    """The answer to 「灵石榜」: the richest members and where the asker stands."""
+def board_text(top, mine, width=16):
+    """The answer to 「灵石榜」: the richest members, names cut to `width`, and where the
+    asker stands."""
     if not top:
         return "💎 灵石榜\n还没有人获得灵石，发送「签到」领取第一笔吧。"
     lines = ["💎 灵石榜"]
     for index, row in enumerate(top):
         rank = MEDALS[index] if index < len(MEDALS) else f"{index + 1}."
-        lines.append(f"{rank} {holder_name(row)[:16]} · {row['balance']}")
+        lines.append(f"{rank} {holder_name(row)[:width]} · {row['balance']}")
     if mine:
         lines.append(f"你：第 {mine['place']} 名 · {mine['balance']} 灵石")
     else:
         lines.append("你还没有灵石")
     return "\n".join(lines)
+
+
+def points_panel():
+    """The message a group pins for 灵石: its buttons answer whoever presses them alone."""
+    text = (
+        "💎 灵石\n"
+        "每天点「📅 签到」领灵石，在群里发言也有机会获得灵石。\n"
+        "点下面的按钮，结果只有你自己看得到。"
+    )
+    markup = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📅 签到", callback_data="pts:checkin")],
+            [
+                InlineKeyboardButton("💎 我的灵石", callback_data="pts:wallet"),
+                InlineKeyboardButton("🏆 灵石榜", callback_data="pts:board"),
+            ],
+        ]
+    )
+    return text, markup
 
 
 def points_file(exported):

@@ -1026,3 +1026,12 @@ def test_finding_members_by_name(setup):
     assert store.holder(-100, 1) == {"display_name": "Alice Wang", "balance": 0}
     store.adjust_points(-100, 99, 1, 5)
     assert store.holder(-100, 1) == {"display_name": "Alice Wang", "balance": 5}
+
+
+def test_points_panel(setup):
+    store, _, _ = setup
+    store.remember_group(-100, "甲群")
+    assert store.swap_points_panel(-100, 5) is None
+    assert store.swap_points_panel(-100, 9) == 5
+    store.migrate_chat(-100, -1001)  # left behind in the old group
+    assert store.swap_points_panel(-1001, 12) is None

@@ -33,6 +33,7 @@ from lottery.views import (
     name_text,
     place,
     points_file,
+    points_panel,
     prize_text,
     status_text,
     when_text,
@@ -482,7 +483,7 @@ class Menu:
             if not self.is_super(user_id):
                 raise LotteryError("只有超级管理员可以修改发言次数。")
             return await self.count_action(user_id, action, args)
-        if action in ("pt", "pk", "pv"):
+        if action in ("pt", "pk", "pv", "pp"):
             chat_id = int(args[0])
             await self.require(bot, user_id, chat_id)
             return await self.points_action(bot, user_id, action, chat_id, args[1:])
@@ -1056,6 +1057,10 @@ class Menu:
     async def points_action(self, bot, user_id, action, chat_id, args):
         if action == "pk":
             return await self.point_prompt(user_id, chat_id, args[0])
+        if action == "pp":
+            await self.post_panel(bot, chat_id)
+            text, markup = await self.points_page(bot, user_id, chat_id)
+            return "✅ 灵石面板已发到群里并置顶。\n\n" + text, markup
         if action == "pv":
             key = args[0]
             if key == "points":
@@ -1087,6 +1092,7 @@ class Menu:
                     "群友在群里发送「签到」「灵石」「灵石榜」使用，机器人的回复按抽奖设置里"
                     "「删除机器人通知」的时间删除。"
                 ),
+                "人多的群建议点「📌 发布灵石面板」：群友点按钮签到、查询，结果只弹给自己看。",
                 f"📅 签到：{checkin}",
                 f"💬 发言奖励：{reward}",
                 f"⚡ 暴击：{crit}",
@@ -1121,6 +1127,8 @@ class Menu:
             ),
             *in_rows(choices, 2),
         ]
+        if v["points"]:
+            rows.append((button("📌 发布灵石面板", f"m:pp:{chat_id}"),))
         if self.is_super(user_id):
             rows.append(
                 (
@@ -1132,6 +1140,21 @@ class Menu:
             (button("📜 修改记录", f"m:log:{chat_id}:pt"), button("⬅️ 返回", f"m:g:{chat_id}"))
         )
         return "\n".join(lines), keyboard(*rows)
+
+    async def post_panel(self, bot, chat_id):
+        """Post the group's 灵石 panel and pin it, taking down the one posted before."""
+        text, markup = points_panel()
+        try:
+            sent = await bot.send_message(chat_id, text, reply_markup=markup)
+        except TelegramError as exc:
+            raise LotteryError(f"发布失败：{exc}") from None
+        before = await asyncio.to_thread(self.store.swap_points_panel, chat_id, sent.message_id)
+        await self.handlers.pin(bot, chat_id, sent.message_id)
+        if before is not None:
+            await self.handlers.unpin(bot, chat_id, before)
+            # Telegram lets bots delete messages for 48 hours; an older panel stays behind,
+            # its buttons working all the same.
+            await self.handlers.delete(bot, chat_id, [before])
 
     async def point_prompt(self, user_id, chat_id, key):
         label, _, presets, question = POINT_SETTINGS[key]

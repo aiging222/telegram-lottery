@@ -990,6 +990,7 @@ def test_points_settings_for_group_admins(env):
         "💎 测试群 · 灵石设置\n"
         "群友在群里发送「签到」「灵石」「灵石榜」使用，机器人的回复按抽奖设置里"
         "「删除机器人通知」的时间删除。\n"
+        "人多的群建议点「📌 发布灵石面板」：群友点按钮签到、查询，结果只弹给自己看。\n"
         "📅 签到：每天 10 灵石\n"
         "💬 发言奖励：每条有效发言有 5% 的概率得 5 灵石，每天不限次数\n"
         "⚡ 暴击：得到发言奖励时有 10% 的概率翻 2 倍\n"
@@ -1007,6 +1008,7 @@ def test_points_settings_for_group_admins(env):
         "✖️ 暴击倍数：2 倍",
         "✍️ 最少字数：3 字",
         "⏱ 发言间隔：5 秒",
+        "📌 发布灵石面板",
         "📜 修改记录",
         "⬅️ 返回",
     ]  # balances are for super admins
@@ -1265,3 +1267,23 @@ def test_super_admins_find_members_by_name(env):
     assert text == "Tom Lee（ID：7）\n💎 10 灵石"
     denied = press(env, OWNER, f"m:pf:{GROUP}:0").answer.await_args.args[0]
     assert denied == "只有超级管理员可以修改余额和导出流水。"
+
+
+def test_admins_post_the_points_panel(env):
+    sends(env, 600, 601)
+    text, _ = shown(press(env, OWNER, f"m:pp:{GROUP}"))
+    assert text.startswith("✅ 灵石面板已发到群里并置顶。\n\n💎 测试群 · 灵石设置")
+    call = env.bot.send_message.await_args
+    assert call.args[0] == GROUP
+    assert call.args[1].startswith("💎 灵石\n")
+    assert labels(call.kwargs["reply_markup"]) == {
+        "📅 签到": "pts:checkin",
+        "💎 我的灵石": "pts:wallet",
+        "🏆 灵石榜": "pts:board",
+    }
+    assert pins(env) == [600]
+    press(env, OWNER, f"m:pp:{GROUP}")  # a new panel takes the old one's place
+    assert pins(env) == [600, 601]
+    assert unpins(env) == [600]
+    env.bot.delete_messages.assert_awaited_with(GROUP, [600])
+    assert press(env, MEMBER, f"m:pp:{GROUP}").answer.await_args.args[0] == NOT_MANAGER

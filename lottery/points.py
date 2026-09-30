@@ -2,7 +2,11 @@
 once a day with 「签到」 and look up their 灵石 and the group's ranking, and super admins give
 or take 灵石 by replying to a member's message. Other messages count for activity raffles
 when they are long enough and not sent too quickly, and each such message has a chance of
-earning 灵石."""
+earning 灵石.
+
+Telegram lets the bot send a group only about 20 messages a minute. Past its budget (see
+BotHandlers.room) these answers become reactions; and the 灵石 panel's buttons answer in a
+pop-up for the member who pressed alone, which sends the group nothing at all."""
 
 import asyncio
 import logging
@@ -14,7 +18,7 @@ from telegram import ChatPermissions
 from telegram.error import TelegramError
 
 from lottery.core import LotteryError
-from lottery.menu import one_at_a_time, sender
+from lottery.menu import one_at_a_time, presser, sender
 from lottery.views import board_text, checkin_text, name_text, reward_text, wallet_text
 
 LOG = logging.getLogger(__name__)
@@ -30,6 +34,10 @@ WORDS = {
 # 「加50灵石」 or 「扣20灵石」. Nothing else may be in the message.
 ADJUST = re.compile(r"(加|扣) *(?:灵石 *(?P<after>[0-9]{1,9})|(?P<before>[0-9]{1,9}) *灵石)")
 BOARD_SIZE = 10
+PANEL_BOARD_SIZE = 5  # a pop-up shows at most 200 characters
+# Reactions standing in for answers once the group's budget is spent. Telegram allows only
+# some emoji as reactions (✅ is not one of them).
+DONE, NOTED, SEEN, NO = "👍", "👌", "👀", "🤷"
 # Checking in again within SPAM_WINDOW seconds: the WARN_AT-th time is warned, from the
 # MUTE_AT-th on the member is muted for MUTE_SECONDS.
 SPAM_WINDOW = 60
@@ -38,6 +46,8 @@ MUTE_AT = 5
 MUTE_SECONDS = 300
 ALREADY = "今天已经签到过了"
 WARNING = "已签到，频繁发送将导致账号禁言"
+POINTS_OFF = "本群的灵石功能已关闭。"
+NO_CHECK_IN = "本群没有开启签到。"
 
 
 class Points:
@@ -63,6 +73,77 @@ class Points:
             self._checked = {key for key in self._checked if key[2] == day}
             self._repeats.clear()
         return day
+
+    async def answer(self, bot, message, text, reaction):
+        """Answer a 灵石 word, both tidied away later; with the group's budget spent, react
+        to it instead."""
+        if self.handlers.room(message.chat.id):
+            await self.handlers.notice(bot, message, text)
+            return
+        await self.react(message, reaction)
+        await self.handlers.tidy(bot, message.chat.id, [message.message_id], "delete_notices")
+
+    async def react(self, message, reaction):
+        try:
+            await message.set_reaction(reaction)
+        except TelegramError as exc:  # reactions may be off in the group
+            LOG.info("群 %s 的表情回应失败：%s", message.chat.id, exc)
+
+    async def enter(self, chat_id, user, day, amount):
+        """Check user in for `day`: what check_in() gives, None if they already were."""
+        key = (chat_id, user.id, day)
+        if key in self._checked:
+            return None
+        got = await asyncio.to_thread(
+            self.store.check_in, chat_id, user.id, name_text(user.full_name), day, amount
+        )
+        self._checked.add(key)
+        return got
+
+    @one_at_a_time(presser)
+    async def button(self, update, context):
+        """A press on the 灵石 panel: the answer pops up for that member alone."""
+        query = update.callback_query
+        if query is None or query.from_user.is_bot:
+            return
+        chat_id = query.message.chat.id
+        settings = await asyncio.to_thread(self.store.group_settings, chat_id)
+        if settings["points"]:
+            press = getattr(self, "press_" + query.data.split(":")[1])
+            text = await press(context.bot, chat_id, query.from_user, settings)
+        else:
+            text = POINTS_OFF
+        try:
+            await query.answer(text[:200], show_alert=True)
+        except TelegramError as exc:
+            LOG.warning("灵石面板按钮应答失败：%s", exc)
+
+    async def press_checkin(self, bot, chat_id, user, settings):
+        if not settings["checkin_points"]:
+            return NO_CHECK_IN
+        day = self.today(self.store.clock())
+        if (chat_id, user.id, day) in self._checked:
+            return ALREADY  # no need to ask Telegram about them again
+        # Anyone who sees the panel can press it, even outside a public group.
+        try:
+            member = await self.handlers.group_member(bot, chat_id, user.id)
+        except TelegramError as exc:
+            LOG.warning("群成员校验失败：%s", exc)
+            return "暂时无法确认你的群成员身份，请稍后重试。"
+        if not member:
+            return "只有本群成员可以签到。"
+        got = await self.enter(chat_id, user, day, settings["checkin_points"])
+        return checkin_text(got) if got else ALREADY
+
+    async def press_wallet(self, bot, chat_id, user, settings):
+        day = self.today(self.store.clock())
+        wallet = await asyncio.to_thread(self.store.wallet, chat_id, user.id, day)
+        return wallet_text(wallet, settings)
+
+    async def press_board(self, bot, chat_id, user, settings):
+        top, _ = await asyncio.to_thread(self.store.holders, chat_id, 0, PANEL_BOARD_SIZE)
+        mine = await asyncio.to_thread(self.store.standing, chat_id, user.id)
+        return board_text(top, mine, width=10)
 
     @one_at_a_time(sender)
     async def message(self, update, context):
@@ -111,7 +192,9 @@ class Points:
                 text = str(exc)
             else:
                 text = f"✅ 已给 {name} {match[1]} {amount} 灵石，现有 {balance} 灵石。"
-        await self.handlers.notice(bot, message, text)
+                await self.answer(bot, message, text, DONE)
+                return
+        await self.answer(bot, message, text, NO)
 
     async def reward(self, bot, message, user_id, name, settings, at):
         day = self.today(at)
@@ -129,35 +212,26 @@ class Points:
         )
         if got is None:
             return  # the day's rewards are all taken
+        if not self.handlers.room(chat_id):
+            await self.react(message, "⚡" if got["crit"] else "🎉")  # 灵石 given all the same
+            return
         try:
             sent = await message.reply_text(reward_text(name, got, settings["reward_daily"]))
         except TelegramError as exc:
             LOG.info("群 %s 的发言奖励通知发送失败：%s", chat_id, exc)
             return
+        self.handlers.spent(chat_id)
         await self.handlers.tidy(bot, chat_id, [sent.message_id], "delete_notices")
 
     async def check_in(self, bot, message, user, settings, at):
         if not settings["checkin_points"]:
-            await self.handlers.notice(bot, message, "本群没有开启签到。")
+            await self.answer(bot, message, NO_CHECK_IN, NO)
             return
-        day = self.today(at)
-        chat_id = message.chat.id
-        key = (chat_id, user.id, day)
-        got = None
-        if key not in self._checked:
-            got = await asyncio.to_thread(
-                self.store.check_in,
-                chat_id,
-                user.id,
-                name_text(user.full_name),
-                day,
-                settings["checkin_points"],
-            )
-            self._checked.add(key)
+        got = await self.enter(message.chat.id, user, self.today(at), settings["checkin_points"])
         if got:
-            await self.handlers.notice(bot, message, checkin_text(got))
+            await self.answer(bot, message, checkin_text(got), DONE)
         else:
-            await self.handlers.notice(bot, message, await self.repeated(bot, message, user, at))
+            await self.answer(bot, message, await self.repeated(bot, message, user, at), NOTED)
 
     async def repeated(self, bot, message, user, at):
         """The answer to checking in again: a warning if it happens WARN_AT times within
@@ -186,11 +260,11 @@ class Points:
         day = self.today(at)
         chat_id = message.chat.id
         wallet = await asyncio.to_thread(self.store.wallet, chat_id, user.id, day)
-        text = wallet_text(name_text(user.full_name), wallet, settings)
-        await self.handlers.notice(bot, message, text)
+        text = wallet_text(wallet, settings, name_text(user.full_name))
+        await self.answer(bot, message, text, SEEN)
 
     async def board(self, bot, message, user, settings, at):
         chat_id = message.chat.id
         top, _ = await asyncio.to_thread(self.store.holders, chat_id, 0, BOARD_SIZE)
         mine = await asyncio.to_thread(self.store.standing, chat_id, user.id)
-        await self.handlers.notice(bot, message, board_text(top, mine))
+        await self.answer(bot, message, board_text(top, mine), SEEN)

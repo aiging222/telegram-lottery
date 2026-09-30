@@ -7,11 +7,11 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from telegram import ChatPermissions
-from telegram.error import BadRequest
+from telegram.error import BadRequest, TimedOut
 
 from lottery.bot import BotHandlers
 from lottery.core import Store
-from lottery.points import ALREADY, WARNING, Points
+from lottery.points import ALREADY, POINTS_OFF, WARNING, Points
 from lottery.views import card
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -33,8 +33,8 @@ def env(tmp_path):
     return SimpleNamespace(store=store, handlers=handlers, points=points, bot=bot, now=now)
 
 
-def say(env, user_id, text, at=0, points=None):
-    """A group message sent `at` seconds after NOW; returns the bot's reply, if any."""
+def post(env, user_id, text, at=0, points=None):
+    """A group message sent `at` seconds after NOW, once the bot has handled it."""
     env.now[0] = NOW + at
     message = SimpleNamespace(
         text=text,
@@ -44,11 +44,22 @@ def say(env, user_id, text, at=0, points=None):
         date=datetime.fromtimestamp(NOW + at, UTC),
         sender_chat=None,
         reply_text=AsyncMock(return_value=SimpleNamespace(message_id=next(MESSAGE_IDS))),
+        set_reaction=AsyncMock(),
     )
     user = SimpleNamespace(id=user_id, full_name=f"user{user_id}", is_bot=False)
     update = SimpleNamespace(effective_message=message, effective_user=user)
     asyncio.run((points or env.points).message(update, SimpleNamespace(bot=env.bot)))
-    call = message.reply_text.await_args
+    return message
+
+
+def say(env, user_id, text, at=0, points=None):
+    """A group message sent `at` seconds after NOW; returns the bot's reply, if any."""
+    call = post(env, user_id, text, at, points).reply_text.await_args
+    return call.args[0] if call else None
+
+
+def reaction(message):
+    call = message.set_reaction.await_args
     return call.args[0] if call else None
 
 
@@ -254,3 +265,75 @@ def test_super_admins_adjust_by_replying(env):
     env.store.flush_activity()
     with env.store.reading() as db:  # the four chats count as speaking, the rest not
         assert db.execute("SELECT SUM(count) FROM activity").fetchone()[0] == 4
+
+
+def press_panel(env, user_id, action, status="member"):
+    """Press a button on the 灵石 panel; returns what pops up for that member alone."""
+    query = SimpleNamespace(
+        data=f"pts:{action}",
+        answer=AsyncMock(),
+        from_user=SimpleNamespace(id=user_id, full_name=f"user{user_id}", is_bot=False),
+        message=SimpleNamespace(chat=SimpleNamespace(id=GROUP)),
+    )
+    env.bot.get_chat_member = AsyncMock(return_value=SimpleNamespace(status=status))
+    asyncio.run(
+        env.points.button(SimpleNamespace(callback_query=query), SimpleNamespace(bot=env.bot))
+    )
+    call = query.answer.await_args
+    assert call.kwargs == {"show_alert": True}
+    return call.args[0]
+
+
+def test_the_panel_answers_only_the_member_who_pressed(env):
+    # The bot sends the group nothing: env.bot cannot even send messages.
+    assert press_panel(env, 1, "checkin") == (
+        "✅ 签到成功，获得 10 灵石\n💎 当前 10 灵石 · 今天第 1 个签到"
+    )
+    assert press_panel(env, 1, "checkin") == ALREADY
+    env.bot.get_chat_member.assert_not_awaited()  # known to have checked in: no lookup
+    assert say(env, 1, "签到") == ALREADY  # the same check-in as by text
+    assert press_panel(env, 2, "checkin", status="left") == "只有本群成员可以签到。"
+    env.bot.get_chat_member = AsyncMock(side_effect=TimedOut())
+    query = SimpleNamespace(
+        data="pts:checkin",
+        answer=AsyncMock(),
+        from_user=SimpleNamespace(id=3, full_name="user3", is_bot=False),
+        message=SimpleNamespace(chat=SimpleNamespace(id=GROUP)),
+    )
+    asyncio.run(
+        env.points.button(SimpleNamespace(callback_query=query), SimpleNamespace(bot=env.bot))
+    )
+    assert query.answer.await_args.args[0] == "暂时无法确认你的群成员身份，请稍后重试。"
+    assert press_panel(env, 1, "wallet") == (
+        "💎 你的灵石：10\n📅 今日已签到\n💬 今日发言奖励 0 次，每条有效发言有 5% 的机会获得"
+    )
+    for uid in range(10, 17):
+        env.store.adjust_points(GROUP, 99, uid, 100 + uid)
+        env.store.check_in(GROUP, uid, "名" * 50, "2027-01-15", 10)
+    board = press_panel(env, 1, "board")
+    assert board.startswith("💎 灵石榜\n🥇 名名名名名名名名名名 · 126\n")
+    assert board.count("\n") == 6  # the top five and the one who pressed
+    assert board.endswith("你：第 8 名 · 10 灵石")
+    assert len(board) <= 200
+    env.store.set_group_setting(GROUP, "points", False)
+    assert press_panel(env, 1, "wallet") == POINTS_OFF
+    assert env.store.due_deletions() == {}
+
+
+def test_past_the_budget_answers_become_reactions(env):
+    env.store.set_group_setting(GROUP, "reward_chance", 100)
+    env.store.set_group_setting(GROUP, "crit_percent", 0)
+    for uid in range(1, 16):  # fifteen answers in a minute: the budget
+        assert say(env, uid, "签到", at=uid).startswith("✅")
+    checked_in = post(env, 16, "签到", at=20)
+    assert checked_in.reply_text.await_count == 0
+    assert reaction(checked_in) == "👍"
+    assert env.store.holder(GROUP, 16)["balance"] == 10  # 灵石 all the same
+    assert reaction(post(env, 16, "签到", at=21)) == "👌"
+    assert reaction(post(env, 16, "灵石", at=22)) == "👀"
+    rewarded = post(env, 16, "大家早上好", at=23)
+    assert (rewarded.reply_text.await_count, reaction(rewarded)) == (0, "🎉")
+    assert env.store.holder(GROUP, 16)["balance"] == 15
+    env.now[0] += 600  # the question is tidied away all the same
+    assert checked_in.message_id in env.store.due_deletions()[GROUP]
+    assert say(env, 17, "签到", at=61).startswith("✅")  # a minute on, room again

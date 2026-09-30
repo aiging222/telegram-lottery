@@ -291,6 +291,9 @@ MIGRATIONS = [
     );
     CREATE INDEX IF NOT EXISTS setting_changes_by_chat ON setting_changes(chat_id)
     """,
+    # 16: the 灵石 panel each group has pinned: a message whose buttons answer the member who
+    # presses them alone.
+    "ALTER TABLE groups ADD COLUMN points_panel INTEGER",
 ]
 # Deletion delays are seconds after posting: 0 deletes at once, None keeps the message.
 GROUP_DEFAULTS = {
@@ -460,7 +463,8 @@ class Store:
                 (new_chat_id, old_chat_id),
             )
             db.execute(
-                "UPDATE OR REPLACE groups SET chat_id=?,pinned_result=NULL WHERE chat_id=?",
+                "UPDATE OR REPLACE groups SET chat_id=?,pinned_result=NULL,points_panel=NULL "
+                "WHERE chat_id=?",
                 (new_chat_id, old_chat_id),
             )
             db.execute("UPDATE drafts SET chat_id=? WHERE chat_id=?", (new_chat_id, old_chat_id))
@@ -1614,6 +1618,15 @@ class Store:
             "ledger": ledger,
             "setting_changes": self.setting_changes(chat_id),
         }
+
+    def swap_points_panel(self, chat_id, message_id):
+        """Remember the 灵石 panel just posted in chat_id; returns the one posted before."""
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT points_panel FROM groups WHERE chat_id=?", (chat_id,)
+            ).fetchone()
+            db.execute("UPDATE groups SET points_panel=? WHERE chat_id=?", (message_id, chat_id))
+        return row["points_panel"] if row else None
 
     def swap_pinned_result(self, chat_id, message_id):
         """Remember the result just pinned in chat_id; returns the one pinned before."""
