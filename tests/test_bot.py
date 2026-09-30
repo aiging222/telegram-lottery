@@ -1036,3 +1036,29 @@ def test_the_database_uses_write_ahead_logging(setup):
     store, _, _ = setup
     with store.reading() as db:
         assert db.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+
+
+def test_short_delays_are_timed_to_the_second(setup, monkeypatch):
+    store, _, handlers = setup
+    store.remember_group(GROUP["id"], "测试群")
+    bot = fake_bot()
+    waited = []
+
+    async def wait(seconds):
+        waited.append(seconds)
+
+    monkeypatch.setattr(asyncio, "sleep", wait)
+
+    async def tidy(setting):
+        await handlers.tidy(bot, GROUP["id"], [1, 2], setting)
+        await asyncio.gather(*handlers._deleting)
+
+    asyncio.run(tidy("delete_notices"))  # 3 seconds by default
+    assert waited == [3]
+    bot.delete_messages.assert_awaited_once_with(GROUP["id"], [1, 2])
+    with store.reading() as db:  # done, so no longer waiting for the 30-second pass
+        assert db.execute("SELECT COUNT(*) FROM deletions").fetchone()[0] == 0
+    asyncio.run(tidy("delete_keyword"))  # a minute: left to the 30-second pass
+    assert waited == [3]
+    with store.reading() as db:
+        assert db.execute("SELECT COUNT(*) FROM deletions").fetchone()[0] == 2

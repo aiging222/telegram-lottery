@@ -300,7 +300,7 @@ GROUP_DEFAULTS = {
     "pin_card": True,
     "pin_result": True,
     "delete_keyword": 60,
-    "delete_notices": 600,
+    "delete_notices": 3,
     # 灵石: a check-in a day, and for every message a chance of reward_chance in 100 of a
     # reward, at most reward_daily a day (0: no limit), multiplied by crit_times with a chance
     # of crit_percent in 100.
@@ -1378,6 +1378,8 @@ class Store:
             raise LotteryError("没有这个设置。")
         if key in SETTING_LIMITS:
             integer(value, "设置值", *SETTING_LIMITS[key])
+        if key in ("delete_keyword", "delete_notices") and value is not None:
+            integer(value, "删除时间（秒）", 0, DELETE_WINDOW)
         with self.transaction() as db:
             row = db.execute("SELECT settings FROM groups WHERE chat_id=?", (chat_id,)).fetchone()
             if row is None:
@@ -1618,6 +1620,23 @@ class Store:
             "ledger": ledger,
             "setting_changes": self.setting_changes(chat_id),
         }
+
+    def restorable_panel(self, chat_id, cards_pinned):
+        """chat_id's 灵石 panel, or None if it has none or, with cards_pinned, the card of a
+        raffle not drawn yet is still pinned there."""
+        with self.reading() as db:
+            row = db.execute(
+                "SELECT points_panel FROM groups WHERE chat_id=?", (chat_id,)
+            ).fetchone()
+            busy = (
+                cards_pinned
+                and db.execute(
+                    "SELECT 1 FROM raffles WHERE chat_id=? AND status IN ('OPEN','FROZEN') "
+                    "AND card_message_id IS NOT NULL",
+                    (chat_id,),
+                ).fetchone()
+            )
+        return None if row is None or busy else row["points_panel"]
 
     def swap_points_panel(self, chat_id, message_id):
         """Remember the 灵石 panel just posted in chat_id; returns the one posted before."""

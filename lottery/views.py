@@ -194,11 +194,10 @@ def checkin_text(got):
     )
 
 
-def reward_text(name, got, limit):
-    """The group notice for a message reward; limit is the day's, 0 for none."""
+def reward_text(name, got):
+    """The group notice for a message reward."""
     head = "⚡ 暴击！" if got["crit"] else "💬 "
-    count = f"今日 {got['rewards']}/{limit}" if limit else f"今日第 {got['rewards']} 次"
-    return f"{head}{name} 活跃发言，获得 {got['amount']} 灵石（{count}）"
+    return f"{head}{name} 活跃发言，获得 {got['amount']} 灵石"
 
 
 def wallet_text(wallet, settings, name=None):
@@ -215,10 +214,8 @@ def wallet_text(wallet, settings, name=None):
         limit = settings["reward_daily"]
         taken = f"{wallet['rewards']}/{limit}" if limit else f"{wallet['rewards']}"
         line = f"💬 今日发言奖励 {taken} 次"
-        if limit and wallet["rewards"] >= limit:
-            line += "，已领满"
-        else:
-            line += f"，每条有效发言有 {settings['reward_chance']}% 的机会获得"
+        if not limit or wallet["rewards"] < limit:  # the chance itself stays with the admins
+            line += "，多发言就有机会获得"
         lines.append(line)
     return "\n".join(lines)
 

@@ -31,6 +31,7 @@ from lottery.views import (
     export_file,
     joined_text,
     name_text,
+    points_panel,
     result_text,
     standing_text,
     status_text,
@@ -50,6 +51,8 @@ RANKING_SECONDS = 30  # how long a ranking behind the card's 📊 button is show
 # past GROUP_BUDGET in the last minute, answers 灵石 with a reaction instead of a message,
 # leaving room for raffle cards and results.
 GROUP_BUDGET = 15
+# Deletions due sooner than this are timed to the second instead of waiting for the next pass.
+QUICK_DELETE_SECONDS = 60
 JOINED_REACTION = "🎉"  # a keyword join is confirmed quietly, with a reaction
 ADMIN_COMMANDS = {
     "new",
@@ -190,6 +193,7 @@ class BotHandlers:
         self._rankings = {}
         # chat ID -> when the bot sent its messages there in the last minute; see room().
         self._sent = {}
+        self._deleting = set()  # deletions waiting a few seconds; see tidy()
         self._ranking = asyncio.Lock()
 
     def user_lock(self, user_id):
@@ -543,6 +547,7 @@ class BotHandlers:
             await asyncio.to_thread(self.store.mark_announced, rid, 0, chat_id)
             await self.refresh_card(bot, rid)
             await self.pin_result(bot, chat_id, sent[0])
+            await self.restore_panel(bot, chat_id)
 
     async def post_result(self, bot, message, rid, result, actor):
         """Reply with a result. Posted in the raffle's own group, it is the announcement
@@ -552,6 +557,7 @@ class BotHandlers:
         if await asyncio.to_thread(self.store.mark_announced, rid, actor, chat_id):
             await self.refresh_card(bot, rid)
             await self.pin_result(bot, chat_id, sent[0].message_id)
+            await self.restore_panel(bot, chat_id)
 
     async def publish_card(self, bot, rid):
         """Post the card to the raffle's group and remember it for later edits."""
@@ -581,11 +587,48 @@ class BotHandlers:
             await self.unpin(bot, chat_id, before)
 
     async def pin(self, bot, chat_id, message_id):
-        # Pinning is a courtesy: without the right, the raffle works all the same.
+        """Pin quietly; whether it worked. Pinning is a courtesy: without the right, the
+        raffle works all the same."""
         try:
             await bot.pin_chat_message(chat_id, message_id, disable_notification=True)
         except TelegramError as exc:
             LOG.info("群 %s 置顶消息失败：%s", chat_id, exc)
+            return False
+        return True
+
+    async def post_panel(self, bot, chat_id, only_pinned=False):
+        """Post the group's 灵石 panel and pin it in place of the one before, which is taken
+        down; returns whether it was pinned. With only_pinned, a panel that cannot be pinned
+        is taken back instead, and the one before stays."""
+        text, markup = points_panel()
+        sent = await bot.send_message(chat_id, text, reply_markup=markup)
+        self.spent(chat_id)
+        pinned = await self.pin(bot, chat_id, sent.message_id)
+        if only_pinned and not pinned:
+            await self.delete(bot, chat_id, [sent.message_id])
+            return False
+        before = await asyncio.to_thread(self.store.swap_points_panel, chat_id, sent.message_id)
+        if before is not None:
+            await self.unpin(bot, chat_id, before)
+            # Telegram lets bots delete messages for 48 hours; an older panel stays behind,
+            # its buttons working all the same.
+            await self.delete(bot, chat_id, [before])
+        return pinned
+
+    async def restore_panel(self, bot, chat_id):
+        """A raffle has ended: put the group's 灵石 panel back on top of its pinned messages,
+        which the raffle's card and result pushed it down from. Not while another raffle's
+        card is still pinned there: the last to end brings it back."""
+        settings = await asyncio.to_thread(self.store.group_settings, chat_id)
+        if not settings["points"] or not (settings["pin_card"] or settings["pin_result"]):
+            return  # no 灵石, or nothing of the bot's pushed the panel down
+        panel = await asyncio.to_thread(self.store.restorable_panel, chat_id, settings["pin_card"])
+        if panel is None:
+            return
+        try:
+            await self.post_panel(bot, chat_id, only_pinned=True)
+        except TelegramError as exc:
+            LOG.warning("群 %s 的灵石面板没能放回置顶：%s", chat_id, exc)
 
     async def unpin(self, bot, chat_id, message_id):
         try:
@@ -603,15 +646,29 @@ class BotHandlers:
             ids = [message.message_id, *(part.message_id for part in sent)]
             await self.tidy(bot, message.chat.id, ids, "delete_notices")
 
-    async def tidy(self, bot, chat_id, message_ids, setting):
+    async def tidy(self, bot, chat_id, message_ids, setting, at_least=0):
+        """Delete messages as the group's `setting` says, but no sooner than `at_least`
+        seconds. The deletion is saved, so a restart does not forget it; one due within
+        QUICK_DELETE_SECONDS is also timed here, since the pass every 30 seconds would be
+        late for it."""
         delay = (await asyncio.to_thread(self.store.group_settings, chat_id))[setting]
         if delay is None:
             return
+        delay = max(delay, at_least)
         if delay == 0:
             await self.delete(bot, chat_id, message_ids)
             return
         due = self.store.clock() + delay
         await asyncio.to_thread(self.store.schedule_deletions, chat_id, message_ids, due)
+        if delay < QUICK_DELETE_SECONDS:
+            task = asyncio.create_task(self._delete_later(bot, chat_id, message_ids, delay))
+            self._deleting.add(task)
+            task.add_done_callback(self._deleting.discard)
+
+    async def _delete_later(self, bot, chat_id, message_ids, delay):
+        await asyncio.sleep(delay)
+        if await self.delete(bot, chat_id, message_ids):
+            await asyncio.to_thread(self.store.drop_deletions, chat_id, message_ids)
 
     async def delete(self, bot, chat_id, message_ids):
         """Delete messages; False only when it is worth trying again later."""

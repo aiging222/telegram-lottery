@@ -216,7 +216,7 @@ class Points:
             await self.react(message, "⚡" if got["crit"] else "🎉")  # 灵石 given all the same
             return
         try:
-            sent = await message.reply_text(reward_text(name, got, settings["reward_daily"]))
+            sent = await message.reply_text(reward_text(name, got))
         except TelegramError as exc:
             LOG.info("群 %s 的发言奖励通知发送失败：%s", chat_id, exc)
             return

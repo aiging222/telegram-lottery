@@ -791,6 +791,8 @@ def test_group_settings(setup):
         store.set_group_setting(-1001, "colour", "red")
     with pytest.raises(LotteryError):
         store.set_group_setting(-999, "pin_card", False)
+    with pytest.raises(LotteryError):
+        store.set_group_setting(-1001, "delete_notices", 48 * 3600)  # too late to delete
 
 
 def test_pinned_result_swaps(setup):

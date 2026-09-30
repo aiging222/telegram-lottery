@@ -77,7 +77,7 @@ def test_checking_in(env):
 def test_answers_are_tidied_away_with_the_question(env):
     say(env, 1, "签到")
     assert env.store.due_deletions() == {}
-    env.now[0] += 600  # 删除机器人通知: 10 minutes
+    env.now[0] += 3  # 删除机器人通知: 3 seconds
     assert len(env.store.due_deletions()[GROUP]) == 2
 
 
@@ -114,32 +114,32 @@ def test_speaking_earns_points_by_chance(env):
     replies = [say(env, 1, f"第{i}条消息", at=10 * i) for i in range(1, 7)]
     assert replies == [
         None,
-        "💬 user1 活跃发言，获得 5 灵石（今日 1/2）",
+        "💬 user1 活跃发言，获得 5 灵石",
         None,
-        "💬 user1 活跃发言，获得 5 灵石（今日 2/2）",
+        "💬 user1 活跃发言，获得 5 灵石",
         None,
         None,  # the day's limit
     ]
     assert env.store.holder(GROUP, 1)["balance"] == 10
-    assert say(env, 1, "灵石", at=100).endswith("💬 今日发言奖励 2/2 次，已领满")
+    assert say(env, 1, "灵石", at=100).endswith("\n💬 今日发言奖励 2/2 次")
 
 
 def test_only_real_messages_earn(env):
     env.store.set_group_setting(GROUP, "reward_chance", 100)
     env.store.set_group_setting(GROUP, "crit_percent", 100)
-    assert say(env, 1, "你好呀") == "⚡ 暴击！user1 活跃发言，获得 10 灵石（今日第 1 次）"
+    assert say(env, 1, "你好呀") == "⚡ 暴击！user1 活跃发言，获得 10 灵石"
     assert say(env, 1, "也太快了吧", at=3) is None  # three seconds after the last
     assert say(env, 1, "你 好", at=10) is None  # two characters: too short
     assert say(env, 1, "签到", at=20).startswith("✅")  # a 灵石 word is not speaking
     assert say(env, 1, "灵石榜", at=30).startswith("💎")
-    assert say(env, 1, "这次可以了", at=40).endswith("（今日第 2 次）")
+    assert say(env, 1, "这次可以了", at=40) == "⚡ 暴击！user1 活跃发言，获得 10 灵石"
 
 
 def test_wallet_and_board(env):
     assert say(env, 1, "灵石") == (
         "💎 user1 的灵石：0\n"
         "📅 今日未签到，发送「签到」领取 10 灵石\n"
-        "💬 今日发言奖励 0 次，每条有效发言有 5% 的机会获得"
+        "💬 今日发言奖励 0 次，多发言就有机会获得"
     )
     assert say(env, 1, "灵石榜", at=1) == "💎 灵石榜\n还没有人获得灵石，发送「签到」领取第一笔吧。"
     say(env, 1, "签到", at=2)
@@ -221,9 +221,9 @@ def test_rewards_without_a_daily_limit(env):
     for key, value in (("reward_chance", 100), ("reward_daily", 0), ("crit_percent", 0)):
         env.store.set_group_setting(GROUP, key, value)
     replies = [say(env, 1, f"第{i}条消息", at=10 * i) for i in range(1, 8)]
-    assert replies[-1] == "💬 user1 活跃发言，获得 5 灵石（今日第 7 次）"
+    assert replies == ["💬 user1 活跃发言，获得 5 灵石"] * 7
     wallet = say(env, 1, "灵石", at=100)
-    assert wallet.endswith("💬 今日发言奖励 7 次，每条有效发言有 100% 的机会获得")
+    assert wallet.endswith("💬 今日发言奖励 7 次，多发言就有机会获得")
 
 
 def test_super_admins_adjust_by_replying(env):
@@ -305,7 +305,7 @@ def test_the_panel_answers_only_the_member_who_pressed(env):
     )
     assert query.answer.await_args.args[0] == "暂时无法确认你的群成员身份，请稍后重试。"
     assert press_panel(env, 1, "wallet") == (
-        "💎 你的灵石：10\n📅 今日已签到\n💬 今日发言奖励 0 次，每条有效发言有 5% 的机会获得"
+        "💎 你的灵石：10\n📅 今日已签到\n💬 今日发言奖励 0 次，多发言就有机会获得"
     )
     for uid in range(10, 17):
         env.store.adjust_points(GROUP, 99, uid, 100 + uid)

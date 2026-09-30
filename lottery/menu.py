@@ -33,7 +33,6 @@ from lottery.views import (
     name_text,
     place,
     points_file,
-    points_panel,
     prize_text,
     status_text,
     when_text,
@@ -58,12 +57,19 @@ CONFIRM = {
     "freeze": "确定截止报名？截止后不能再报名。",
     "cancel": "确定取消这场抽奖？取消后不能恢复。",
 }
-# Group settings: button label and the values one press cycles through (first = default).
+# Group settings: button label, and for switches the values one press cycles through; the
+# deletion delays are picked from DELAYS or typed in minutes instead.
 SETTINGS = {
     "pin_card": ("📌 置顶报名卡片", (True, False)),
     "pin_result": ("📌 置顶开奖公告", (True, False)),
-    "delete_keyword": ("🧹 删除口令消息", (60, 0, 300, None)),
-    "delete_notices": ("🗑 删除机器人通知", (600, 60, 3600, None)),
+    "delete_keyword": ("🧹 删除口令消息", None),
+    "delete_notices": ("🗑 删除机器人通知", None),
+}
+DELAYS = (0, 3, 60, 300, 600, 3600, None)  # seconds after posting; None keeps the message
+MAX_DELAY_MINUTES = 1440
+DELAY_QUESTIONS = {
+    "delete_keyword": "群友发的口令消息多久后删除？",
+    "delete_notices": "机器人在群里的通知（签到、查询、奖励、提示等）多久后删除？",
 }
 # 灵石 settings: button label, how a value reads, preset buttons and the question asked.
 POINT_SETTINGS = {
@@ -221,7 +227,11 @@ def setting_text(value):
         return "不删"
     if value == 0:
         return "立即"
-    return f"{value // 3600}小时后" if value >= 3600 else f"{value // 60}分钟后"
+    if value < 60:
+        return f"{value}秒后"
+    if value % 3600 == 0:
+        return f"{value // 3600}小时后"
+    return f"{value // 60}分钟后"
 
 
 def point_value(key, value):
@@ -364,7 +374,8 @@ class Menu:
             LOG.warning("群 %s 的欢迎消息发送失败：%s", chat_id, exc)
             return
         ids = [sent.message_id] if trigger is None else [trigger, sent.message_id]
-        await self.handlers.tidy(bot, chat_id, ids, "delete_notices")
+        # Left a minute at least, for an admin to press its button.
+        await self.handlers.tidy(bot, chat_id, ids, "delete_notices", at_least=60)
 
     @one_at_a_time(sender)
     async def start(self, update, context):
@@ -466,11 +477,20 @@ class Menu:
             return await self.act(bot, user_id, args[0], int(args[1]))
         if action == "repost":
             return await self.repost(bot, user_id, int(args[0]))
-        if action in ("set", "sv"):
+        if action in ("set", "sv", "sk", "sd"):
             chat_id = int(args[0])
             await self.require(bot, user_id, chat_id)
+            if action == "sv" and SETTINGS[args[1]][1] is None:
+                action = "sk"  # a delay's button from a menu shown before they were picked
             if action == "sv":
                 await self.cycle_setting(user_id, chat_id, args[1])
+            elif action == "sk":
+                return await self.delay_prompt(user_id, chat_id, args[1])
+            elif action == "sd":
+                if args[1] not in DELAY_QUESTIONS:
+                    raise ValueError(args[1])
+                delay = None if args[2] == "n" else int(args[2])
+                await self.set_setting(user_id, chat_id, args[1], delay)
             return await self.settings(bot, chat_id)
         if action == "log":
             chat_id = int(args[0])
@@ -594,6 +614,8 @@ class Menu:
         if asking:
             points = asking[0] in ("setting", "balance", "balance_id", "balance_find")
             typed = self.points_typed if points else self.weight_typed
+            if asking[0] == "delay":
+                typed = self.delay_typed
             await typed(context.bot, message, user.id, asking)
             return
         found = await asyncio.to_thread(self.store.draft, user.id)
@@ -1014,8 +1036,13 @@ class Menu:
                 lines.append("缺少的权限请群主在群管理员设置里给机器人打开，否则对应功能不生效。")
         lines += await self.last_change(chat_id, list(SETTINGS))
         rows = [
-            (button(f"{label}：{setting_text(values[key])}", f"m:sv:{chat_id}:{key}"),)
-            for key, (label, _) in SETTINGS.items()
+            (
+                button(
+                    f"{label}：{setting_text(values[key])}",
+                    f"m:{'sv' if choices else 'sk'}:{chat_id}:{key}",
+                ),
+            )
+            for key, (label, choices) in SETTINGS.items()
         ]
         return "\n".join(lines), keyboard(
             *rows,
@@ -1041,6 +1068,34 @@ class Menu:
             lines.append(f"只显示最近 {CHANGES_SHOWN} 条。")
         return "\n".join(lines), keyboard((button("⬅️ 返回", f"m:{page}:{chat_id}"),))
 
+    async def delay_prompt(self, user_id, chat_id, key):
+        """Ask how long after posting messages of a kind are deleted."""
+        label = SETTINGS[key][0]
+        value = (await asyncio.to_thread(self.store.group_settings, chat_id))[key]
+        self._asking[user_id] = ("delay", chat_id, key, 0)
+        text = (
+            f"{label}：{setting_text(value)}\n{DELAY_QUESTIONS[key]}\n"
+            f"点按钮，或直接发送分钟数（0～{MAX_DELAY_MINUTES}，0 表示立即删除）："
+        )
+        choices = [
+            button(setting_text(delay), f"m:sd:{chat_id}:{key}:{'n' if delay is None else delay}")
+            for delay in DELAYS
+        ]
+        return text, keyboard(*in_rows(choices, 3), (button("⬅️ 返回", f"m:set:{chat_id}"),))
+
+    async def delay_typed(self, bot, message, user_id, asking):
+        _, chat_id, key, _ = asking
+        try:
+            minutes = number(message.text.strip(), "分钟数", 0, MAX_DELAY_MINUTES)
+            await self.set_setting(user_id, chat_id, key, minutes * 60)
+        except LotteryError as exc:
+            back = keyboard((button("⬅️ 返回", f"m:set:{chat_id}"),))
+            await message.reply_text(str(exc), reply_markup=back)
+            return
+        self._asking.pop(user_id, None)
+        text, markup = await self.settings(bot, chat_id)
+        await message.reply_text(text, reply_markup=markup)
+
     async def cycle_setting(self, user_id, chat_id, key):
         choices = SETTINGS[key][1]
         current = (await asyncio.to_thread(self.store.group_settings, chat_id))[key]
@@ -1058,9 +1113,15 @@ class Menu:
         if action == "pk":
             return await self.point_prompt(user_id, chat_id, args[0])
         if action == "pp":
-            await self.post_panel(bot, chat_id)
+            try:
+                pinned = await self.handlers.post_panel(bot, chat_id)
+            except TelegramError as exc:
+                raise LotteryError(f"发布失败：{exc}") from None
             text, markup = await self.points_page(bot, user_id, chat_id)
-            return "✅ 灵石面板已发到群里并置顶。\n\n" + text, markup
+            if pinned:
+                return "✅ 灵石面板已发到群里并置顶。\n\n" + text, markup
+            done = "✅ 灵石面板已发到群里，但没能置顶：请给机器人打开「置顶消息」权限。"
+            return done + "\n\n" + text, markup
         if action == "pv":
             key = args[0]
             if key == "points":
@@ -1140,21 +1201,6 @@ class Menu:
             (button("📜 修改记录", f"m:log:{chat_id}:pt"), button("⬅️ 返回", f"m:g:{chat_id}"))
         )
         return "\n".join(lines), keyboard(*rows)
-
-    async def post_panel(self, bot, chat_id):
-        """Post the group's 灵石 panel and pin it, taking down the one posted before."""
-        text, markup = points_panel()
-        try:
-            sent = await bot.send_message(chat_id, text, reply_markup=markup)
-        except TelegramError as exc:
-            raise LotteryError(f"发布失败：{exc}") from None
-        before = await asyncio.to_thread(self.store.swap_points_panel, chat_id, sent.message_id)
-        await self.handlers.pin(bot, chat_id, sent.message_id)
-        if before is not None:
-            await self.handlers.unpin(bot, chat_id, before)
-            # Telegram lets bots delete messages for 48 hours; an older panel stays behind,
-            # its buttons working all the same.
-            await self.handlers.delete(bot, chat_id, [before])
 
     async def point_prompt(self, user_id, chat_id, key):
         label, _, presets, question = POINT_SETTINGS[key]
@@ -1419,6 +1465,8 @@ class Menu:
                     LOG.warning("抽奖 %s 的取消通知发送失败：%s", rid, exc)
                 else:
                     await self.handlers.tidy(bot, chat_id, [sent.message_id], "delete_notices")
+                if raffle["card_message_id"] is not None:
+                    await self.handlers.restore_panel(bot, chat_id)
         else:
             raise ValueError(action)
         return await self.detail(bot, user_id, rid)

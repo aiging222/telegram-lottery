@@ -862,20 +862,36 @@ def test_settings_page(env):
         "📌 置顶报名卡片：开",
         "📌 置顶开奖公告：开",
         "🧹 删除口令消息：1分钟后",
-        "🗑 删除机器人通知：10分钟后",
+        "🗑 删除机器人通知：3秒后",
         "📜 修改记录",
         "⬅️ 返回",
     ]
-    seen = []
-    for _ in range(4):
-        _, buttons = shown(press(env, ADMIN, f"m:sv:{GROUP}:delete_keyword"))
-        seen.append(next(label for label in buttons if label.startswith("🧹")))
-    assert seen == [
-        "🧹 删除口令消息：立即",
-        "🧹 删除口令消息：5分钟后",
-        "🧹 删除口令消息：不删",
-        "🧹 删除口令消息：1分钟后",
+    text, buttons = shown(press(env, ADMIN, buttons["🧹 删除口令消息：1分钟后"]))
+    assert text == (
+        "🧹 删除口令消息：1分钟后\n群友发的口令消息多久后删除？\n"
+        "点按钮，或直接发送分钟数（0～1440，0 表示立即删除）："
+    )
+    assert list(buttons) == [
+        "立即",
+        "3秒后",
+        "1分钟后",
+        "5分钟后",
+        "10分钟后",
+        "1小时后",
+        "不删",
+        "⬅️ 返回",
     ]
+    _, buttons = shown(press(env, ADMIN, buttons["不删"]))
+    assert "🧹 删除口令消息：不删" in buttons
+    assert env.store.group_settings(GROUP)["delete_keyword"] is None
+    press(env, ADMIN, f"m:sk:{GROUP}:delete_notices")
+    assert type_text(env, ADMIN, "1441")[0] == "分钟数需为 0～1440 的整数，请重新输入。"
+    _, buttons = type_text(env, ADMIN, "90")
+    assert "🗑 删除机器人通知：90分钟后" in buttons
+    assert env.store.group_settings(GROUP)["delete_notices"] == 5400
+    # A button from a menu shown before this asks too, instead of cycling.
+    text, _ = shown(press(env, ADMIN, f"m:sv:{GROUP}:delete_notices"))
+    assert text.startswith("🗑 删除机器人通知：90分钟后\n")
     _, buttons = shown(press(env, ADMIN, f"m:sv:{GROUP}:pin_card"))
     assert "📌 置顶报名卡片：关" in buttons
     assert not env.store.group_settings(GROUP)["pin_card"]
@@ -968,8 +984,10 @@ def test_group_notices_are_deleted_later(env):
     rid = env.store.create(OWNER, "耳机", 1, 60, chat_id=GROUP)
     sends(env, 501)
     press(env, OWNER, f"m:do:cancel:{rid}")  # the cancel notice (501)
-    env.now[0] += 600
-    assert env.store.due_deletions() == {GROUP: [11, 500, 501]}
+    env.now[0] += 3
+    assert env.store.due_deletions() == {GROUP: [501]}
+    env.now[0] += 57  # the welcome stays a minute, for its button to be pressed
+    assert env.store.due_deletions() == {GROUP: [501, 11, 500]}
 
 
 def test_failed_deletions_are_retried_only_when_worth_it(env):
@@ -1211,7 +1229,7 @@ def test_setting_changes_are_recorded(env):
     )
     assert buttons == {"⬅️ 返回": f"m:pt:{GROUP}"}
     # The 抽奖设置 page keeps a record of its own.
-    text, _ = press_as(OWNER, "张三", f"m:sv:{GROUP}:delete_keyword")
+    text, _ = press_as(OWNER, "张三", f"m:sd:{GROUP}:delete_keyword:0")
     assert "\n🕘 最近修改：01-15 16:01 张三：🧹 删除口令消息 1分钟后 → 立即" in text
     text, _ = press_as(OWNER, "张三", f"m:log:{GROUP}:set")
     assert (
@@ -1287,3 +1305,62 @@ def test_admins_post_the_points_panel(env):
     assert unpins(env) == [600]
     env.bot.delete_messages.assert_awaited_with(GROUP, [600])
     assert press(env, MEMBER, f"m:pp:{GROUP}").answer.await_args.args[0] == NOT_MANAGER
+
+
+def test_the_panel_goes_back_on_top_once_a_raffle_ends(env):
+    sends(env, 600, 601, 602, 603)
+    press(env, OWNER, f"m:pp:{GROUP}")  # the panel (600)
+    fill_wizard(env, OWNER)
+    press(env, OWNER, "m:pub")  # the card (601), pinned above the panel
+    press(env, OWNER, "m:do:draw:1")  # the result (602), then the panel again (603)
+    assert pins(env) == [600, 601, 602, 603]
+    assert unpins(env) == [601, 600]  # the card, then the old panel
+    env.bot.delete_messages.assert_awaited_with(GROUP, [600])
+    assert env.bot.send_message.await_args.args[1].startswith("💎 灵石\n")
+
+
+def test_the_panel_waits_for_the_last_raffle_to_end(env):
+    sends(env, 600, 601, 602, 603, 604, 605)
+    press(env, OWNER, f"m:pp:{GROUP}")  # the panel (600)
+    first, second = (env.store.create(OWNER, t, 1, 60, chat_id=GROUP) for t in ("甲", "乙"))
+    for rid in (first, second):
+        asyncio.run(env.handlers.publish_card(env.bot, rid))  # cards 601 and 602
+    press(env, OWNER, f"m:do:cancel:{first}")  # its notice (603); 乙's card is still up
+    assert pins(env) == [600, 601, 602]
+    press(env, OWNER, f"m:do:cancel:{second}")  # its notice (604), then the panel (605)
+    assert pins(env) == [600, 601, 602, 605]
+
+
+def test_a_panel_that_cannot_be_pinned_leaves_the_old_one(env):
+    sends(env, 600, 601, 602, 603)
+    press(env, OWNER, f"m:pp:{GROUP}")  # the panel (600)
+    rid = env.store.create(OWNER, "甲", 1, 60, chat_id=GROUP)
+    asyncio.run(env.handlers.publish_card(env.bot, rid))  # the card (601)
+    env.bot.pin_chat_message = AsyncMock(side_effect=BadRequest("not enough rights"))
+    press(env, OWNER, f"m:do:cancel:{rid}")  # its notice (602); the new panel (603) goes
+    env.bot.delete_messages.assert_awaited_with(GROUP, [603])
+    assert 600 not in unpins(env)
+    assert env.store.restorable_panel(GROUP, True) == 600
+
+
+def test_no_panel_is_posted_where_there_was_none_or_no_points(env):
+    sends(env, 600, 601, 602, 603)
+    first = env.store.create(OWNER, "甲", 1, 60, chat_id=GROUP)
+    asyncio.run(env.handlers.publish_card(env.bot, first))  # the card (600)
+    press(env, OWNER, f"m:do:cancel:{first}")  # its notice (601): no panel ever posted
+    assert env.bot.send_message.await_count == 2
+    press(env, OWNER, f"m:pp:{GROUP}")  # the panel (602)
+    env.store.set_group_setting(GROUP, "points", False)
+    second = env.store.create(OWNER, "乙", 1, 60, chat_id=GROUP)
+    sends(env, 700, 701)
+    asyncio.run(env.handlers.publish_card(env.bot, second))  # the card (700)
+    press(env, OWNER, f"m:do:cancel:{second}")  # its notice (701), and no panel
+    assert env.bot.send_message.await_count == 2
+
+
+def test_admins_are_told_when_the_panel_could_not_be_pinned(env):
+    env.bot.pin_chat_message = AsyncMock(side_effect=BadRequest("not enough rights"))
+    text, _ = shown(press(env, OWNER, f"m:pp:{GROUP}"))
+    assert text.startswith(
+        "✅ 灵石面板已发到群里，但没能置顶：请给机器人打开「置顶消息」权限。\n\n"
+    )
