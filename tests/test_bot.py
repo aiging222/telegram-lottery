@@ -728,6 +728,46 @@ def test_auto_draw_announces_once_after_deadline(due):
     run_auto_draw(handlers).assert_not_awaited()
 
 
+def test_a_raffle_no_longer_full_holds_up_no_other(due, monkeypatch):
+    store, rid, now, handlers = due
+    full = store.create(99, "满人", 1, 30, chat_id=GROUP["id"], target=2)  # listed first
+    store.join(full, 1, "A")
+    store.join(full, 2, "B")
+    store.freeze(rid, 99)
+    store.draw(rid, 99)  # drawn in private: the pass announces it
+    listed = store.pending_announcements
+
+    def listed_then_one_leaves():
+        found = listed()
+        store.leave_group(GROUP["id"], 2, now[0])  # just after: full no longer
+        return found
+
+    monkeypatch.setattr(store, "pending_announcements", listed_then_one_leaves)
+    send = run_auto_draw(handlers)
+    assert [(c.args[0], c.args[1].split("\n")[0]) for c in send.await_args_list] == [
+        (GROUP["id"], f"🎉 自动开奖 开奖结果  #{rid}")
+    ]
+    assert store.view(full)["status"] == "OPEN"
+
+
+def test_a_raffle_that_fails_to_draw_holds_up_no_other(due, monkeypatch, caplog):
+    store, rid, now, handlers = due
+    broken = store.create(99, "坏的", 1, 30, chat_id=GROUP["id"])  # due first
+    now[0] += 3600
+    draw = store.draw
+
+    def draw_all_but_broken(raffle_id, actor):
+        if raffle_id == broken:
+            raise RuntimeError("bug")
+        return draw(raffle_id, actor)
+
+    monkeypatch.setattr(store, "draw", draw_all_but_broken)
+    assert run_auto_draw(handlers).await_args.args[0] == GROUP["id"]
+    assert not store.announcement_due(rid)
+    assert store.announcement_due(broken)  # tried again on the next pass
+    assert f"抽奖 {broken} 开奖或公布失败" in caplog.text
+
+
 def test_auto_draw_retries_after_network_error(due):
     _, _, now, handlers = due
     now[0] += 3600

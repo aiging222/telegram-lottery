@@ -651,18 +651,28 @@ class BotHandlers:
             self.refresh_card_soon(context, rid)
 
     async def auto_draw(self, context):
-        """Draw raffles that are due (deadline passed or full); announce each result once."""
+        """Draw raffles that are due (deadline passed or full); announce each result once.
+        A raffle that fails is tried again on the next pass and holds up none after it."""
         for rid, chat_id in await asyncio.to_thread(self.store.pending_announcements):
-            await self.announce(context.bot, rid, chat_id)
+            try:
+                await self.announce(context.bot, rid, chat_id)
+            except Exception:
+                LOG.exception("抽奖 %s 开奖或公布失败，下一轮重试。", rid)
 
     async def announce(self, bot, rid, chat_id):
         """Draw if needed, post the result to the raffle's group and close its card."""
         async with self._announcing:
             if not await asyncio.to_thread(self.store.announcement_due, rid):
                 return
-            sent = self._posted_parts.setdefault(rid, [])
             try:
                 result = await asyncio.to_thread(self.store.draw, rid, 0)
+            except LotteryError as exc:
+                # Due a moment ago, no longer: a member left a raffle that had just filled
+                # up, or it was cancelled meanwhile.
+                LOG.info("抽奖 %s 暂不开奖：%s", rid, exc)
+                return
+            sent = self._posted_parts.setdefault(rid, [])
+            try:
                 for part in chunks(result_text(result, mention=True))[len(sent) :]:
                     message = await bot.send_message(chat_id, part, parse_mode="HTML")
                     sent.append(message.message_id)
