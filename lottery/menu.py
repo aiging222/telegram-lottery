@@ -24,6 +24,7 @@ from lottery.views import (
     EXPORT_CAPTION,
     activity_rule,
     chances,
+    cost_text,
     counting_text,
     draw_rule,
     export_file,
@@ -47,6 +48,7 @@ COUNTS = (1, 2, 3, 5, 10)
 DURATIONS = (("1小时", 60), ("6小时", 360), ("1天", 1440), ("3天", 4320), ("7天", 10080))
 TARGETS = (10, 50, 100)
 MINIMUMS = (5, 10, 20, 50, 100)
+COSTS = (10, 20, 50, 100)
 WEIGHTS = (0, 1, 2, 3, 5, 10)
 CORRECTIONS = (1, 5, 10, -1, -5, -10)
 UNITS = {"分钟": 1, "分": 1, "m": 1, "小时": 60, "时": 60, "h": 60, "天": 1440, "d": 1440}
@@ -70,9 +72,19 @@ POINT_SETTINGS = {
         (5, 10, 20, 50),
         "每天签到得多少灵石？0 表示关闭签到。",
     ),
-    "reward_every": ("💬 发言", "每 {} 条", (10, 20, 50, 100), "每多少条有效发言奖励一次？"),
+    "reward_chance": (
+        "🎲 奖励概率",
+        "{}%",
+        (1, 3, 5, 10, 20),
+        "每条有效发言有百分之几的概率获得发言奖励？",
+    ),
     "reward_points": ("🎁 发言奖励", "{} 灵石", (0, 1, 5, 10), "每次奖励多少灵石？0 表示不奖励。"),
-    "reward_daily": ("🔁 每天最多", "{} 次", (1, 3, 5, 10), "每人每天最多领几次发言奖励？"),
+    "reward_daily": (
+        "🔁 每天最多",
+        "{} 次",
+        (1, 3, 5, 10, 0),
+        "每人每天最多领几次发言奖励？0 表示不限。",
+    ),
     "crit_percent": ("⚡ 暴击率", "{}%", (0, 5, 10, 20), "发言奖励暴击的概率是百分之几？"),
     "crit_times": ("✖️ 暴击倍数", "{} 倍", (2, 3, 5), "暴击时奖励是平时的几倍？"),
     "min_chars": ("✍️ 最少字数", "{} 字", (1, 2, 3, 5), "一条发言至少几个字才算有效发言？"),
@@ -83,8 +95,11 @@ POINT_SETTINGS = {
         "距上一条有效发言至少几秒，才算新的一条？0 表示不限。",
     ),
 }
-OFF_AT_ZERO = {"checkin_points", "reward_points"}
+# How a 0 reads where it means more than the number.
+ZERO_TEXT = {"checkin_points": "关", "reward_points": "关", "reward_daily": "不限"}
 BALANCE_STEPS = (10, 50, 100, -10, -50, -100)
+POINT_KEYS = ("points", *POINT_SETTINGS)  # the settings on the 灵石 page
+CHANGES_SHOWN = 15
 NOT_MANAGER = "只有该群的管理员可以管理抽奖。"
 NOT_SUPER = "只有超级管理员可以设置中奖加成。"
 NOT_BANKER = "只有超级管理员可以修改余额和导出流水。"
@@ -98,6 +113,7 @@ BUTTON_STEPS = {
     "fr": "since",
     "pe": "rank",
     "mm": "minimum",
+    "co": "cost",
     "c": "count",
     "mode": "mode",
     "t": "time",
@@ -106,7 +122,18 @@ BUTTON_STEPS = {
     "tt": "title",
     **dict.fromkeys(("more", "to", "cur", "pub", "wz"), "confirm"),
 }
-TYPED_STEPS = {"prize", "count", "time", "target", "keyword", "title", "since", "rank", "minimum"}
+TYPED_STEPS = {
+    "prize",
+    "count",
+    "time",
+    "target",
+    "keyword",
+    "title",
+    "since",
+    "rank",
+    "minimum",
+    "cost",
+}
 
 
 def button(text, data):
@@ -197,9 +224,23 @@ def setting_text(value):
 
 
 def point_value(key, value):
-    if value == 0 and key in OFF_AT_ZERO:
-        return "关"
+    if value == 0 and key in ZERO_TEXT:
+        return ZERO_TEXT[key]
     return POINT_SETTINGS[key][1].format(value)
+
+
+def change_text(change, timezone):
+    """One change to a group setting, as "01-15 16:00 张三：🎲 奖励概率 5% → 8%"."""
+    key = change["key"]
+    if key in POINT_SETTINGS:
+        label, shown = POINT_SETTINGS[key][0], functools.partial(point_value, key)
+    else:
+        label = SETTINGS[key][0] if key in SETTINGS else "💎 灵石功能"
+        shown = setting_text
+    who = name_text(change["actor_name"]) or f"用户 {change['actor_id']}"
+    when = datetime.fromtimestamp(change["at"], timezone)
+    before, after = shown(change["before"]), shown(change["after"])
+    return f"{when:%m-%d %H:%M} {who}：{label} {before} → {after}"
 
 
 def number(text, name, low, high):
@@ -217,9 +258,26 @@ class Menu:
         # user_id -> (kind, raffle_id or chat_id, user_id or setting or None, page): a page
         # waiting for a typed answer. Any button press or /start drops it; a restart forgets it.
         self._asking = {}
+        # user_id -> the name they last used the menu under, for the record of setting changes.
+        self._names = {}
 
     def user_lock(self, user_id):
         return self.handlers.user_lock(user_id)
+
+    def saw(self, user):
+        self._names[user.id] = name_text(getattr(user, "full_name", "") or "")
+
+    async def set_setting(self, user_id, chat_id, key, value):
+        """Change a group setting as user_id, who goes into the record of changes."""
+        change = functools.partial(
+            self.store.set_group_setting,
+            chat_id,
+            key,
+            value,
+            actor=user_id,
+            actor_name=self._names.get(user_id, ""),
+        )
+        await asyncio.to_thread(change)
 
     # Permissions
 
@@ -365,6 +423,7 @@ class Menu:
             return
         action, *args = query.data.split(":")[1:]
         self._asking.pop(query.from_user.id, None)
+        self.saw(query.from_user)
         try:
             text, markup = await self.route(context, query.from_user.id, action, args)
         except LotteryError as exc:
@@ -410,8 +469,12 @@ class Menu:
             chat_id = int(args[0])
             await self.require(bot, user_id, chat_id)
             if action == "sv":
-                await self.cycle_setting(chat_id, args[1])
+                await self.cycle_setting(user_id, chat_id, args[1])
             return await self.settings(bot, chat_id)
+        if action == "log":
+            chat_id = int(args[0])
+            await self.require(bot, user_id, chat_id)
+            return await self.changes(chat_id, args[1])
         if action in ("w", "wu", "ws", "wd", "wid", "wc", "export"):
             self.require_super(user_id)
             return await self.weight_action(bot, user_id, action, args)
@@ -423,7 +486,7 @@ class Menu:
             chat_id = int(args[0])
             await self.require(bot, user_id, chat_id)
             return await self.points_action(bot, user_id, action, chat_id, args[1:])
-        if action in ("pb", "pu", "pa", "pid", "px"):
+        if action in ("pb", "pu", "pa", "pid", "pf", "px"):
             if not self.is_super(user_id):
                 raise LotteryError(NOT_BANKER)
             return await self.balance_action(bot, user_id, action, int(args[0]), args[1:])
@@ -525,9 +588,10 @@ class Menu:
     async def text(self, update, context):
         """A typed answer to the current wizard step or weight prompt."""
         message, user = update.effective_message, update.effective_user
+        self.saw(user)
         asking = self._asking.get(user.id)
         if asking:
-            points = asking[0] in ("setting", "balance", "balance_id")
+            points = asking[0] in ("setting", "balance", "balance_id", "balance_find")
             typed = self.points_typed if points else self.weight_typed
             await typed(context.bot, message, user.id, asking)
             return
@@ -561,7 +625,10 @@ class Menu:
                 raise LotteryError(f"中奖总人数不能超过满人开奖人数 {data['target']}。")
             data["prizes"].append([data.pop("pending"), count])
         elif step == "mode":
-            data["mode"] = {"t": "t", "f": "f"}[value]
+            if value == "back":  # 积分抽奖 asks this first, right after the kind
+                del data["kind"]
+            else:
+                data["mode"] = {"t": "t", "f": "f"}[value]
         elif step == "time":
             now = self.store.clock()
             if typed:
@@ -575,7 +642,7 @@ class Menu:
                 raise LotteryError("开奖时间要晚于开始统计发言的时间，请重新输入。")
             data.update(when)
         elif step == "kind":
-            data["kind"] = {"join": "join", "act": "act"}[value]
+            data["kind"] = {"join": "join", "act": "act", "points": "points"}[value]
         elif step == "activity":
             if value == "back":
                 del data["kind"]
@@ -592,6 +659,8 @@ class Menu:
                 data["ranks_done"] = True
         elif step == "minimum":
             data["min_messages"] = number(value, "发言次数", 1, 100_000)
+        elif step == "cost":
+            data["cost"] = number(value, "参与所需灵石", 1, 1_000_000)
         elif step == "target":
             data["target"] = number(value, "满人开奖人数", total, 100_000)
         elif step == "join":
@@ -619,6 +688,16 @@ class Menu:
                 self.ask_keyword,
                 self.ask_title,
             ],
+            "points": [
+                self.ask_mode,
+                self.ask_prizes,
+                self.ask_time,
+                self.ask_target,
+                self.ask_cost,
+                self.ask_join,
+                self.ask_keyword,
+                self.ask_title,
+            ],
             "rank": [self.ask_since, self.ask_time, self.ask_ranks, self.ask_title],
             "reach": [
                 self.ask_since,
@@ -638,11 +717,14 @@ class Menu:
         data["step"] = "kind"
         ask = (
             "🎟 普通抽奖：点按钮或发口令参与\n"
-            "🔥 群活跃抽奖：按发言排名，或发言达到次数参与随机抽奖\n\n"
+            "🔥 群活跃抽奖：按发言排名，或发言达到次数参与随机抽奖\n"
+            "🪙 积分抽奖：用签到、发言得到的灵石报名，参与时扣除\n\n"
             "选择抽奖类型："
         )
         return self.draft_text(data, ask), keyboard(
-            (button("🎟 普通抽奖", "m:k:join"), button("🔥 群活跃抽奖", "m:k:act")), CANCEL_ROW
+            (button("🎟 普通抽奖", "m:k:join"), button("🔥 群活跃抽奖", "m:k:act")),
+            (button("🪙 积分抽奖", "m:k:points"),),
+            CANCEL_ROW,
         )
 
     async def ask_activity(self, chat_id, data):
@@ -673,8 +755,17 @@ class Menu:
         if "mode" in data:
             return None
         data["step"] = "mode"
-        return self.draft_text(data, "怎么开奖？"), keyboard(
-            (button("⏰ 定时开奖", "m:mode:t"), button("👥 满人开奖", "m:mode:f")), CANCEL_ROW
+        ask, back = "怎么开奖？", ()
+        if data["kind"] == "points":
+            ask = (
+                "🪙 积分抽奖：群成员通过签到或发言获得灵石，参与本抽奖会扣除报名所需的灵石。\n"
+                "怎么开奖？"
+            )
+            back = (button("⬅️ 返回选择抽奖类型", "m:mode:back"),)
+        return self.draft_text(data, ask), keyboard(
+            (button("⏰ 定时开奖", "m:mode:t"), button("👥 满人开奖", "m:mode:f")),
+            back,
+            CANCEL_ROW,
         )
 
     async def ask_time(self, chat_id, data):
@@ -742,6 +833,16 @@ class Menu:
         done = (button("👉 结束添加奖品，进入下一步", "m:pe"),) if prizes else ()
         return self.draft_text(data, ask), keyboard(done, CANCEL_ROW)
 
+    async def ask_cost(self, chat_id, data):
+        if "cost" in data:
+            return None
+        data["step"] = "cost"
+        ask = "参与一次需要多少灵石？点按钮或直接发送数字，群友报名时扣除："
+        if not (await asyncio.to_thread(self.store.group_settings, chat_id))["points"]:
+            ask = "⚠️ 本群的灵石功能已关闭，群友现在得不到灵石。\n" + ask
+        choices = [button(f"{n} 灵石", f"m:co:{n}") for n in COSTS]
+        return self.draft_text(data, ask), keyboard(choices, CANCEL_ROW)
+
     async def ask_minimum(self, chat_id, data):
         if "min_messages" in data:
             return None
@@ -764,7 +865,7 @@ class Menu:
         group = await asyncio.to_thread(self.store.group_title, chat_id)
         more = (button("➕ 添加奖品", "m:more"),) if room_for_prize(data) else ()
         bonus = ()
-        if self.is_super(user_id) and data["kind"] == "join":
+        if self.is_super(user_id) and data["kind"] in ("join", "points"):
             # Turning this on shows the bonus notice on the card from the very start, so it
             # does not appear halfway through when the first weight is set.
             bonus = (button(f"⚖️ 中奖加成：{'开' if data.get('weighted') else '关'}", "m:wz"),)
@@ -792,7 +893,10 @@ class Menu:
         kind = data.get("kind")
         if data.get("title"):
             lines.append(data["title"])
-        if kind == "rank":
+        if kind == "points":
+            cost = f" · 参与需 {data['cost']} 灵石" if "cost" in data else ""
+            lines.append(f"├ 类型：积分抽奖{cost}")
+        elif kind == "rank":
             lines.append("├ 类型：群活跃抽奖 · 按发言排名")
         elif kind == "reach":
             need = f"发言满 {data['min_messages']} 次" if "min_messages" in data else "发言达到次数"
@@ -839,11 +943,12 @@ class Menu:
             return "⚠️ 填写的开奖时间已经过了，请重新填写。\n\n" + text, markup
         prizes = data["prizes"]
         kind = data.get("kind", "join")
-        if kind == "join":
+        if kind in ("join", "points"):
             options = {
                 "target": data.get("target"),
                 "weighted": bool(data.get("weighted")) and self.is_super(user_id),
                 "keyword": data.get("keyword") if data["join"] == "k" else None,
+                "cost": data.get("cost"),  # 积分抽奖 is a join raffle that costs 灵石
             }
             minutes = data.get("minutes") or (
                 FULL_DEADLINE_MINUTES if data["mode"] == "f" else None
@@ -869,17 +974,20 @@ class Menu:
             )
         )
         await asyncio.to_thread(self.store.drop_draft, user_id)
-        weights = self.is_super(user_id) and kind == "join"
+        weights = self.is_super(user_id) and kind in ("join", "points")
         back = keyboard(
             (button("⚖️ 设置加成", f"m:w:{rid}:0"),) if weights else (),
             (button("📜 抽奖记录", f"m:list:{chat_id}:0"), button("⬅️ 返回", f"m:g:{chat_id}")),
         )
+        group = await asyncio.to_thread(self.store.group_title, chat_id)
         try:
             await self.handlers.publish_card(bot, rid)
         except TelegramError as exc:
             LOG.warning("抽奖 %s 发到群 %s 失败：%s", rid, chat_id, exc)
-            return "已创建，但没能发到群里。请确认我在群里并能发言，再到抽奖记录里重新发布。", back
-        return "✅ 已发布到群。", back
+            return (
+                f"已创建，但没能发到「{group}」。请确认我在群里并能发言，再到抽奖记录里重新发布。"
+            ), back
+        return f"✅ 已发布到「{group}」。", back
 
     # Group settings
 
@@ -903,13 +1011,36 @@ class Menu:
             )
             if not all(rights.values()):
                 lines.append("缺少的权限请群主在群管理员设置里给机器人打开，否则对应功能不生效。")
+        lines += await self.last_change(chat_id, list(SETTINGS))
         rows = [
             (button(f"{label}：{setting_text(values[key])}", f"m:sv:{chat_id}:{key}"),)
             for key, (label, _) in SETTINGS.items()
         ]
-        return "\n".join(lines), keyboard(*rows, (button("⬅️ 返回", f"m:g:{chat_id}"),))
+        return "\n".join(lines), keyboard(
+            *rows,
+            (button("📜 修改记录", f"m:log:{chat_id}:set"), button("⬅️ 返回", f"m:g:{chat_id}")),
+        )
 
-    async def cycle_setting(self, chat_id, key):
+    async def last_change(self, chat_id, keys):
+        """The line that says who last changed one of these settings, if anyone did."""
+        found = await asyncio.to_thread(self.store.setting_changes, chat_id, keys, 1)
+        return [f"🕘 最近修改：{change_text(found[0], self.handlers.timezone)}"] if found else []
+
+    async def changes(self, chat_id, page):
+        """The latest changes to the settings on the 抽奖设置 ("set") or 灵石 ("pt") page."""
+        keys = {"set": list(SETTINGS), "pt": list(POINT_KEYS)}[page]
+        title = await asyncio.to_thread(self.store.group_title, chat_id)
+        found = await asyncio.to_thread(self.store.setting_changes, chat_id, keys, CHANGES_SHOWN)
+        name = {"set": "抽奖设置", "pt": "灵石设置"}[page]
+        lines = [f"📜 {title} · {name}的修改记录"]
+        lines += [change_text(change, self.handlers.timezone) for change in found] or [
+            "还没有修改过。"
+        ]
+        if len(found) == CHANGES_SHOWN:
+            lines.append(f"只显示最近 {CHANGES_SHOWN} 条。")
+        return "\n".join(lines), keyboard((button("⬅️ 返回", f"m:{page}:{chat_id}"),))
+
+    async def cycle_setting(self, user_id, chat_id, key):
         choices = SETTINGS[key][1]
         current = (await asyncio.to_thread(self.store.group_settings, chat_id))[key]
         after = (
@@ -917,7 +1048,7 @@ class Menu:
             if current in choices
             else choices[0]
         )
-        await asyncio.to_thread(self.store.set_group_setting, chat_id, key, after)
+        await self.set_setting(user_id, chat_id, key, after)
 
     # 灵石 settings, for group admins (route() checks): how 灵石 are earned, and what counts
     # as a message for them and for activity raffles.
@@ -933,7 +1064,7 @@ class Menu:
                 value = int(args[1])
             else:
                 raise ValueError(key)
-            await asyncio.to_thread(self.store.set_group_setting, chat_id, key, value)
+            await self.set_setting(user_id, chat_id, key, value)
         return await self.points_page(bot, user_id, chat_id)
 
     async def points_page(self, bot, user_id, chat_id):
@@ -942,13 +1073,15 @@ class Menu:
         lines = [f"💎 {title} · 灵石设置"]
         if v["points"]:
             checkin = f"每天 {v['checkin_points']} 灵石" if v["checkin_points"] else "关闭"
-            reward = "关闭"
+            reward, crit = "关闭", "关闭"
             if v["reward_points"]:
+                daily = f"每天最多 {v['reward_daily']} 次" if v["reward_daily"] else "每天不限次数"
                 reward = (
-                    f"每 {v['reward_every']} 条有效发言 {v['reward_points']} 灵石，"
-                    f"每天最多 {v['reward_daily']} 次；{v['crit_percent']}% 的概率暴击，"
-                    f"得 {v['crit_times']} 倍"
+                    f"每条有效发言有 {v['reward_chance']}% 的概率得 {v['reward_points']} 灵石，"
+                    f"{daily}"
                 )
+            if v["reward_points"] and v["crit_percent"]:
+                crit = f"得到发言奖励时有 {v['crit_percent']}% 的概率翻 {v['crit_times']} 倍"
             lines += [
                 (
                     "群友在群里发送「签到」「灵石」「灵石榜」使用，机器人的回复按抽奖设置里"
@@ -956,6 +1089,7 @@ class Menu:
                 ),
                 f"📅 签到：{checkin}",
                 f"💬 发言奖励：{reward}",
+                f"⚡ 暴击：{crit}",
             ]
         else:
             lines.append("灵石功能已关闭：群友发送「签到」等不会有回应，发言也不奖励灵石。")
@@ -972,6 +1106,7 @@ class Menu:
             lines.append(f"机器人权限：封禁用户 {'✅' if mute else '❌'}（签到刷屏时禁言）")
             if not mute:
                 lines.append("没有这个权限时，刷屏只警告、不禁言。")
+        lines += await self.last_change(chat_id, list(POINT_KEYS))
         keys = list(POINT_SETTINGS) if v["points"] else ["min_chars", "cooldown"]
         choices = [
             button(f"{POINT_SETTINGS[key][0]}：{point_value(key, v[key])}", f"m:pk:{chat_id}:{key}")
@@ -993,7 +1128,9 @@ class Menu:
                     button("📄 导出流水", f"m:px:{chat_id}"),
                 )
             )
-        rows.append((button("⬅️ 返回", f"m:g:{chat_id}"),))
+        rows.append(
+            (button("📜 修改记录", f"m:log:{chat_id}:pt"), button("⬅️ 返回", f"m:g:{chat_id}"))
+        )
         return "\n".join(lines), keyboard(*rows)
 
     async def point_prompt(self, user_id, chat_id, key):
@@ -1021,6 +1158,10 @@ class Menu:
         page = int(args[-1])
         if action == "pb":
             return await self.balances(chat_id, page)
+        if action == "pf":
+            self._asking[user_id] = ("balance_find", chat_id, None, page)
+            back = keyboard((button("⬅️ 返回", f"m:pb:{chat_id}:{page}"),))
+            return "发送要找的人的名字，写其中几个字就行：", back
         if action == "pid":
             self._asking[user_id] = ("balance_id", chat_id, None, page)
             back = keyboard((button("⬅️ 返回", f"m:pb:{chat_id}:{page}"),))
@@ -1040,7 +1181,13 @@ class Menu:
     async def balances(self, chat_id, page):
         title = await asyncio.to_thread(self.store.group_title, chat_id)
         rows, more = await asyncio.to_thread(self.store.holders, chat_id, page, PAGE_SIZE)
-        lines = [f"✏️ 修改余额 · {title}", "点成员加减灵石，或按用户 ID 修改。每次修改都记入流水。"]
+        lines = [
+            f"✏️ 修改余额 · {title}",
+            (
+                "点成员加减灵石；列表里没有的人可以按名字查找，也可以在群里回复他的消息，"
+                "发「加灵石 50」或「扣灵石 20」。每次修改都记入流水。"
+            ),
+        ]
         if not rows:
             lines.append("还没有人有灵石。")
         people = [
@@ -1060,9 +1207,37 @@ class Menu:
         return "\n".join(lines), keyboard(
             *people,
             nav,
-            (button("➕ 按用户 ID 修改", f"m:pid:{chat_id}:{page}"),),
+            (
+                button("🔍 按名字查找", f"m:pf:{chat_id}:{page}"),
+                button("➕ 按用户 ID 修改", f"m:pid:{chat_id}:{page}"),
+            ),
             (button("⬅️ 返回", f"m:pt:{chat_id}"),),
         )
+
+    async def found_members(self, chat_id, text, page):
+        """The members whose name has `text` in it, to pick one whose 灵石 to change."""
+        rows, more = await asyncio.to_thread(self.store.find_members, chat_id, text)
+        back = (button("⬅️ 返回", f"m:pb:{chat_id}:{page}"),)
+        if not rows:
+            return (
+                f"没找到名字里有「{text}」的人，换几个字再发一次。\n"
+                "机器人只认识在群里发过言或有灵石的人；找不到的话，可以在群里回复他的消息，"
+                "发「加灵石 50」或「扣灵石 20」。"
+            ), keyboard(back)
+        people = [
+            (
+                button(
+                    f"{holder_name(row)[:16]} · {row['balance']} 灵石",
+                    f"m:pu:{chat_id}:{row['user_id']}:{page}",
+                ),
+            )
+            for row in rows
+        ]
+        lines = [f"🔍 名字里有「{text}」的人，点一个加减灵石："]
+        if more:
+            lines.append(f"只列出前 {len(rows)} 个，多写几个字可以缩小范围。")
+        lines.append("也可以接着发别的名字。")
+        return "\n".join(lines), keyboard(*people, back)
 
     async def balance_page(self, chat_id, uid, page):
         """One member's 灵石, with buttons to add or take away."""
@@ -1078,11 +1253,15 @@ class Menu:
     async def points_typed(self, bot, message, user_id, asking):
         kind, chat_id, key, page = asking
         parts = message.text.split()
+        if kind == "balance_find":  # still asking, so another name can be sent
+            text, markup = await self.found_members(chat_id, message.text.strip()[:64], page)
+            await message.reply_text(text, reply_markup=markup)
+            return
         try:
             if kind == "setting":
                 name = POINT_SETTINGS[key][0].split(" ", 1)[1]
                 value = number(message.text.strip(), name, *SETTING_LIMITS[key])
-                await asyncio.to_thread(self.store.set_group_setting, chat_id, key, value)
+                await self.set_setting(user_id, chat_id, key, value)
             else:
                 if kind == "balance":
                     uid, amount = key, message.text.strip()
@@ -1136,6 +1315,8 @@ class Menu:
                 draw_rule(raffle, zone),
                 join_text(raffle["keyword"]),
             ]
+            if raffle["cost"]:
+                lines.append(cost_text(raffle["cost"]))
         else:
             counted = "已发言" if kind == "rank" else "已达标"
             lines = [
@@ -1206,8 +1387,11 @@ class Menu:
         elif action == "cancel":
             if await asyncio.to_thread(self.store.cancel, rid, user_id):
                 await self.handlers.refresh_card(bot, rid)
+                text = f"「{raffle['title']}」抽奖已取消。"
+                if raffle["cost"] and raffle["entries"]:
+                    text += "报名扣除的灵石已全部退还。"
                 try:
-                    sent = await bot.send_message(chat_id, f"「{raffle['title']}」抽奖已取消。")
+                    sent = await bot.send_message(chat_id, text)
                 except TelegramError as exc:
                     LOG.warning("抽奖 %s 的取消通知发送失败：%s", rid, exc)
                 else:

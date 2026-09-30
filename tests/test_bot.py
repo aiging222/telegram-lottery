@@ -811,6 +811,7 @@ def test_group_text_counts_for_activity_raffles(due):
     )
 
     points = Points(handlers)
+    points.randbelow = lambda total: total - 1  # no 灵石 rewards to answer
 
     def say(user_id, at=5, text="大家好", **fields):
         message = SimpleNamespace(
@@ -978,3 +979,60 @@ def test_messages_left_in_an_upgraded_group_are_given_up(due):
     asyncio.run(handlers.cleanup(SimpleNamespace(bot=bot)))
     assert store.due_deletions() == {}
     assert store.view(rid)["chat_id"] == -1001
+
+
+def test_rankings_are_worked_out_once_in_a_while(tmp_path, monkeypatch):
+    now = [1_800_000_000.0]
+    store = Store(tmp_path / "rank.sqlite3", clock=lambda: now[0])
+    handlers = BotHandlers(store, {99}, SHANGHAI)
+    rid = store.create(99, "话痨榜", 1, 60, chat_id=GROUP["id"], kind="rank", prizes=[["a", 1]])
+    worked_out = []
+    ranking = store.ranking
+    monkeypatch.setattr(store, "ranking", lambda r: worked_out.append(r) or ranking(r))
+
+    def press(user_id):
+        query = SimpleNamespace(
+            data=f"rank:{rid}",
+            answer=AsyncMock(),
+            from_user=SimpleNamespace(id=user_id, full_name="x", is_bot=False),
+        )
+        context = SimpleNamespace(bot=fake_bot())
+        asyncio.run(handlers.callback(SimpleNamespace(callback_query=query), context))
+        return query.answer.await_args.args[0]
+
+    assert press(1).endswith("你还没有发言，发言即可参与排名")
+    store.count_message(GROUP["id"], 1, "u1", now[0] + 1)
+    now[0] += 29
+    assert press(1).endswith("你还没有发言，发言即可参与排名")  # shown again for 30 seconds
+    assert press(2).endswith("你还没有发言，发言即可参与排名")
+    assert len(worked_out) == 1
+    now[0] += 1
+    assert press(1).endswith("你：第 1 名 · 1 次")
+    assert len(worked_out) == 2
+    now[0] += 3600  # counting has ended: no ranking any more
+    assert press(1) == "统计已截止，结果以开奖公告为准。"
+
+
+def test_presses_at_once_share_one_ranking(setup):
+    store, _, handlers = setup
+    rid = store.create(99, "话痨榜", 1, 60, chat_id=GROUP["id"], kind="rank", prizes=[["a", 1]])
+    worked_out = []
+
+    def slow(r):
+        worked_out.append(r)
+        time.sleep(0.05)
+        return Store.ranking(store, r)
+
+    store.ranking = slow
+
+    async def crowd():
+        return await asyncio.gather(*(handlers.ranking(rid) for _ in range(10)))
+
+    assert len(asyncio.run(crowd())) == 10
+    assert worked_out == [rid]
+
+
+def test_the_database_uses_write_ahead_logging(setup):
+    store, _, _ = setup
+    with store.reading() as db:
+        assert db.execute("PRAGMA journal_mode").fetchone()[0] == "wal"

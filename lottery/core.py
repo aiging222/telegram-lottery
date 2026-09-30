@@ -17,6 +17,10 @@ class LotteryError(ValueError):
     pass
 
 
+class NotEnoughPoints(LotteryError):
+    """Too few 灵石 to join a raffle that costs them."""
+
+
 def integer(value, name, low=0, high=1_000_000):
     if type(value) is not int or not low <= value <= high:
         raise LotteryError(f"{name}必须为 {low}～{high} 的整数。")
@@ -265,6 +269,28 @@ MIGRATIONS = [
     );
     CREATE INDEX IF NOT EXISTS ledger_by_chat ON ledger(chat_id)
     """,
+    # 14: 积分抽奖, raffles that cost `cost` 灵石 to join. Each participant's `paid` is given
+    # back if the raffle is cancelled; ledger rows name the raffle they were paid into.
+    """
+    ALTER TABLE raffles ADD COLUMN cost INTEGER;
+    ALTER TABLE participants ADD COLUMN paid INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE ledger ADD COLUMN raffle_id INTEGER
+    """,
+    # 15: who changed which group setting, when, and from what (JSON values; `before` is
+    # what applied then, the default if it was never set).
+    """
+    CREATE TABLE IF NOT EXISTS setting_changes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER NOT NULL,
+        key TEXT NOT NULL,
+        before TEXT NOT NULL,
+        after TEXT NOT NULL,
+        actor_id INTEGER NOT NULL,
+        actor_name TEXT NOT NULL,
+        at REAL NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS setting_changes_by_chat ON setting_changes(chat_id)
+    """,
 ]
 # Deletion delays are seconds after posting: 0 deletes at once, None keeps the message.
 GROUP_DEFAULTS = {
@@ -272,13 +298,14 @@ GROUP_DEFAULTS = {
     "pin_result": True,
     "delete_keyword": 60,
     "delete_notices": 600,
-    # 灵石: a check-in a day, and a reward for every reward_every messages, at most
-    # reward_daily a day, multiplied by crit_times with a chance of crit_percent in 100.
+    # 灵石: a check-in a day, and for every message a chance of reward_chance in 100 of a
+    # reward, at most reward_daily a day (0: no limit), multiplied by crit_times with a chance
+    # of crit_percent in 100.
     "points": True,
     "checkin_points": 10,
-    "reward_every": 20,
+    "reward_chance": 5,
     "reward_points": 5,
-    "reward_daily": 5,
+    "reward_daily": 0,
     "crit_percent": 10,
     "crit_times": 2,
     # A message counts, for activity raffles and 灵石 alike, if it has at least min_chars
@@ -288,9 +315,9 @@ GROUP_DEFAULTS = {
 }
 SETTING_LIMITS = {
     "checkin_points": (0, 10_000),
-    "reward_every": (1, 10_000),
+    "reward_chance": (1, 100),
     "reward_points": (0, 10_000),
-    "reward_daily": (1, 1_000),
+    "reward_daily": (0, 1_000),
     "crit_percent": (0, 100),
     "crit_times": (2, 10),
     "min_chars": (1, 100),
@@ -322,6 +349,11 @@ class Store:
         # migrate_chat() are the only writers.
         self._settings = {}
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        with self.reading() as db:
+            # Write-ahead logging: reads and the one write at a time no longer wait for each
+            # other. The mode stays with the file; SQLite keeps it in a -wal file beside the
+            # database until the last connection closes.
+            db.execute("PRAGMA journal_mode = WAL")
         with self.transaction() as db:
             self._migrate(db)
 
@@ -452,6 +484,9 @@ class Store:
                 "UPDATE OR REPLACE points SET chat_id=? WHERE chat_id=?", (new_chat_id, old_chat_id)
             )
             db.execute("UPDATE ledger SET chat_id=? WHERE chat_id=?", (new_chat_id, old_chat_id))
+            db.execute(
+                "UPDATE setting_changes SET chat_id=? WHERE chat_id=?", (new_chat_id, old_chat_id)
+            )
             for row in rows:
                 self.audit(
                     db, row["id"], 0, "migrate_chat", {"before": old_chat_id, "after": new_chat_id}
@@ -509,6 +544,7 @@ class Store:
         kind="join",
         count_from=None,
         min_messages=None,
+        cost=None,
     ):
         """Create a raffle ending after `minutes` or at `deadline`, or earlier once `target`
         people have joined. Menus create it already bound to `chat_id`; `weighted` shows the
@@ -518,7 +554,9 @@ class Store:
 
         A "rank" or "reach" raffle counts the text messages sent in its group from
         `count_from` (default: now) on: "rank" hands its prizes, one per place, to the most
-        active; "reach" draws among those with at least `min_messages`."""
+        active; "reach" draws among those with at least `min_messages`.
+
+        Joining a raffle with a `cost` takes that many of the member's 灵石 in its group."""
         integer(winner_count, "中奖名额", 1, 100)
         if kind not in KINDS:
             raise LotteryError("抽奖类型无效。")
@@ -533,6 +571,10 @@ class Store:
             integer(min_messages, "发言次数", 1, 100_000)
         if kind == "join" and count_from is not None:
             raise LotteryError("只有群活跃抽奖统计发言。")
+        if cost is not None:
+            integer(cost, "参与所需灵石", 1, 1_000_000)
+            if kind != "join" or chat_id is None:
+                raise LotteryError("积分抽奖需要报名参与，并发布到群里。")
         if prizes is not None:
             prizes = [[name.strip(), count] for name, count in prizes]
             if check_prizes(prizes) != winner_count:
@@ -559,8 +601,8 @@ class Store:
                     )
             cursor = db.execute(
                 "INSERT INTO raffles(title,winner_count,deadline,created_by,chat_id,target_count,"
-                "weighted,prizes,keyword,kind,count_from,min_messages) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                "weighted,prizes,keyword,kind,count_from,min_messages,cost) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     title.strip(),
                     winner_count,
@@ -574,6 +616,7 @@ class Store:
                     kind,
                     count_from,
                     min_messages,
+                    cost,
                 ),
             )
             raffle_id = cursor.lastrowid
@@ -589,10 +632,14 @@ class Store:
             }
             if kind != "join":
                 details |= {"kind": kind, "count_from": count_from, "min_messages": min_messages}
+            if cost is not None:
+                details["cost"] = cost
             self.audit(db, raffle_id, actor, "create", details)
             return raffle_id
 
     def join(self, raffle_id, user_id, display_name):
+        """Join user_id: {"paid": 灵石 paid, "balance": 灵石 left or None if it costs none}, or
+        None if they already joined. Raises NotEnoughPoints if they cannot pay."""
         integer(user_id, "用户 ID", 1, 2**63 - 1)
         with self.transaction() as db:
             raffle = self._editable(db, raffle_id)
@@ -601,13 +648,24 @@ class Store:
             if db.execute(
                 "SELECT 1 FROM participants WHERE raffle_id=? AND user_id=?", (raffle_id, user_id)
             ).fetchone():
-                return False
+                return None
             if self._full(db, raffle):
                 raise LotteryError("名额已满，即将开奖。")
+            cost, balance = raffle["cost"] or 0, None
+            if cost:
+                chat_id = raffle["chat_id"]
+                have = self._holder(db, chat_id, user_id, display_name)["balance"]
+                if have < cost:
+                    raise NotEnoughPoints(
+                        f"灵石不足：参与需要 {cost} 灵石，你有 {have} 灵石。"
+                        "发送「签到」或多发言可以获得灵石。"
+                    )
+                balance = self._credit(db, chat_id, user_id, -cost, "raffle", 0, raffle_id)
             db.execute(
-                "INSERT INTO participants VALUES(?,?,?)", (raffle_id, user_id, display_name[:128])
+                "INSERT INTO participants(raffle_id,user_id,display_name,paid) VALUES(?,?,?,?)",
+                (raffle_id, user_id, display_name[:128], cost),
             )
-            return True
+            return {"paid": cost, "balance": balance}
 
     def keyword_raffles(self, chat_id, text):
         """Open raffles of chat_id that people join by sending `text` (any letter case).
@@ -625,7 +683,8 @@ class Store:
             return self._full(db, self._get(db, raffle_id))
 
     def cancel(self, raffle_id, actor):
-        """Call off a raffle that has not been drawn; False if it already was cancelled."""
+        """Call off a raffle that has not been drawn, giving back the 灵石 paid to join it;
+        False if it already was cancelled."""
         with self.transaction() as db:
             raffle = self._get(db, raffle_id)
             if raffle["status"] == "DRAWN":
@@ -633,6 +692,13 @@ class Store:
             if raffle["status"] == "CANCELLED":
                 return False
             db.execute("UPDATE raffles SET status='CANCELLED' WHERE id=?", (raffle_id,))
+            for row in db.execute(
+                "SELECT user_id,paid FROM participants WHERE raffle_id=? AND paid>0", (raffle_id,)
+            ).fetchall():
+                self._holder(db, raffle["chat_id"], row["user_id"])
+                self._credit(
+                    db, raffle["chat_id"], row["user_id"], row["paid"], "refund", actor, raffle_id
+                )
             self.audit(db, raffle_id, actor, "cancel", {})
             return True
 
@@ -816,23 +882,6 @@ class Store:
             self._pending[key] = (count + 1, max(last, at))
             self._names[chat_id, user_id] = display_name[:128]
         return True
-
-    def messages_since(self, chat_id, user_id, since):
-        """How many of user_id's messages in chat_id were counted from `since` on."""
-        minute = int(since // 60)
-        with self.reading() as db:
-            saved = db.execute(
-                "SELECT COALESCE(SUM(count),0) FROM activity "
-                "WHERE chat_id=? AND user_id=? AND minute>=?",
-                (chat_id, user_id, minute),
-            ).fetchone()[0]
-        # A flush between the query and here may leave out a few messages it was saving.
-        with self._pending_lock:
-            return saved + sum(
-                count
-                for (chat, uid, at), (count, _) in self._pending.items()
-                if chat == chat_id and uid == user_id and at >= minute
-            )
 
     def flush_activity(self):
         """Save the counts waiting in memory. Once an hour, also forget counts older than a
@@ -1319,7 +1368,8 @@ class Store:
             self._settings[chat_id] = settings
         return dict(settings)
 
-    def set_group_setting(self, chat_id, key, value):
+    def set_group_setting(self, chat_id, key, value, actor=0, actor_name=""):
+        """Change one of a group's settings, recording who did; False if it was so already."""
         if key not in GROUP_DEFAULTS:
             raise LotteryError("没有这个设置。")
         if key in SETTING_LIMITS:
@@ -1329,18 +1379,43 @@ class Store:
             if row is None:
                 raise LotteryError("机器人还不在这个群里。")
             stored = json.loads(row["settings"]) if row["settings"] else {}
+            before = stored.get(key, GROUP_DEFAULTS[key])
+            if before == value:
+                return False
             stored[key] = value
             db.execute("UPDATE groups SET settings=? WHERE chat_id=?", (encode(stored), chat_id))
+            db.execute(
+                "INSERT INTO setting_changes(chat_id,key,before,after,actor_id,actor_name,at) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (chat_id, key, encode(before), encode(value), actor, actor_name, self.clock()),
+            )
         self._settings.pop(chat_id, None)
+        return True
+
+    def setting_changes(self, chat_id, keys=None, limit=None):
+        """Changes to chat_id's settings (those in `keys`, if given), newest first."""
+        with self.reading() as db:
+            rows = db.execute(
+                "SELECT key,before,after,actor_id,actor_name,at FROM setting_changes "
+                "WHERE chat_id=? ORDER BY id DESC",
+                (chat_id,),
+            ).fetchall()
+        changes = [
+            dict(row) | {"before": json.loads(row["before"]), "after": json.loads(row["after"])}
+            for row in rows
+            if keys is None or row["key"] in keys
+        ]
+        return changes[:limit]
 
     # 灵石: points members earn in each group, kept apart per group. Every change goes into
     # the ledger with the balance after it. `day` is the local date, as "2027-01-15".
 
     def _holder(self, db, chat_id, user_id, display_name=None):
-        """user_id's 灵石 row in chat_id, made at 0 if new; the name is updated when given."""
+        """user_id's 灵石 row in chat_id, made at 0 if new; the name is updated when given,
+        and a new row without one takes the name they last wrote under."""
         db.execute(
             "INSERT OR IGNORE INTO points(chat_id,user_id,display_name) VALUES(?,?,?)",
-            (chat_id, user_id, display_name or ""),
+            (chat_id, user_id, display_name or self._speaker_name(db, chat_id, user_id)),
         )
         if display_name:
             db.execute(
@@ -1351,8 +1426,9 @@ class Store:
             "SELECT * FROM points WHERE chat_id=? AND user_id=?", (chat_id, user_id)
         ).fetchone()
 
-    def _credit(self, db, chat_id, user_id, delta, reason, actor):
-        """Add delta to a balance and write it in the ledger; returns the new balance."""
+    def _credit(self, db, chat_id, user_id, delta, reason, actor, raffle_id=None):
+        """Add delta to a balance and write it in the ledger, with the raffle it was paid
+        into or given back from; returns the new balance."""
         db.execute(
             "UPDATE points SET balance=balance+? WHERE chat_id=? AND user_id=?",
             (delta, chat_id, user_id),
@@ -1361,9 +1437,9 @@ class Store:
             "SELECT balance FROM points WHERE chat_id=? AND user_id=?", (chat_id, user_id)
         ).fetchone()[0]
         db.execute(
-            "INSERT INTO ledger(chat_id,user_id,delta,balance,reason,actor_id,at) "
-            "VALUES(?,?,?,?,?,?,?)",
-            (chat_id, user_id, delta, balance, reason, actor, self.clock()),
+            "INSERT INTO ledger(chat_id,user_id,delta,balance,reason,actor_id,at,raffle_id) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (chat_id, user_id, delta, balance, reason, actor, self.clock(), raffle_id),
         )
         return balance
 
@@ -1397,12 +1473,12 @@ class Store:
         randbelow=secrets.randbelow,
     ):
         """Reward speaking with `amount`, or crit_times as much with a chance of crit_percent
-        in 100, at most `limit` times on `day`: {"amount", "crit", "balance", "rewards"},
-        rewards counting those of the day; None once the limit is reached."""
+        in 100, at most `limit` times on `day` (0: no limit): {"amount", "crit", "balance",
+        "rewards"}, rewards counting those of the day; None once the limit is reached."""
         with self.transaction() as db:
             row = self._holder(db, chat_id, user_id, display_name)
             rewards = row["rewards"] if row["reward_day"] == day else 0
-            if rewards >= limit:
+            if limit and rewards >= limit:
                 return None
             crit = randbelow(100) < crit_percent
             amount *= crit_times if crit else 1
@@ -1435,7 +1511,15 @@ class Store:
                 "SELECT display_name,balance FROM points WHERE chat_id=? AND user_id=?",
                 (chat_id, user_id),
             ).fetchone()
-        return dict(row) if row else {"display_name": "", "balance": 0}
+            if row:
+                return dict(row)
+            return {"display_name": self._speaker_name(db, chat_id, user_id), "balance": 0}
+
+    def _speaker_name(self, db, chat_id, user_id):
+        row = db.execute(
+            "SELECT display_name FROM speakers WHERE chat_id=? AND user_id=?", (chat_id, user_id)
+        ).fetchone()
+        return row[0] if row else ""
 
     def holders(self, chat_id, page, size):
         """One page of chat_id's members with 灵石, the richest first, and whether another
@@ -1467,21 +1551,44 @@ class Store:
             ).fetchone()[0]
         return {"place": ahead + 1, "balance": balance}
 
-    def adjust_points(self, chat_id, actor, user_id, delta):
+    def find_members(self, chat_id, text, limit=10):
+        """Members of chat_id the bot knows, from their messages or 灵石, whose name has
+        `text` in it (Latin letter case aside), the richest first: (rows, whether more)."""
+        self.flush_activity()  # names seen in the last few seconds
+        with self.reading() as db:
+            found = {}
+            for table in ("speakers", "points"):  # the name in points is the newer
+                for row in db.execute(
+                    f"SELECT user_id,display_name FROM {table} "
+                    "WHERE chat_id=? AND instr(lower(display_name),lower(?))>0",
+                    (chat_id, text),
+                ):
+                    found[row["user_id"]] = row["display_name"]
+            balances = dict(
+                db.execute("SELECT user_id,balance FROM points WHERE chat_id=?", (chat_id,))
+            )
+        rows = [
+            {"user_id": uid, "display_name": name, "balance": balances.get(uid, 0)}
+            for uid, name in found.items()
+        ]
+        rows.sort(key=lambda r: (-r["balance"], r["display_name"], r["user_id"]))
+        return rows[:limit], len(rows) > limit
+
+    def adjust_points(self, chat_id, actor, user_id, delta, display_name=None):
         """A super admin adds delta 灵石 to user_id's balance (takes it away if negative);
-        returns the new balance."""
+        returns the new balance. The name, if given, is the one the member now goes by."""
         integer(user_id, "用户 ID", 1, 2**63 - 1)
         integer(delta, "加减的数量", -1_000_000_000, 1_000_000_000)
         if not delta:
             raise LotteryError("加减的数量不能为 0。")
         with self.transaction() as db:
-            balance = self._holder(db, chat_id, user_id)["balance"]
+            balance = self._holder(db, chat_id, user_id, display_name)["balance"]
             if balance + delta < 0:
                 raise LotteryError(f"余额不足：当前 {balance} 灵石，最多扣 {balance}。")
             return self._credit(db, chat_id, user_id, delta, "adjust", actor)
 
     def export_points(self, chat_id):
-        """chat_id's balances and its whole ledger."""
+        """chat_id's balances, its whole ledger and the changes to its settings."""
         title = self.group_title(chat_id)
         with self.reading() as db:
             balances = [
@@ -1495,12 +1602,18 @@ class Store:
             ledger = [
                 dict(r)
                 for r in db.execute(
-                    "SELECT id,user_id,delta,balance,reason,actor_id,at FROM ledger "
+                    "SELECT id,user_id,delta,balance,reason,raffle_id,actor_id,at FROM ledger "
                     "WHERE chat_id=? ORDER BY id",
                     (chat_id,),
                 )
             ]
-        return {"chat_id": chat_id, "title": title, "balances": balances, "ledger": ledger}
+        return {
+            "chat_id": chat_id,
+            "title": title,
+            "balances": balances,
+            "ledger": ledger,
+            "setting_changes": self.setting_changes(chat_id),
+        }
 
     def swap_pinned_result(self, chat_id, message_id):
         """Remember the result just pinned in chat_id; returns the one pinned before."""

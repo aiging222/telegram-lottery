@@ -244,7 +244,7 @@ def test_wizard_publishes_a_timed_raffle(env):
     )
     assert set(buttons) == {"✅ 发布抽奖", "❌ 取消发布", "➕ 添加奖品", "🔄 换个群"}
     text, _ = shown(press(env, OWNER, buttons["✅ 发布抽奖"]))
-    assert text == "✅ 已发布到群。"
+    assert text == "✅ 已发布到「测试群」。"
     (row,), _ = env.store.group_raffles(GROUP, 0, 8)
     raffle = env.store.view(row["id"])
     assert (raffle["title"], raffle["winner_count"], raffle["deadline"]) == (
@@ -325,7 +325,7 @@ def test_wizard_creates_an_activity_ranking(env):
     text, buttons = type_text(env, OWNER, "本周话痨榜")
     assert "├ 奖品：第一名 10USDT、第二名 5USDT" in text
     assert "⚖️ 中奖加成：关" not in buttons
-    assert shown(press(env, OWNER, buttons["✅ 发布抽奖"]))[0] == "✅ 已发布到群。"
+    assert shown(press(env, OWNER, buttons["✅ 发布抽奖"]))[0] == "✅ 已发布到「测试群」。"
     raffle = env.store.view(1)
     assert (raffle["kind"], raffle["winner_count"], raffle["prizes"]) == (
         "rank",
@@ -428,7 +428,7 @@ def test_typed_duration_counts_from_publishing(env):
     press(env, OWNER, "m:j:b")
     press(env, OWNER, "m:tt")
     env.now[0] += 3600  # the admin comes back to the confirmation page an hour later
-    assert shown(press(env, OWNER, "m:pub"))[0] == "✅ 已发布到群。"
+    assert shown(press(env, OWNER, "m:pub"))[0] == "✅ 已发布到「测试群」。"
     assert env.store.view(1)["deadline"] == env.now[0] + 1800
 
 
@@ -448,7 +448,7 @@ def test_typed_date_that_has_passed_is_asked_again(env):
     assert text.endswith("🕒 现在是 2027-01-15 18:00（UTC+08:00）")
     text, _ = shown(press(env, OWNER, buttons["1小时"]))
     assert text.endswith("发布到「测试群」？")
-    assert shown(press(env, OWNER, "m:pub"))[0] == "✅ 已发布到群。"
+    assert shown(press(env, OWNER, "m:pub"))[0] == "✅ 已发布到「测试群」。"
     assert env.store.view(1)["deadline"] == env.now[0] + 3600
 
 
@@ -863,6 +863,7 @@ def test_settings_page(env):
         "📌 置顶开奖公告：开",
         "🧹 删除口令消息：1分钟后",
         "🗑 删除机器人通知：10分钟后",
+        "📜 修改记录",
         "⬅️ 返回",
     ]
     seen = []
@@ -990,7 +991,8 @@ def test_points_settings_for_group_admins(env):
         "群友在群里发送「签到」「灵石」「灵石榜」使用，机器人的回复按抽奖设置里"
         "「删除机器人通知」的时间删除。\n"
         "📅 签到：每天 10 灵石\n"
-        "💬 发言奖励：每 20 条有效发言 5 灵石，每天最多 5 次；10% 的概率暴击，得 2 倍\n"
+        "💬 发言奖励：每条有效发言有 5% 的概率得 5 灵石，每天不限次数\n"
+        "⚡ 暴击：得到发言奖励时有 10% 的概率翻 2 倍\n"
         "✍️ 有效发言：至少 3 个字，距上一条有效发言 5 秒以上。群活跃抽奖也只统计有效发言。\n"
         "机器人权限：封禁用户 ❌（签到刷屏时禁言）\n"
         "没有这个权限时，刷屏只警告、不禁言。"
@@ -998,13 +1000,14 @@ def test_points_settings_for_group_admins(env):
     assert list(buttons) == [
         "💎 灵石功能：开",
         "📅 签到：10 灵石",
-        "💬 发言：每 20 条",
+        "🎲 奖励概率：5%",
         "🎁 发言奖励：5 灵石",
-        "🔁 每天最多：5 次",
+        "🔁 每天最多：不限",
         "⚡ 暴击率：10%",
         "✖️ 暴击倍数：2 倍",
         "✍️ 最少字数：3 字",
         "⏱ 发言间隔：5 秒",
+        "📜 修改记录",
         "⬅️ 返回",
     ]  # balances are for super admins
     text, buttons = shown(press(env, OWNER, buttons["📅 签到：10 灵石"]))
@@ -1021,7 +1024,13 @@ def test_points_settings_for_group_admins(env):
     assert "💬 发言奖励：关闭" in text
     text, buttons = shown(press(env, OWNER, f"m:pv:{GROUP}:points:0"))
     assert "灵石功能已关闭" in text
-    assert list(buttons) == ["💎 灵石功能：关", "✍️ 最少字数：3 字", "⏱ 发言间隔：5 秒", "⬅️ 返回"]
+    assert list(buttons) == [
+        "💎 灵石功能：关",
+        "✍️ 最少字数：3 字",
+        "⏱ 发言间隔：5 秒",
+        "📜 修改记录",
+        "⬅️ 返回",
+    ]
     assert not env.store.group_settings(GROUP)["points"]
     assert press(env, MEMBER, f"m:pv:{GROUP}:points:1").answer.await_args.args[0] == NOT_MANAGER
     assert not env.store.group_settings(GROUP)["points"]
@@ -1073,3 +1082,186 @@ def test_super_admins_adjust_balances(env):
         (7, -20, "adjust"),
         (8, 30, "adjust"),
     ]
+
+
+def test_wizard_publishes_a_points_raffle(env):
+    text, buttons = shown(press(env, OWNER, f"m:new:{GROUP}"))
+    assert "🪙 积分抽奖：用签到、发言得到的灵石报名，参与时扣除" in text
+    text, buttons = shown(press(env, OWNER, buttons["🪙 积分抽奖"]))
+    assert text == HEADER + (
+        "├ 类型：积分抽奖\n\n"
+        "🪙 积分抽奖：群成员通过签到或发言获得灵石，参与本抽奖会扣除报名所需的灵石。\n"
+        "怎么开奖？"
+    )
+    assert list(buttons) == ["⏰ 定时开奖", "👥 满人开奖", "⬅️ 返回选择抽奖类型", "✖ 取消"]
+    text, _ = shown(press(env, OWNER, buttons["⬅️ 返回选择抽奖类型"]))
+    assert text.endswith("选择抽奖类型：")
+    press(env, OWNER, "m:k:points")
+    text, _ = shown(press(env, OWNER, "m:mode:f"))
+    assert text.endswith("请发送奖品名称，例如：1USDT")
+    type_text(env, OWNER, "1usdt")
+    press(env, OWNER, "m:c:2")
+    text, buttons = shown(press(env, OWNER, "m:f:10"))
+    assert text.endswith("参与一次需要多少灵石？点按钮或直接发送数字，群友报名时扣除：")
+    assert list(buttons) == ["10 灵石", "20 灵石", "50 灵石", "100 灵石", "✖ 取消"]
+    assert type_text(env, OWNER, "0")[0] == "参与所需灵石需为 1～1000000 的整数，请重新输入。"
+    text, _ = type_text(env, OWNER, "30")
+    assert "├ 类型：积分抽奖 · 参与需 30 灵石\n" in text
+    assert text.endswith("怎么参与？")
+    press(env, OWNER, "m:j:b")
+    _, buttons = type_text(env, OWNER, "灵石福利")
+    assert set(buttons) == {"✅ 发布抽奖", "❌ 取消发布", "➕ 添加奖品", "🔄 换个群"}
+    press(env, OWNER, "m:pub")
+    raffle = env.store.view(1)
+    assert (raffle["kind"], raffle["cost"], raffle["target_count"]) == ("join", 30, 10)
+    card = env.bot.send_message.await_args
+    assert "🪙 参与需 30 灵石，报名时扣除" in card.args[1]
+    assert labels(card.kwargs["reply_markup"]) == {"🎟 参与抽奖（30 灵石）": "join:1"}
+    text, _ = shown(press(env, OWNER, "m:r:1"))
+    assert "🪙 参与需 30 灵石，报名时扣除" in text
+    env.store.adjust_points(GROUP, ADMIN, 7, 50)
+    env.store.join(1, 7, "Tom")
+    press(env, OWNER, "m:do:cancel:1")
+    notice = env.bot.send_message.await_args.args[1]
+    assert notice == "「灵石福利」抽奖已取消。报名扣除的灵石已全部退还。"
+    assert env.store.holder(GROUP, 7)["balance"] == 50
+
+
+def test_points_raffles_warn_when_the_group_earns_none(env):
+    env.store.set_group_setting(GROUP, "points", False)
+    press(env, OWNER, f"m:new:{GROUP}")
+    press(env, OWNER, "m:k:points")
+    press(env, OWNER, "m:mode:t")
+    type_text(env, OWNER, "1usdt")
+    press(env, OWNER, "m:c:1")
+    text, _ = shown(press(env, OWNER, "m:t:60"))
+    assert "⚠️ 本群的灵石功能已关闭，群友现在得不到灵石。\n参与一次需要多少灵石？" in text
+
+
+def test_super_admins_weigh_points_raffles(env):
+    press(env, ADMIN, f"m:new:{GROUP}")
+    press(env, ADMIN, "m:k:points")
+    press(env, ADMIN, "m:mode:t")
+    type_text(env, ADMIN, "1usdt")
+    press(env, ADMIN, "m:c:1")
+    press(env, ADMIN, "m:t:60")
+    press(env, ADMIN, "m:co:10")
+    press(env, ADMIN, "m:j:b")
+    _, buttons = type_text(env, ADMIN, "积分")
+    assert "⚖️ 中奖加成：关" in buttons
+    _, buttons = shown(press(env, ADMIN, "m:pub"))
+    assert buttons["⚖️ 设置加成"] == "m:w:1:0"
+
+
+def test_daily_rewards_are_unlimited_unless_limited(env):
+    text, buttons = shown(press(env, OWNER, f"m:pk:{GROUP}:reward_daily"))
+    assert text == (
+        "🔁 每天最多：不限\n每人每天最多领几次发言奖励？0 表示不限。\n"
+        "点按钮或直接发送数字（0～1000）："
+    )
+    assert list(buttons) == ["1 次", "3 次", "5 次", "10 次", "不限", "⬅️ 返回"]
+    text, buttons = shown(press(env, OWNER, buttons["5 次"]))
+    assert "💬 发言奖励：每条有效发言有 5% 的概率得 5 灵石，每天最多 5 次\n" in text
+    assert "🔁 每天最多：5 次" in buttons
+    text, buttons = shown(press(env, OWNER, f"m:pv:{GROUP}:reward_daily:0"))
+    assert "🔁 每天最多：不限" in buttons
+    assert env.store.group_settings(GROUP)["reward_daily"] == 0
+
+
+def test_reward_chance_setting(env):
+    text, buttons = shown(press(env, OWNER, f"m:pk:{GROUP}:reward_chance"))
+    assert text == (
+        "🎲 奖励概率：5%\n每条有效发言有百分之几的概率获得发言奖励？\n"
+        "点按钮或直接发送数字（1～100）："
+    )
+    assert list(buttons) == ["1%", "3%", "5%", "10%", "20%", "⬅️ 返回"]
+    text, buttons = type_text(env, OWNER, "8")
+    assert "每条有效发言有 8% 的概率得 5 灵石" in text
+    assert "🎲 奖励概率：8%" in buttons
+    press(env, OWNER, f"m:pv:{GROUP}:crit_percent:0")
+    text, _ = shown(press(env, OWNER, f"m:pt:{GROUP}"))
+    assert "\n⚡ 暴击：关闭\n" in text
+
+
+def test_setting_changes_are_recorded(env):
+    env.statuses[(GROUP, 8)] = ChatMember.ADMINISTRATOR
+
+    def press_as(user_id, name, data):
+        query = query_for(user_id, data)
+        query.from_user.full_name = name
+        asyncio.run(
+            env.menu.callback(SimpleNamespace(callback_query=query), SimpleNamespace(bot=env.bot))
+        )
+        return shown(query)
+
+    text, _ = press_as(OWNER, "张三", f"m:log:{GROUP}:pt")
+    assert text == "📜 测试群 · 灵石设置的修改记录\n还没有修改过。"
+    press_as(OWNER, "张三", f"m:pv:{GROUP}:reward_chance:8")
+    env.now[0] += 60
+    text, buttons = press_as(8, "李四", f"m:pv:{GROUP}:points:0")
+    assert text.endswith("\n🕘 最近修改：01-15 16:01 李四：💎 灵石功能 开 → 关")
+    press_as(8, "李四", f"m:pv:{GROUP}:points:0")  # already off: nothing to record
+    text, buttons = press_as(OWNER, "张三", buttons["📜 修改记录"])
+    assert text == (
+        "📜 测试群 · 灵石设置的修改记录\n"
+        "01-15 16:01 李四：💎 灵石功能 开 → 关\n"
+        "01-15 16:00 张三：🎲 奖励概率 5% → 8%"
+    )
+    assert buttons == {"⬅️ 返回": f"m:pt:{GROUP}"}
+    # The 抽奖设置 page keeps a record of its own.
+    text, _ = press_as(OWNER, "张三", f"m:sv:{GROUP}:delete_keyword")
+    assert "\n🕘 最近修改：01-15 16:01 张三：🧹 删除口令消息 1分钟后 → 立即" in text
+    text, _ = press_as(OWNER, "张三", f"m:log:{GROUP}:set")
+    assert (
+        text == "📜 测试群 · 抽奖设置的修改记录\n01-15 16:01 张三：🧹 删除口令消息 1分钟后 → 立即"
+    )
+    # Typed answers are recorded too, and members may not read the record.
+    press_as(OWNER, "张三", f"m:pk:{GROUP}:checkin_points")
+    type_text(env, OWNER, "20")
+    changes = env.store.setting_changes(GROUP)
+    assert (changes[0]["key"], changes[0]["after"], changes[0]["actor_id"]) == (
+        "checkin_points",
+        20,
+        OWNER,
+    )
+    assert press(env, MEMBER, f"m:log:{GROUP}:pt").answer.await_args.args[0] == NOT_MANAGER
+    press(env, ADMIN, f"m:px:{GROUP}")
+    exported = json.loads(env.bot.send_document.await_args.kwargs["document"].getvalue())
+    assert [c["key"] for c in exported["setting_changes"]] == [
+        "checkin_points",
+        "delete_keyword",
+        "points",
+        "reward_chance",
+    ]
+
+
+def test_publishing_names_the_group_even_when_it_fails(env):
+    fill_wizard(env, OWNER)
+    env.bot.send_message = AsyncMock(side_effect=Forbidden("bot was kicked"))
+    text, buttons = shown(press(env, OWNER, "m:pub"))
+    assert text == "已创建，但没能发到「测试群」。请确认我在群里并能发言，再到抽奖记录里重新发布。"
+    assert "📜 抽奖记录" in buttons
+
+
+def test_super_admins_find_members_by_name(env):
+    env.store.count_message(GROUP, 7, "Tom Lee", NOW)
+    env.store.count_message(GROUP, 8, "Tommy", NOW)
+    env.store.check_in(GROUP, 9, "Jerry", "2027-01-15", 10)
+    _, buttons = shown(press(env, ADMIN, f"m:pb:{GROUP}:0"))
+    text, _ = shown(press(env, ADMIN, buttons["🔍 按名字查找"]))
+    assert text == "发送要找的人的名字，写其中几个字就行："
+    text, buttons = type_text(env, ADMIN, "tom")
+    assert text == "🔍 名字里有「tom」的人，点一个加减灵石：\n也可以接着发别的名字。"
+    assert buttons == {
+        "Tom Lee · 0 灵石": f"m:pu:{GROUP}:7:0",
+        "Tommy · 0 灵石": f"m:pu:{GROUP}:8:0",
+        "⬅️ 返回": f"m:pb:{GROUP}:0",
+    }
+    text, _ = type_text(env, ADMIN, "小明")  # still asking: another name
+    assert text.startswith("没找到名字里有「小明」的人，换几个字再发一次。")
+    text, buttons = shown(press(env, ADMIN, f"m:pu:{GROUP}:7:0"))
+    assert text == "Tom Lee（ID：7）\n💎 0 灵石"
+    text, _ = shown(press(env, ADMIN, buttons["+10"]))
+    assert text == "Tom Lee（ID：7）\n💎 10 灵石"
+    denied = press(env, OWNER, f"m:pf:{GROUP}:0").answer.await_args.args[0]
+    assert denied == "只有超级管理员可以修改余额和导出流水。"

@@ -6,7 +6,14 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from lottery.core import GROUP_DEFAULTS, MIGRATIONS, LotteryError, Store, weighted_draw
+from lottery.core import (
+    GROUP_DEFAULTS,
+    MIGRATIONS,
+    LotteryError,
+    NotEnoughPoints,
+    Store,
+    weighted_draw,
+)
 
 
 @pytest.fixture
@@ -149,7 +156,7 @@ def test_parallel_duplicate_registration(setup):
     store, rid, _ = setup
     with ThreadPoolExecutor(max_workers=8) as pool:
         joined = list(pool.map(lambda _: store.join(rid, 123, "Alice"), range(16)))
-    assert sum(joined) == 1
+    assert sum(map(bool, joined)) == 1
     assert len(store.view(rid)["entries"]) == 1
 
 
@@ -920,11 +927,11 @@ def test_messages_too_quick_do_not_count(setup):
     assert not store.count_message(-100, 1, "Eve", start + 4, cooldown=5)
     assert store.count_message(-100, 2, "Frank", start + 4, cooldown=5)  # everyone apart
     assert store.count_message(-100, 1, "Eve", start + 5, cooldown=5)
-    store.flush_activity()
-    assert store.count_message(-100, 1, "Eve", start + 70, cooldown=5)
-    assert store.messages_since(-100, 1, start) == 3  # saved and not saved yet
-    assert store.messages_since(-100, 1, start + 60) == 1
     assert store.count_message(-100, 1, "Eve", start + 70)  # no cooldown
+    store.flush_activity()
+    with store.reading() as db:
+        counts = db.execute("SELECT user_id,SUM(count) FROM activity GROUP BY user_id")
+        assert dict(counts.fetchall()) == {1: 3, 2: 1}
 
 
 def test_point_settings(setup):
@@ -933,7 +940,7 @@ def test_point_settings(setup):
     assert store.group_settings(-100)["checkin_points"] == 10
     store.set_group_setting(-100, "checkin_points", 20)
     assert store.group_settings(-100)["checkin_points"] == 20
-    for key, value in (("crit_percent", 101), ("reward_every", 0), ("min_chars", "3")):
+    for key, value in (("crit_percent", 101), ("reward_chance", 0), ("min_chars", "3")):
         with pytest.raises(LotteryError):
             store.set_group_setting(-100, key, value)
     # Settings are read for every message, so they are kept in memory, but not stale.
@@ -943,3 +950,79 @@ def test_point_settings(setup):
     store.migrate_chat(-100, -1001)
     assert store.group_settings(-1001)["checkin_points"] == 20
     assert store.group_settings(-100)["checkin_points"] == 10
+
+
+def test_points_raffles_cost_points_to_join(setup):
+    store, _, _ = setup
+    rid = store.create(99, "积分", 1, 60, chat_id=-100, cost=20)
+    store.adjust_points(-100, 99, 1, 15)
+    with pytest.raises(NotEnoughPoints, match="灵石不足：参与需要 20 灵石，你有 15 灵石。"):
+        store.join(rid, 1, "Eve")
+    assert store.view(rid)["entries"] == []
+    store.adjust_points(-100, 99, 1, 35)
+    assert store.join(rid, 1, "Eve") == {"paid": 20, "balance": 30}
+    assert store.join(rid, 1, "Eve") is None  # once each, paid once
+    assert store.holder(-100, 1)["balance"] == 30
+    last = store.export_points(-100)["ledger"][-1]
+    assert (last["delta"], last["reason"], last["raffle_id"]) == (-20, "raffle", rid)
+    free = store.create(99, "免费", 1, 60, chat_id=-100)
+    assert store.join(free, 1, "Eve") == {"paid": 0, "balance": None}
+    for options in ({"chat_id": None}, {"kind": "rank", "prizes": [["a", 1]]}):
+        with pytest.raises(LotteryError, match="积分抽奖需要报名参与"):
+            store.create(99, "x", 1, 60, **({"chat_id": -100, "cost": 5} | options))
+
+
+def test_cancelling_gives_the_points_back(setup):
+    store, _, now = setup
+    rid = store.create(99, "积分", 2, 60, chat_id=-100, cost=20)
+    for uid in (1, 2):
+        store.adjust_points(-100, 99, uid, 50)
+        store.join(rid, uid, f"u{uid}")
+    store.leave_group(-100, 2, now[0])  # gone, with all their 灵石
+    assert store.cancel(rid, 99)
+    assert store.holder(-100, 1)["balance"] == 50
+    assert store.holder(-100, 2)["balance"] == 0
+    assert not store.cancel(rid, 99)  # given back once
+    assert store.holder(-100, 1)["balance"] == 50
+    last = store.export_points(-100)["ledger"][-1]
+    assert (last["user_id"], last["delta"], last["reason"], last["raffle_id"]) == (
+        1,
+        20,
+        "refund",
+        rid,
+    )
+
+
+def test_setting_changes(setup):
+    store, _, now = setup
+    store.remember_group(-100, "甲群")
+    assert store.set_group_setting(-100, "reward_chance", 8, actor=5, actor_name="张三")
+    assert not store.set_group_setting(-100, "reward_chance", 8, actor=5, actor_name="张三")
+    now[0] += 60
+    store.set_group_setting(-100, "pin_card", False, actor=6, actor_name="李四")
+    store.migrate_chat(-100, -1001)
+    changes = store.setting_changes(-1001)
+    assert [(c["key"], c["before"], c["after"], c["actor_name"]) for c in changes] == [
+        ("pin_card", True, False, "李四"),
+        ("reward_chance", 5, 8, "张三"),  # before: the default then
+    ]
+    assert [c["key"] for c in store.setting_changes(-1001, ["pin_card"], 1)] == ["pin_card"]
+
+
+def test_finding_members_by_name(setup):
+    store, _, now = setup
+    store.count_message(-100, 1, "Alice Wang", now[0])  # only spoken, not saved yet
+    store.count_message(-100, 2, "张小三", now[0])
+    store.check_in(-100, 2, "张三", "2027-01-15", 10)  # the name they now go by
+    store.count_message(-200, 3, "张三丰", now[0])  # another group
+    store.count_message(-100, 4, "Anna", now[0])
+    rows, more = store.find_members(-100, "张")
+    assert [(r["user_id"], r["display_name"], r["balance"]) for r in rows] == [(2, "张三", 10)]
+    assert not more
+    assert [r["user_id"] for r in store.find_members(-100, "ALICE")[0]] == [1]
+    rows, more = store.find_members(-100, "a", limit=1)
+    assert ([r["display_name"] for r in rows], more) == (["Alice Wang"], True)  # and Anna
+    # Someone known only from their messages keeps that name once they have 灵石.
+    assert store.holder(-100, 1) == {"display_name": "Alice Wang", "balance": 0}
+    store.adjust_points(-100, 99, 1, 5)
+    assert store.holder(-100, 1) == {"display_name": "Alice Wang", "balance": 5}

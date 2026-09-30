@@ -17,7 +17,13 @@ cd "$1"
 db="$(.venv/bin/python -c 'from dotenv import dotenv_values
 print(dotenv_values(".env").get("DATABASE_PATH") or "data/lottery.sqlite3")')"
 if [ -f "$db" ]; then
-    cp "$db" "$(dirname "$db")/backup-$(date +%Y%m%d-%H%M%S).sqlite3"
+    # SQLite's own backup, which also takes what is still in the -wal file beside it.
+    .venv/bin/python -c 'import sqlite3, sys
+source, backup = sqlite3.connect(sys.argv[1]), sqlite3.connect(sys.argv[2])
+source.backup(backup)
+backup.close()
+source.close()' \
+        "$db" "$(dirname "$db")/backup-$(date +%Y%m%d-%H%M%S).sqlite3"
     ls -t "$(dirname "$db")"/backup-*.sqlite3 | tail -n +6 | while IFS= read -r old; do
         rm -- "$old"
     done

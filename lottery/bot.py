@@ -20,7 +20,7 @@ from telegram.ext import (
     filters,
 )
 
-from lottery.core import MAX_KEYWORD, LotteryError, Store, integer
+from lottery.core import MAX_KEYWORD, LotteryError, NotEnoughPoints, Store, integer
 from lottery.menu import MANAGERS, Menu, one_at_a_time, presser, sender
 from lottery.points import Points
 from lottery.views import (
@@ -29,6 +29,7 @@ from lottery.views import (
     chances,
     chunks,
     export_file,
+    joined_text,
     name_text,
     result_text,
     standing_text,
@@ -44,6 +45,7 @@ ALLOWED_UPDATES = ["message", "callback_query", "chat_member", "my_chat_member"]
 AUTO_DRAW_SECONDS = 30  # how often due raffles are drawn and old messages deleted
 CARD_REFRESH_SECONDS = 5  # joins arriving within this window share one card edit
 SAVE_ACTIVITY_SECONDS = 10  # message counts wait in memory at most this long
+RANKING_SECONDS = 30  # how long a ranking behind the card's 📊 button is shown again
 JOINED_REACTION = "🎉"  # a keyword join is confirmed quietly, with a reaction
 ADMIN_COMMANDS = {
     "new",
@@ -180,6 +182,9 @@ class BotHandlers:
         self._posted_parts = {}
         # user ID -> the lock that keeps that person's updates in order; see one_at_a_time.
         self._user_locks = weakref.WeakValueDictionary()
+        # raffle ID -> (until when, raffle, ranking) for the card's 📊 button; see ranking().
+        self._rankings = {}
+        self._ranking = asyncio.Lock()
 
     def user_lock(self, user_id):
         lock = self._user_locks.get(user_id)
@@ -377,11 +382,11 @@ class BotHandlers:
                 added = await asyncio.to_thread(
                     self.store.join, rid, query.from_user.id, name_text(query.from_user.full_name)
                 )
-                text = "报名成功！" if added else "你已报名，无需重复报名。"
+                text = joined_text(added)
                 if added:
                     await self.after_join(context, rid)
             elif action == "rank":
-                raffle, ranked = await asyncio.to_thread(self.store.ranking, rid)
+                raffle, ranked = await self.ranking(rid)
                 text = standing_text(raffle, ranked, query.from_user.id)
             else:
                 # Cards published before weights became private still carry this button.
@@ -395,10 +400,25 @@ class BotHandlers:
             # already saved, so there is nothing to retry and nothing to tell the group.
             LOG.warning("按钮应答失败：%s", exc)
 
+    async def ranking(self, rid):
+        """An open activity raffle and its ranking, for the card's 📊 button. Working it out
+        reads every message counted, a second or so in a big group, and many may press at
+        once: whoever presses within RANKING_SECONDS of it being worked out gets the same one,
+        and only one is worked out at a time."""
+        async with self._ranking:
+            now = self.store.clock()
+            found = self._rankings.get(rid)
+            if found is None or found[0] <= now or found[1]["deadline"] <= now:
+                raffle, ranked = await asyncio.to_thread(self.store.ranking, rid)
+                self._rankings = {k: v for k, v in self._rankings.items() if v[0] > now}
+                found = self._rankings[rid] = (now + RANKING_SECONDS, raffle, ranked)
+        return found[1], found[2]
+
     @one_at_a_time(sender)
     async def keyword(self, update, context):
         """Join by sending a raffle's keyword in its group. Whoever writes in the group is a
-        member, so no membership lookup is needed; admins must not post anonymously."""
+        member, so no membership lookup is needed; admins must not post anonymously. Joins
+        that cost 灵石 are answered with what was paid, or why it could not be."""
         message, user = update.effective_message, update.effective_user
         if message is None or user is None or user.is_bot or message.sender_chat:
             return
@@ -409,15 +429,21 @@ class BotHandlers:
         if not rids:
             return
         joined = False
+        notes = []
         for rid in rids:
             try:
                 added = await asyncio.to_thread(
                     self.store.join, rid, user.id, name_text(user.full_name)
                 )
+            except NotEnoughPoints as exc:
+                notes.append(str(exc))
+                continue
             except LotteryError:
                 continue  # full or just closed
             if added:
                 joined = True
+                if added["paid"]:
+                    notes.append(joined_text(added))
                 await self.after_join(context, rid)
         settings = await asyncio.to_thread(self.store.group_settings, message.chat.id)
         if joined and settings["delete_keyword"] != 0:
@@ -425,6 +451,10 @@ class BotHandlers:
                 await message.set_reaction(JOINED_REACTION)
             except TelegramError as exc:
                 LOG.info("报名成功的表情回应失败：%s", exc)
+        if notes:
+            sent = await reply(message, "\n".join(notes))
+            ids = [part.message_id for part in sent]
+            await self.tidy(context.bot, message.chat.id, ids, "delete_notices")
         await self.tidy(context.bot, message.chat.id, [message.message_id], "delete_keyword")
 
     async def save_activity(self, _context):
@@ -585,6 +615,7 @@ class BotHandlers:
 
     async def refresh_card(self, bot, rid):
         """Redraw the group card in place: participant count, status and button."""
+        self._rankings.pop(rid, None)  # frozen, drawn or cancelled: no ranking to show
         raffle = await asyncio.to_thread(self.store.view, rid)
         if raffle["card_message_id"] is None or raffle["chat_id"] is None:
             return

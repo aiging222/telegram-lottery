@@ -67,6 +67,19 @@ def counting_text(count_from, timezone):
     return f"📊 统计 {when_text(count_from, timezone)} 起的文字发言"
 
 
+def joined_text(joined):
+    """The answer to joining: store.join()'s result."""
+    if not joined:
+        return "你已报名，无需重复报名。"
+    if joined["paid"]:
+        return f"报名成功，扣除 {joined['paid']} 灵石，剩余 {joined['balance']} 灵石。"
+    return "报名成功！"
+
+
+def cost_text(cost):
+    return f"🪙 参与需 {cost} 灵石，报名时扣除"
+
+
 def join_text(keyword):
     return f"在群里发送「{keyword}」参与" if keyword else "点按钮参与"
 
@@ -88,6 +101,8 @@ def card(raffle, timezone):
         lines.append(f"🏆 {prize_text(raffle['prizes'], kind)}")
     if kind == "join":
         lines.append(f"中奖 {raffle['winner_count']} 人 · 已参与 {len(raffle['entries'])} 人")
+        if raffle.get("cost"):
+            lines.append(cost_text(raffle["cost"]))
     else:
         lines += [
             activity_rule(kind, raffle["winner_count"], raffle["min_messages"]),
@@ -106,8 +121,9 @@ def card(raffle, timezone):
         elif raffle["keyword"]:
             lines.append(f"👉 {join_text(raffle['keyword'])}")
         else:
+            label = f"🎟 参与抽奖（{raffle['cost']} 灵石）" if raffle.get("cost") else "🎟 参与抽奖"
             markup = InlineKeyboardMarkup(
-                [[InlineKeyboardButton("🎟 参与抽奖", callback_data=f"join:{raffle['id']}")]]
+                [[InlineKeyboardButton(label, callback_data=f"join:{raffle['id']}")]]
             )
     elif raffle["status"] == "OPEN":
         lines.append("尚未在群里发布，暂不能报名。")
@@ -179,13 +195,14 @@ def checkin_text(got):
 
 
 def reward_text(name, got, limit):
-    """The group notice for a message reward."""
+    """The group notice for a message reward; limit is the day's, 0 for none."""
     head = "⚡ 暴击！" if got["crit"] else "💬 "
-    return f"{head}{name} 活跃发言，获得 {got['amount']} 灵石（今日 {got['rewards']}/{limit}）"
+    count = f"今日 {got['rewards']}/{limit}" if limit else f"今日第 {got['rewards']} 次"
+    return f"{head}{name} 活跃发言，获得 {got['amount']} 灵石（{count}）"
 
 
-def wallet_text(name, wallet, settings, spoken):
-    """A member's answer to 「灵石」; spoken is how many of their messages counted today."""
+def wallet_text(name, wallet, settings):
+    """A member's answer to 「灵石」."""
     lines = [f"💎 {name} 的灵石：{wallet['balance']}"]
     if settings["checkin_points"]:
         lines.append(
@@ -194,10 +211,13 @@ def wallet_text(name, wallet, settings, spoken):
             else f"📅 今日未签到，发送「签到」领取 {settings['checkin_points']} 灵石"
         )
     if settings["reward_points"]:
-        limit, every = settings["reward_daily"], settings["reward_every"]
-        line = f"💬 今日发言奖励 {wallet['rewards']}/{limit} 次"
-        if wallet["rewards"] < limit:
-            line += f"，再发 {every - spoken % every} 条发言可领下一次"
+        limit = settings["reward_daily"]
+        taken = f"{wallet['rewards']}/{limit}" if limit else f"{wallet['rewards']}"
+        line = f"💬 今日发言奖励 {taken} 次"
+        if limit and wallet["rewards"] >= limit:
+            line += "，已领满"
+        else:
+            line += f"，每条有效发言有 {settings['reward_chance']}% 的机会获得"
         lines.append(line)
     return "\n".join(lines)
 
