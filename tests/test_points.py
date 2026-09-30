@@ -33,13 +33,13 @@ def env(tmp_path):
     return SimpleNamespace(store=store, handlers=handlers, points=points, bot=bot, now=now)
 
 
-def post(env, user_id, text, at=0, points=None):
+def post(env, user_id, text, at=0, points=None, handle="message", chat_type="supergroup"):
     """A group message sent `at` seconds after NOW, once the bot has handled it."""
     env.now[0] = NOW + at
     message = SimpleNamespace(
         text=text,
         caption=None,
-        chat=SimpleNamespace(id=GROUP, type="supergroup"),
+        chat=SimpleNamespace(id=GROUP, type=chat_type),
         message_id=next(MESSAGE_IDS),
         date=datetime.fromtimestamp(NOW + at, UTC),
         sender_chat=None,
@@ -48,7 +48,8 @@ def post(env, user_id, text, at=0, points=None):
     )
     user = SimpleNamespace(id=user_id, full_name=f"user{user_id}", is_bot=False)
     update = SimpleNamespace(effective_message=message, effective_user=user)
-    asyncio.run((points or env.points).message(update, SimpleNamespace(bot=env.bot)))
+    handler = getattr(points or env.points, handle)
+    asyncio.run(handler(update, SimpleNamespace(bot=env.bot)))
     return message
 
 
@@ -72,6 +73,19 @@ def test_checking_in(env):
     assert say(env, 1, "签到", at=MIDNIGHT - NOW).startswith("✅ 签到成功")
     # A restart forgets who checked in, but the database does not.
     assert say(env, 1, "签到", at=MIDNIGHT - NOW + 600, points=Points(env.handlers)) == ALREADY
+
+
+def test_checking_in_by_command(env):
+    def command(user_id, at=0, **options):
+        call = post(env, user_id, "/checkin", at, handle="command", **options).reply_text
+        return call.await_args.args[0]
+
+    assert command(1).startswith("✅ 签到成功，获得 10 灵石")
+    assert say(env, 1, "签到", at=30) == ALREADY  # one check-in, whichever way
+    assert command(1, at=600) == ALREADY
+    assert command(1, at=700, chat_type="private") == "请在群里发送 /checkin 或「签到」。"
+    env.store.set_group_setting(GROUP, "points", False)
+    assert command(2, at=800) == POINTS_OFF
 
 
 def test_answers_are_tidied_away_with_the_question(env):

@@ -103,6 +103,7 @@ PUBLIC_HELP = """🎁 抽奖机器人
 /result 抽奖ID — 在发布群里查看开奖结果
 /id — 查看自己的用户 ID
 /link — 在群里领取自己的专属邀请链接，查看自己邀请了多少人
+/checkin — 在群里每日签到领灵石，和发「签到」一样
 在群里发送「签到」领灵石，「灵石」查看自己的灵石，「灵石榜」看排行。"""
 ADMIN_HELP = """
 
@@ -803,22 +804,24 @@ class BotHandlers:
             await self.restore_panel(bot, chat_id)
 
     async def publish_card(self, bot, rid):
-        """Post the card to the raffle's group and remember it for later edits."""
+        """Post the card to the raffle's group and remember it for later edits; False if the
+        group wants cards pinned and this one could not be."""
         raffle = await asyncio.to_thread(self.store.view, rid)
         text, markup = card(raffle, self.timezone)
         sent = await bot.send_message(raffle["chat_id"], text, reply_markup=markup)
         self.spent(raffle["chat_id"])
-        await self.card_posted(bot, raffle, sent.message_id)
+        return await self.card_posted(bot, raffle, sent.message_id)
 
     async def card_posted(self, bot, raffle, message_id):
-        """Track the newest card of a raffle and pin it in place of the one before."""
+        """Track the newest card of a raffle and pin it in place of the one before; False if
+        the group wants cards pinned and this one could not be."""
         await asyncio.to_thread(self.store.set_card, raffle["id"], message_id)
         chat_id = raffle["chat_id"]
         if not (await asyncio.to_thread(self.store.group_settings, chat_id))["pin_card"]:
-            return
+            return True
         if raffle["card_message_id"] not in (None, message_id):
             await self.unpin(bot, chat_id, raffle["card_message_id"])
-        await self.pin(bot, chat_id, message_id)
+        return await self.pin(bot, chat_id, message_id)
 
     async def pin_result(self, bot, chat_id, message_id):
         """Pin a result announcement; only the group's latest result stays pinned."""
@@ -835,7 +838,7 @@ class BotHandlers:
         try:
             await bot.pin_chat_message(chat_id, message_id, disable_notification=True)
         except TelegramError as exc:
-            LOG.info("群 %s 置顶消息失败：%s", chat_id, exc)
+            LOG.warning("群 %s 置顶消息失败：%s", chat_id, exc)
             return False
         return True
 
@@ -1042,11 +1045,15 @@ class TokenFilter(logging.Filter):
 
 async def register_commands(app):
     # Everything else is done with buttons; the other commands still work when typed.
-    # Groups also list /link, which answers only there.
+    # Groups also list /link and /checkin, which answer only there.
     commands = [BotCommand("start", "打开菜单"), BotCommand("id", "查看我的用户 ID")]
     await app.bot.set_my_commands(commands)
     await app.bot.set_my_commands(
-        [*commands, BotCommand("link", "领取专属邀请链接、查看邀请人数")],
+        [
+            *commands,
+            BotCommand("link", "领取专属邀请链接、查看邀请人数"),
+            BotCommand("checkin", "每日签到"),
+        ],
         scope=BotCommandScopeAllGroupChats(),
     )
 
@@ -1075,6 +1082,7 @@ def build_application(settings):
     )
     app.add_handler(CallbackQueryHandler(menu.callback, pattern=r"^m:"))
     points = Points(handlers)
+    app.add_handler(CommandHandler("checkin", points.command))
     app.add_handler(CallbackQueryHandler(points.button, pattern=r"^pts:(checkin|wallet|board)$"))
     app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, handlers.migrate))
     app.add_handler(

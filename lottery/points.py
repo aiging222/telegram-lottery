@@ -153,6 +153,22 @@ class Points:
         return board_text(top, mine, width=10)
 
     @one_at_a_time(sender)
+    async def command(self, update, context):
+        """/checkin: 「签到」 as a command, for the group's command menu, which lists only
+        commands spelled in Latin letters."""
+        message, user = update.effective_message, update.effective_user
+        if message is None or user is None or user.is_bot or message.sender_chat:
+            return
+        if message.chat.type not in ("group", "supergroup"):
+            await self.handlers.say(message, "请在群里发送 /checkin 或「签到」。")
+            return
+        settings = await asyncio.to_thread(self.store.group_settings, message.chat.id)
+        if not settings["points"]:
+            await self.answer(context.bot, message, POINTS_OFF, NO)
+            return
+        await self.check_in(context.bot, message, user, settings, message.date.timestamp())
+
+    @one_at_a_time(sender)
     async def message(self, update, context):
         message, user = update.effective_message, update.effective_user
         if message is None or user is None or user.is_bot or message.sender_chat:

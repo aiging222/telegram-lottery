@@ -70,8 +70,10 @@ def place(index):
 
 
 def prize_text(prizes, kind="join"):
+    """The prizes, as 「第一名奖品：a；第二名奖品：b」 for a ranking, so that nobody takes a
+    prize for the name of whoever came first; otherwise as 「a ×2、b ×1」."""
     if kind == "rank":
-        return "、".join(f"{place(i)} {name}" for i, (name, _) in enumerate(prizes))
+        return "；".join(f"{place(i)}奖品：{name}" for i, (name, _) in enumerate(prizes))
     return "、".join(f"{name} ×{count}" for name, count in prizes)
 
 

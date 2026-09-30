@@ -149,6 +149,10 @@ NOT_MANAGER = "只有该群的管理员可以管理抽奖。"
 NOT_SUPER = "只有超级管理员可以设置中奖加成。"
 NOT_BANKER = "只有超级管理员可以修改余额和导出流水。"
 EXPIRED = "操作已过期，请重新开始。"
+NOT_PINNED = (
+    "但没能置顶，群友往上翻才看得到。请群主在群管理员设置里给机器人打开「置顶消息」权限，"
+    "再到抽奖记录里点「📣 重新发布」。"
+)
 STALE = "这个按钮已过期，请用最新一条消息里的按钮。"
 # The question each creation wizard button answers. Buttons left on earlier messages count
 # only while the draft is still at that question, so they cannot undo later answers.
@@ -1243,7 +1247,9 @@ class Menu:
             since = data["count_from"] and when_text(data["count_from"], self.handlers.timezone)
             lines.append(f"├ 统计：从{f' {since} ' if since else '抽奖发布时'}起的文字发言")
         if data["prizes"]:
-            lines.append(f"├ 奖品：{prize_text(data['prizes'], INVITE_KINDS.get(kind, kind))}")
+            ranked = INVITE_KINDS.get(kind, kind) == "rank"  # each place says it is a prize
+            prizes = prize_text(data["prizes"], "rank" if ranked else "join")
+            lines.append(f"├ {prizes}" if ranked else f"├ 奖品：{prizes}")
         if data.get("target") or data.get("minutes") or data.get("deadline"):
             rule = draw_rule(
                 {
@@ -1359,12 +1365,14 @@ class Menu:
         )
         group = await asyncio.to_thread(self.store.group_title, chat_id)
         try:
-            await self.handlers.publish_card(bot, rid)
+            pinned = await self.handlers.publish_card(bot, rid)
         except TelegramError as exc:
             LOG.warning("抽奖 %s 发到群 %s 失败：%s", rid, chat_id, exc)
             return (
                 f"已创建，但没能发到「{group}」。请确认我在群里并能发言，再到抽奖记录里重新发布。"
             ), back
+        if not pinned:
+            return f"✅ 已发布到「{group}」，{NOT_PINNED}", back
         return f"✅ 已发布到「{group}」。", back
 
     # Group settings
@@ -2087,10 +2095,13 @@ class Menu:
         if raffle["status"] != "OPEN":
             raise LotteryError("只有报名中的抽奖可以重新发布。")
         try:
-            await self.handlers.publish_card(bot, rid)
+            pinned = await self.handlers.publish_card(bot, rid)
         except TelegramError as exc:
             raise LotteryError(f"发布失败：{exc}") from None
-        return await self.detail(bot, user_id, rid)
+        text, markup = await self.detail(bot, user_id, rid)
+        if not pinned:
+            text = f"⚠️ 已重新发布，{NOT_PINNED}\n\n{text}"
+        return text, markup
 
     # Weights, for super admins only (route() checks). Participants never see any of this;
     # the group card only says whether the raffle is weighted.

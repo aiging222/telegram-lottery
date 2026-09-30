@@ -317,13 +317,13 @@ def test_wizard_creates_an_activity_ranking(env):
     assert text.endswith("请发送第一名的奖品，例如：1USDT")
     assert "👉 结束添加奖品，进入下一步" not in buttons
     text, buttons = type_text(env, OWNER, "10USDT")
-    assert "├ 奖品：第一名 10USDT" in text
+    assert "├ 第一名奖品：10USDT\n" in text
     assert text.endswith("请发送第二名的奖品，例如：1USDT")
     type_text(env, OWNER, "5USDT")
     text, _ = shown(press(env, OWNER, buttons["👉 结束添加奖品，进入下一步"]))
     assert text.endswith("最后，请发送抽奖活动名称：")
     text, buttons = type_text(env, OWNER, "本周话痨榜")
-    assert "├ 奖品：第一名 10USDT、第二名 5USDT" in text
+    assert "├ 第一名奖品：10USDT；第二名奖品：5USDT\n" in text
     assert "⚖️ 中奖加成：关" not in buttons
     assert shown(press(env, OWNER, buttons["✅ 发布抽奖"]))[0] == "✅ 已发布到「测试群」。"
     raffle = env.store.view(1)
@@ -373,7 +373,10 @@ def test_activity_raffles_in_the_records(env):
     env.store.count_message(GROUP, 7, "Tom", NOW + 30)
     env.now[0] += 90
     text, buttons = shown(press(env, ADMIN, f"m:r:{rid}"))
-    assert "🏆 第一名 a、第二名 b\n💬 按发言次数排名，前 2 名获奖\n2 人中奖 · 已发言 1 人" in text
+    assert (
+        "🏆 第一名奖品：a；第二名奖品：b\n💬 按发言次数排名，前 2 名获奖\n2 人中奖 · 已发言 1 人"
+        in text
+    )
     assert "⚖️ 中奖加成" not in buttons
     text, _ = shown(press(env, ADMIN, buttons["📄 导出记录"]))
     assert text.startswith("话痨榜")
@@ -1350,6 +1353,24 @@ def test_publishing_names_the_group_even_when_it_fails(env):
     text, buttons = shown(press(env, OWNER, "m:pub"))
     assert text == "已创建，但没能发到「测试群」。请确认我在群里并能发言，再到抽奖记录里重新发布。"
     assert "📜 抽奖记录" in buttons
+
+
+def test_admins_hear_when_a_card_could_not_be_pinned(env):
+    fill_wizard(env, OWNER)
+    env.bot.pin_chat_message = AsyncMock(side_effect=BadRequest("Not enough rights"))
+    text, _ = shown(press(env, OWNER, "m:pub"))
+    assert text == (
+        "✅ 已发布到「测试群」，但没能置顶，群友往上翻才看得到。请群主在群管理员设置里"
+        "给机器人打开「置顶消息」权限，再到抽奖记录里点「📣 重新发布」。"
+    )
+    text, _ = shown(press(env, OWNER, "m:repost:1"))
+    assert text.startswith("⚠️ 已重新发布，但没能置顶，群友往上翻才看得到。")
+    env.bot.pin_chat_message = AsyncMock()
+    text, _ = shown(press(env, OWNER, "m:repost:1"))
+    assert text.startswith("坦克300 抽奖  #1 · 报名中")
+    env.store.set_group_setting(GROUP, "pin_card", False)  # asked not to pin: nothing to say
+    env.bot.pin_chat_message = AsyncMock(side_effect=BadRequest("Not enough rights"))
+    assert not shown(press(env, OWNER, "m:repost:1"))[0].startswith("⚠️")
 
 
 def test_super_admins_find_members_by_name(env):

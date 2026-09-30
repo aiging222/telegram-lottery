@@ -319,7 +319,7 @@ def test_build_application_offline(tmp_path, monkeypatch):
         "123456:offline-test-token", frozenset({99}), str(tmp_path / "test.sqlite3"), SHANGHAI
     )
     app = build_application(settings)
-    assert len(app.handlers[0]) == 12
+    assert len(app.handlers[0]) == 13
     assert app.concurrent_updates > 1
     assert {"chat_member", "my_chat_member"} <= set(ALLOWED_UPDATES)
     jobs = [job.callback.__name__ for job in app.job_queue.jobs()]
@@ -930,7 +930,7 @@ def test_group_text_counts_for_activity_raffles(due):
     asyncio.run(handlers.save_activity(None))
     now[0] += 60
     text, markup = card(store.view(ranked), SHANGHAI)
-    assert "🏆 第一名 a、第二名 b\n💬 按发言次数排名，前 2 名获奖" in text
+    assert "🏆 第一名奖品：a；第二名奖品：b\n💬 按发言次数排名，前 2 名获奖" in text
     assert text.endswith("👉 在群里发言即可参与")
     assert markup.inline_keyboard[0][0].callback_data == f"rank:{ranked}"
 
@@ -973,14 +973,17 @@ def test_standing_in_a_reach_raffle_and_its_length():
     assert standing_text(rank, crowd, 8).endswith("你：第 9 名 · 99992 次")
 
 
-def test_the_command_menu_lists_start_and_id_and_link_in_groups():
+def test_the_command_menu_lists_start_and_id_and_link_and_checkin_in_groups():
     bot = SimpleNamespace(set_my_commands=AsyncMock())
     asyncio.run(register_commands(SimpleNamespace(bot=bot)))
     menus = {
         getattr(call.kwargs.get("scope"), "type", "default"): [c.command for c in call.args[0]]
         for call in bot.set_my_commands.await_args_list
     }
-    assert menus == {"default": ["start", "id"], "all_group_chats": ["start", "id", "link"]}
+    assert menus == {
+        "default": ["start", "id"],
+        "all_group_chats": ["start", "id", "link", "checkin"],
+    }
 
 
 def test_preview_shows_corrections(setup):
