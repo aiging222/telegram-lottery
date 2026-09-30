@@ -217,16 +217,19 @@ def local_time(text, timezone):
 def parse_time(text, now, timezone):
     """A typed answer to "when" as the draft field it fills: {"minutes": n} for '90分钟' /
     '2小时' / '3天' / '45' (minutes), counted from publishing like the buttons, or
-    {"deadline": timestamp} for 'YYYY-MM-DD HH:MM' / 'MM-DD HH:MM'."""
+    {"deadline": timestamp} for 'YYYY-MM-DD HH:MM' / 'MM-DD HH:MM'.
+
+    Without a year it is the nearest such date, before or after: in December "01-05" is next
+    January, in early January "12-31" last December. A draw's time that comes out past is
+    refused rather than moved to next year."""
     text = " ".join(text.replace("：", ":").split())
     match = re.fullmatch(r"(\d{1,6}) ?(分钟|分|小时|时|天|m|h|d)?", text, re.IGNORECASE)
     if match:
         return {"minutes": int(match[1]) * UNITS[(match[2] or "分钟").lower()]}
     deadline = local_time(text, timezone)
     if deadline is None:
-        # Without a year it is the nearest such date, so in December "01-05" is next January.
         year = datetime.fromtimestamp(now, timezone).year
-        dates = [local_time(f"{y}-{text}", timezone) for y in (year, year + 1)]
+        dates = [local_time(f"{y}-{text}", timezone) for y in (year - 1, year, year + 1)]
         deadline = min(filter(None, dates), key=lambda d: abs(d - now), default=None)
     if deadline is None:
         raise LotteryError("看不懂这个时间，请按 2026-10-05 20:00 或 2小时 这样输入。")
@@ -700,6 +703,10 @@ class Menu:
             else:
                 when = {"minutes": integer(int(value), "报名时长（分钟）", 1, 525600)}
             deadline = when["deadline"] if "deadline" in when else now + when["minutes"] * 60
+            if deadline < now:
+                raise LotteryError(
+                    "这个时间已经过了，开奖时间不能早于现在，请重新输入；明年的日期请写上年份。"
+                )
             if not now + 60 <= deadline <= now + 525600 * 60:
                 raise LotteryError("开奖时间需在 1 分钟到 365 天之后，请重新输入。")
             if deadline <= (data.get("count_from") or 0):

@@ -339,6 +339,14 @@ def test_wizard_creates_an_activity_ranking(env):
     assert labels(card.kwargs["reply_markup"]) == {"📊 查看我的排名": "rank:1"}
 
 
+def test_counting_may_start_last_year(env):
+    press(env, OWNER, f"m:new:{GROUP}")
+    press(env, OWNER, "m:k:act")
+    press(env, OWNER, "m:ka:rank")
+    text, _ = type_text(env, OWNER, "12-31 18:00")  # fifteen days ago, not this December
+    assert "├ 统计：从 2026-12-31 18:00（UTC+08:00） 起的文字发言" in text
+
+
 def test_wizard_creates_an_activity_draw(env):
     press(env, OWNER, f"m:new:{GROUP}")
     press(env, OWNER, "m:k:act")
@@ -414,6 +422,9 @@ def test_wizard_typed_deadline(env):
     press(env, OWNER, "m:mode:t")
     text, _ = type_text(env, OWNER, "0分钟")
     assert text == "开奖时间需在 1 分钟到 365 天之后，请重新输入。"
+    past = "这个时间已经过了，开奖时间不能早于现在，请重新输入；明年的日期请写上年份。"
+    for gone in ("01-14 20:00", "01-15 15:00", "2027-01-10 12:00"):  # never moved to 2028
+        assert type_text(env, OWNER, gone)[0] == past
     text, _ = type_text(env, OWNER, "01-20 20:00")
     assert "├ 开奖时间：2027-01-20 20:00（UTC+08:00）" in text
 
@@ -576,6 +587,10 @@ def test_a_date_without_year_is_the_nearest_one():
     assert parse_time("01-05 20:00", december, SHANGHAI) == {"deadline": next_january}
     an_hour_ago = datetime(2027, 1, 15, 15, tzinfo=SHANGHAI).timestamp()
     assert parse_time("01-15 15:00", NOW, SHANGHAI) == {"deadline": an_hour_ago}  # not 2028
+    new_year = datetime(2028, 1, 2, 10, tzinfo=SHANGHAI).timestamp()
+    last_december = datetime(2027, 12, 31, 18, tzinfo=SHANGHAI).timestamp()
+    # Two days ago, not next December.
+    assert parse_time("12-31 18:00", new_year, SHANGHAI) == {"deadline": last_december}
 
 
 def test_parse_time_rejects_nonsense():
