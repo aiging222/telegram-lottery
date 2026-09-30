@@ -12,14 +12,17 @@ from datetime import datetime
 from telegram import ChatMember, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest, ChatMigrated, Forbidden, TelegramError
 
-from lottery.core import MAX_PRIZES, LotteryError, check_keyword, integer
+from lottery.core import LOOK_BACK_DAYS, MAX_PRIZES, LotteryError, check_keyword, integer
 from lottery.views import (
     EXPORT_CAPTION,
+    activity_rule,
     chances,
+    counting_text,
     draw_rule,
     export_file,
     join_text,
     name_text,
+    place,
     prize_text,
     status_text,
     when_text,
@@ -34,6 +37,7 @@ FULL_DEADLINE_MINUTES = 7 * 1440  # a raffle that never fills up still ends afte
 COUNTS = (1, 2, 3, 5, 10)
 DURATIONS = (("1小时", 60), ("6小时", 360), ("1天", 1440), ("3天", 4320), ("7天", 10080))
 TARGETS = (10, 50, 100)
+MINIMUMS = (5, 10, 20, 50, 100)
 WEIGHTS = (0, 1, 2, 3, 5, 10)
 UNITS = {"分钟": 1, "分": 1, "m": 1, "小时": 60, "时": 60, "h": 60, "天": 1440, "d": 1440}
 CONFIRM = {
@@ -55,6 +59,11 @@ STALE = "这个按钮已过期，请用最新一条消息里的按钮。"
 # The question each creation wizard button answers. Buttons left on earlier messages count
 # only while the draft is still at that question, so they cannot undo later answers.
 BUTTON_STEPS = {
+    "k": "kind",
+    "ka": "activity",
+    "fr": "since",
+    "pe": "rank",
+    "mm": "minimum",
     "c": "count",
     "mode": "mode",
     "t": "time",
@@ -63,7 +72,7 @@ BUTTON_STEPS = {
     "tt": "title",
     **dict.fromkeys(("more", "to", "cur", "pub", "wz"), "confirm"),
 }
-TYPED_STEPS = {"prize", "count", "time", "target", "keyword", "title"}
+TYPED_STEPS = {"prize", "count", "time", "target", "keyword", "title", "since", "rank", "minimum"}
 
 
 def button(text, data):
@@ -341,7 +350,7 @@ class Menu:
             return await self.wizard_start(bot, user_id, int(args[0]))
         if action == "quit":
             return await self.wizard_quit(user_id)
-        if action in ("c", "mode", "t", "f", "j", "tt", "more", "to", "cur", "pub", "wz"):
+        if action in BUTTON_STEPS:
             return await self.wizard_step(bot, user_id, action, args[0] if args else "")
         if action == "list":
             await self.require(bot, user_id, int(args[0]))
@@ -442,7 +451,14 @@ class Menu:
         elif action == "more":
             if not room_for_prize(data):
                 raise LotteryError("奖品最多 10 种、共 100 人，不超过满人开奖人数。")
-            data["adding"] = True
+            if data["kind"] == "rank":
+                data.pop("ranks_done")
+            else:
+                data["adding"] = True
+        elif action == "pe":
+            if not data["prizes"]:
+                raise LotteryError("请先发送第一名的奖品。")
+            data["ranks_done"] = True
         elif action == "tt":
             self.answer(data, "title", data["prizes"][0][0])
         elif action != "cur":
@@ -488,15 +504,36 @@ class Menu:
             data["prizes"].append([data.pop("pending"), count])
         elif step == "mode":
             data["mode"] = {"t": "t", "f": "f"}[value]
-        elif step == "time" and not typed:
-            data["minutes"] = integer(int(value), "报名时长（分钟）", 1, 525600)
         elif step == "time":
             now = self.store.clock()
-            when = parse_time(value, now, self.handlers.timezone)
+            if typed:
+                when = parse_time(value, now, self.handlers.timezone)
+            else:
+                when = {"minutes": integer(int(value), "报名时长（分钟）", 1, 525600)}
             deadline = when["deadline"] if "deadline" in when else now + when["minutes"] * 60
             if not now + 60 <= deadline <= now + 525600 * 60:
                 raise LotteryError("开奖时间需在 1 分钟到 365 天之后，请重新输入。")
+            if deadline <= (data.get("count_from") or 0):
+                raise LotteryError("开奖时间要晚于开始统计发言的时间，请重新输入。")
             data.update(when)
+        elif step == "kind":
+            data["kind"] = {"join": "join", "act": "act"}[value]
+        elif step == "activity":
+            if value == "back":
+                del data["kind"]
+            else:
+                data["kind"] = {"rank": "rank", "reach": "reach"}[value]
+                data["mode"] = "t"  # drawn at a set time
+        elif step == "since":
+            data["count_from"] = self.since(value)
+        elif step == "rank":
+            if not 1 <= len(value) <= 64:
+                raise LotteryError("奖品名称需为 1～64 字，请重新输入。")
+            data["prizes"].append([value, 1])
+            if len(data["prizes"]) == MAX_PRIZES:
+                data["ranks_done"] = True
+        elif step == "minimum":
+            data["min_messages"] = number(value, "发言次数", 1, 100_000)
         elif step == "target":
             data["target"] = number(value, "满人开奖人数", total, 100_000)
         elif step == "join":
@@ -510,6 +547,57 @@ class Menu:
 
     async def next_prompt(self, user_id, chat_id, data):
         """The next unanswered question; sets data["step"] to it."""
+        if "kind" not in data and (data["prizes"] or "pending" in data):
+            data["kind"] = "join"  # saved before there was a choice of kind
+        questions = {
+            None: [self.ask_kind],
+            "act": [self.ask_activity],
+            "join": [
+                self.ask_prizes,
+                self.ask_mode,
+                self.ask_time,
+                self.ask_target,
+                self.ask_join,
+                self.ask_keyword,
+                self.ask_title,
+            ],
+            "rank": [self.ask_since, self.ask_time, self.ask_ranks, self.ask_title],
+            "reach": [
+                self.ask_since,
+                self.ask_time,
+                self.ask_minimum,
+                self.ask_prizes,
+                self.ask_title,
+            ],
+        }[data.get("kind")]
+        for ask in questions:
+            prompt = await ask(chat_id, data)
+            if prompt:
+                return prompt
+        return await self.ask_confirm(user_id, chat_id, data)
+
+    async def ask_kind(self, chat_id, data):
+        data["step"] = "kind"
+        ask = (
+            "🎟 普通抽奖：点按钮或发口令参与\n"
+            "🔥 群活跃抽奖：按发言排名，或发言达到次数参与随机抽奖\n\n"
+            "选择抽奖类型："
+        )
+        return self.draft_text(data, ask), keyboard(
+            (button("🎟 普通抽奖", "m:k:join"), button("🔥 群活跃抽奖", "m:k:act")), CANCEL_ROW
+        )
+
+    async def ask_activity(self, chat_id, data):
+        data["step"] = "activity"
+        ask = "🔥 群活跃抽奖：按发言排名，或发言达到次数参与随机抽奖。\n选择一种："
+        return self.draft_text(data, ask), keyboard(
+            (button("1️⃣ 根据活跃排名抽奖", "m:ka:rank"),),
+            (button("2️⃣ 达到发言次数参与随机抽奖", "m:ka:reach"),),
+            (button("⬅️ 返回选择抽奖类型", "m:ka:back"),),
+            CANCEL_ROW,
+        )
+
+    async def ask_prizes(self, chat_id, data):
         prizes = data["prizes"]
         total = sum(count for _, count in prizes)
         if "pending" in data:
@@ -521,45 +609,104 @@ class Menu:
             data["step"] = "prize"
             ask = "请发送奖品名称，例如：1USDT" if not prizes else "请发送下一个奖品的名称："
             return self.draft_text(data, ask), keyboard(CANCEL_ROW)
-        if "mode" not in data:
-            data["step"] = "mode"
-            return self.draft_text(data, "怎么开奖？"), keyboard(
-                (button("⏰ 定时开奖", "m:mode:t"), button("👥 满人开奖", "m:mode:f")), CANCEL_ROW
-            )
-        if data["mode"] == "t" and "minutes" not in data and "deadline" not in data:
-            data["step"] = "time"
-            now = when_text(self.store.clock(), self.handlers.timezone)
-            ask = (
-                "什么时候开奖？点按钮，或发送时间，例如 2026-10-05 20:00、90分钟、2小时。\n"
-                f"🕒 现在是 {now}"
-            )
-            choices = [button(label, f"m:t:{m}") for label, m in DURATIONS]
-            return self.draft_text(data, ask), keyboard(*in_rows(choices, 3), CANCEL_ROW)
-        if data["mode"] == "f" and "target" not in data:
-            data["step"] = "target"
-            choices = [button(str(n), f"m:f:{n}") for n in TARGETS if n >= total]
-            ask = f"满多少人开奖？点按钮或直接发送数字（至少 {total}）："
-            return self.draft_text(data, ask), keyboard(choices, CANCEL_ROW)
-        if "join" not in data:
-            data["step"] = "join"
-            return self.draft_text(data, "怎么参与？"), keyboard(
-                (button("🎟 点按钮参与", "m:j:b"), button("💬 发口令参与", "m:j:k")), CANCEL_ROW
-            )
-        if data["join"] == "k" and "keyword" not in data:
-            data["step"] = "keyword"
-            ask = "请发送参与口令，群友在群里发这句话就能参与，例如：帅哥"
-            return self.draft_text(data, ask), keyboard(CANCEL_ROW)
-        if "title" not in data:
-            data["step"] = "title"
-            first = prizes[0][0][:20]
-            return self.draft_text(data, "最后，请发送抽奖活动名称："), keyboard(
-                (button(f"用「{first}」作名称", "m:tt"),), CANCEL_ROW
-            )
+        return None
+
+    async def ask_mode(self, chat_id, data):
+        if "mode" in data:
+            return None
+        data["step"] = "mode"
+        return self.draft_text(data, "怎么开奖？"), keyboard(
+            (button("⏰ 定时开奖", "m:mode:t"), button("👥 满人开奖", "m:mode:f")), CANCEL_ROW
+        )
+
+    async def ask_time(self, chat_id, data):
+        if data["mode"] != "t" or "minutes" in data or "deadline" in data:
+            return None
+        data["step"] = "time"
+        now = when_text(self.store.clock(), self.handlers.timezone)
+        ask = (
+            "什么时候开奖？点按钮，或发送时间，例如 2026-10-05 20:00、90分钟、2小时。\n"
+            f"🕒 现在是 {now}"
+        )
+        choices = [button(label, f"m:t:{m}") for label, m in DURATIONS]
+        return self.draft_text(data, ask), keyboard(*in_rows(choices, 3), CANCEL_ROW)
+
+    async def ask_target(self, chat_id, data):
+        if data["mode"] != "f" or "target" in data:
+            return None
+        data["step"] = "target"
+        total = sum(count for _, count in data["prizes"])
+        choices = [button(str(n), f"m:f:{n}") for n in TARGETS if n >= total]
+        ask = f"满多少人开奖？点按钮或直接发送数字（至少 {total}）："
+        return self.draft_text(data, ask), keyboard(choices, CANCEL_ROW)
+
+    async def ask_join(self, chat_id, data):
+        if "join" in data:
+            return None
+        data["step"] = "join"
+        return self.draft_text(data, "怎么参与？"), keyboard(
+            (button("🎟 点按钮参与", "m:j:b"), button("💬 发口令参与", "m:j:k")), CANCEL_ROW
+        )
+
+    async def ask_keyword(self, chat_id, data):
+        if data["join"] != "k" or "keyword" in data:
+            return None
+        data["step"] = "keyword"
+        ask = "请发送参与口令，群友在群里发这句话就能参与，例如：帅哥"
+        return self.draft_text(data, ask), keyboard(CANCEL_ROW)
+
+    async def ask_since(self, chat_id, data):
+        if "count_from" in data:
+            return None
+        data["step"] = "since"
+        zone = self.handlers.timezone
+        since = await asyncio.to_thread(self.store.activity_since, chat_id)
+        record = (
+            f"本群从 {when_text(since, zone)} 开始记录发言" if since else "本群还没有记录到发言"
+        )
+        ask = (
+            f"发言次数从什么时候开始统计？最早可以选 {LOOK_BACK_DAYS} 天前；"
+            "从抽奖发布时开始统计请发送 0。\n"
+            "格式：2026-09-30 18:41\n"
+            f"📊 {record}，只统计文字消息\n"
+            f"🕒 现在是 {when_text(self.store.clock(), zone)}"
+        )
+        return self.draft_text(data, ask), keyboard(
+            (button("▶️ 从发布时开始", "m:fr:0"),), CANCEL_ROW
+        )
+
+    async def ask_ranks(self, chat_id, data):
+        if data.get("ranks_done"):
+            return None
+        data["step"] = "rank"
+        prizes = data["prizes"]
+        ask = f"请发送{place(len(prizes))}的奖品，例如：1USDT"
+        done = (button("👉 结束添加奖品，进入下一步", "m:pe"),) if prizes else ()
+        return self.draft_text(data, ask), keyboard(done, CANCEL_ROW)
+
+    async def ask_minimum(self, chat_id, data):
+        if "min_messages" in data:
+            return None
+        data["step"] = "minimum"
+        choices = [button(str(n), f"m:mm:{n}") for n in MINIMUMS]
+        ask = "至少发言多少次才能参与抽奖？点按钮或直接发送数字："
+        return self.draft_text(data, ask), keyboard(choices, CANCEL_ROW)
+
+    async def ask_title(self, chat_id, data):
+        if "title" in data:
+            return None
+        data["step"] = "title"
+        first = data["prizes"][0][0][:20]
+        return self.draft_text(data, "最后，请发送抽奖活动名称："), keyboard(
+            (button(f"用「{first}」作名称", "m:tt"),), CANCEL_ROW
+        )
+
+    async def ask_confirm(self, user_id, chat_id, data):
         data["step"] = "confirm"
         group = await asyncio.to_thread(self.store.group_title, chat_id)
         more = (button("➕ 添加奖品", "m:more"),) if room_for_prize(data) else ()
         bonus = ()
-        if self.is_super(user_id):
+        if self.is_super(user_id) and data["kind"] == "join":
             # Turning this on shows the bonus notice on the card from the very start, so it
             # does not appear halfway through when the first weight is set.
             bonus = (button(f"⚖️ 中奖加成：{'开' if data.get('weighted') else '关'}", "m:wz"),)
@@ -569,13 +716,34 @@ class Menu:
             bonus,
         )
 
+    def since(self, value):
+        """When an activity raffle starts counting messages; 0 for when it is published."""
+        if value.strip() == "0":
+            return 0
+        now = self.store.clock()
+        when = parse_time(value, now, self.handlers.timezone)
+        if "deadline" not in when:
+            raise LotteryError("请按 2026-09-30 18:41 这样输入时间，或发送 0。")
+        if not now - LOOK_BACK_DAYS * 86400 <= when["deadline"] <= now + 364 * 86400:
+            raise LotteryError(f"统计开始时间需在 {LOOK_BACK_DAYS} 天前到一年之内，请重新输入。")
+        return when["deadline"]
+
     def draft_text(self, data, ask):
         """The wizard header: what is filled in so far, then the question."""
         lines = ["🎁 发起抽奖（/cancel 退出）", ""]
+        kind = data.get("kind")
         if data.get("title"):
             lines.append(data["title"])
+        if kind == "rank":
+            lines.append("├ 类型：群活跃抽奖 · 按发言排名")
+        elif kind == "reach":
+            need = f"发言满 {data['min_messages']} 次" if "min_messages" in data else "发言达到次数"
+            lines.append(f"├ 类型：群活跃抽奖 · {need}参与抽奖")
+        if "count_from" in data:
+            since = data["count_from"] and when_text(data["count_from"], self.handlers.timezone)
+            lines.append(f"├ 统计：从{f' {since} ' if since else '抽奖发布时'}起的文字发言")
         if data["prizes"]:
-            lines.append(f"├ 奖品：{prize_text(data['prizes'])}")
+            lines.append(f"├ 奖品：{prize_text(data['prizes'], kind)}")
         if data.get("target") or data.get("minutes") or data.get("deadline"):
             rule = draw_rule(
                 {"deadline": self.deadline_of(data), "target_count": data.get("target")},
@@ -612,22 +780,40 @@ class Menu:
             text, markup = await self.advance(user_id, chat_id, data)
             return "⚠️ 填写的开奖时间已经过了，请重新填写。\n\n" + text, markup
         prizes = data["prizes"]
+        kind = data.get("kind", "join")
+        if kind == "join":
+            options = {
+                "target": data.get("target"),
+                "weighted": bool(data.get("weighted")) and self.is_super(user_id),
+                "keyword": data.get("keyword") if data["join"] == "k" else None,
+            }
+            minutes = data.get("minutes") or (
+                FULL_DEADLINE_MINUTES if data["mode"] == "f" else None
+            )
+        else:
+            options = {
+                "kind": kind,
+                "count_from": data["count_from"] or None,  # 0: from now on
+                "min_messages": data.get("min_messages"),
+            }
+            minutes = data.get("minutes")
         rid = await asyncio.to_thread(
-            self.store.create,
-            user_id,
-            data["title"],
-            sum(count for _, count in prizes),
-            data.get("minutes") or (FULL_DEADLINE_MINUTES if data["mode"] == "f" else None),
-            deadline=data.get("deadline"),
-            chat_id=chat_id,
-            target=data.get("target"),
-            weighted=bool(data.get("weighted")) and self.is_super(user_id),
-            prizes=prizes,
-            keyword=data.get("keyword") if data["join"] == "k" else None,
+            functools.partial(
+                self.store.create,
+                user_id,
+                data["title"],
+                sum(count for _, count in prizes),
+                minutes,
+                deadline=data.get("deadline"),
+                chat_id=chat_id,
+                prizes=prizes,
+                **options,
+            )
         )
         await asyncio.to_thread(self.store.drop_draft, user_id)
+        weights = self.is_super(user_id) and kind == "join"
         back = keyboard(
-            (button("⚖️ 设置加成", f"m:w:{rid}:0"),) if self.is_super(user_id) else (),
+            (button("⚖️ 设置加成", f"m:w:{rid}:0"),) if weights else (),
             (button("📜 抽奖记录", f"m:list:{chat_id}:0"), button("⬅️ 返回", f"m:g:{chat_id}")),
         )
         try:
@@ -697,14 +883,26 @@ class Menu:
 
     async def detail(self, bot, user_id, rid):
         raffle = await self.managed_raffle(bot, user_id, rid)
-        lines = [
-            f"{raffle['title']}  #{rid} · {status_text(raffle)}",
-            f"{raffle['winner_count']} 人中奖 · 已参与 {len(raffle['entries'])} 人",
-            draw_rule(raffle, self.handlers.timezone),
-            join_text(raffle["keyword"]),
-        ]
+        kind = raffle["kind"]
+        zone = self.handlers.timezone
+        if kind == "join":
+            lines = [
+                f"{raffle['title']}  #{rid} · {status_text(raffle)}",
+                f"{raffle['winner_count']} 人中奖 · 已参与 {len(raffle['entries'])} 人",
+                draw_rule(raffle, zone),
+                join_text(raffle["keyword"]),
+            ]
+        else:
+            counted = "已发言" if kind == "rank" else "已达标"
+            lines = [
+                f"{raffle['title']}  #{rid} · {status_text(raffle)}",
+                activity_rule(kind, raffle["winner_count"], raffle["min_messages"]),
+                f"{raffle['winner_count']} 人中奖 · {counted} {len(raffle['entries'])} 人",
+                counting_text(raffle["count_from"], zone),
+                draw_rule(raffle, zone),
+            ]
         if raffle["prizes"]:
-            lines.insert(1, f"🏆 {prize_text(raffle['prizes'])}")
+            lines.insert(1, f"🏆 {prize_text(raffle['prizes'], kind)}")
         if raffle["weighted"]:
             lines.append("本场设有中奖加成")
         if raffle["result"]:
@@ -732,8 +930,10 @@ class Menu:
                     button("✖ 取消抽奖", f"m:ask:cancel:{rid}"),
                 )
             )
-        if self.is_super(user_id):
+        if self.is_super(user_id) and kind == "join":
             rows.append((button("⚖️ 中奖加成", f"m:w:{rid}:0"),))
+        elif self.is_super(user_id):
+            rows.append((button("📄 导出记录", f"m:export:{rid}:0"),))
         rows.append((button("⬅️ 返回", f"m:list:{raffle['chat_id']}:0"),))
         return "\n".join(lines), keyboard(*rows)
 
@@ -791,8 +991,10 @@ class Menu:
             await bot.send_document(
                 user_id, document=document, filename=filename, caption=EXPORT_CAPTION
             )
+            if exported["raffle"]["kind"] != "join":  # exported from the records page
+                return await self.detail(bot, user_id, rid)
             return await self.weights(rid, int(args[1]))
-        raffle = await asyncio.to_thread(self.store.view, rid)
+        raffle = self.weighs(await asyncio.to_thread(self.store.view, rid))
         if raffle["status"] != "OPEN":
             raise LotteryError(f"{status_text(raffle)}，权重已锁定。")
         page = int(args[-1])
@@ -829,8 +1031,14 @@ class Menu:
         if not before["weighted"]:
             await self.handlers.refresh_card(bot, before["id"])
 
+    @staticmethod
+    def weighs(raffle):
+        if raffle["kind"] != "join":
+            raise LotteryError("群活跃抽奖按发言次数决定，不能设置权重或指定获奖。")
+        return raffle
+
     async def weights(self, rid, page):
-        raffle = await asyncio.to_thread(self.store.view, rid)
+        raffle = self.weighs(await asyncio.to_thread(self.store.view, rid))
         entries = raffle["entries"]
         odds = chances(entries, raffle["winner_count"])
         adjusted = sum(1 for e in entries if e["override"] is not None or e["tags"])

@@ -300,7 +300,7 @@ def test_build_application_offline(tmp_path, monkeypatch):
     assert app.concurrent_updates > 1
     assert {"chat_member", "my_chat_member"} <= set(ALLOWED_UPDATES)
     jobs = [job.callback.__name__ for job in app.job_queue.jobs()]
-    assert jobs == ["auto_draw", "cleanup", "sync_all_admins"]
+    assert jobs == ["auto_draw", "cleanup", "sync_all_admins", "save_activity"]
 
 
 def test_missing_configuration_fails_closed(monkeypatch, tmp_path):
@@ -793,6 +793,55 @@ def test_designated_winners_are_listed_like_the_others(due):
     announcement = run_auto_draw(handlers).await_args.args[1]
     assert "Bob" in announcement and "Alice" not in announcement
     assert "指定" not in announcement
+
+
+def test_group_text_counts_for_activity_raffles(due):
+    store, rid, now, handlers = due
+    store.cancel(rid, 99)  # only the activity raffle below is due
+    ranked = store.create(
+        99,
+        "话痨榜",
+        2,
+        deadline=now[0] + 3600,
+        chat_id=GROUP["id"],
+        kind="rank",
+        prizes=[["a", 1], ["b", 1]],
+    )
+
+    def say(user_id, **fields):
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=GROUP["id"]),
+            date=datetime.fromtimestamp(now[0] + 5, UTC),
+            sender_chat=fields.pop("sender_chat", None),
+        )
+        user = SimpleNamespace(
+            **{"id": user_id, "full_name": f"u{user_id}", "is_bot": False} | fields
+        )
+        update = SimpleNamespace(effective_message=message, effective_user=user)
+        asyncio.run(handlers.count_message(update, None))
+
+    for user_id in (123, 123, 124):
+        say(user_id)
+    say(125, is_bot=True)
+    say(126, sender_chat=SimpleNamespace(id=GROUP["id"]))  # an anonymous admin
+    asyncio.run(handlers.save_activity(None))
+    now[0] += 60
+    text, markup = card(store.view(ranked), SHANGHAI)
+    assert "🏆 第一名 a、第二名 b\n💬 按发言次数排名，前 2 名获奖" in text
+    assert text.endswith("👉 在群里发言即可参与") and markup is None
+    preview = run_command(handlers, f"/preview {ranked}").reply_text.call_args.args[0]
+    assert "u123 / 123：发言 2 次\nu124 / 124：发言 1 次\n展示前 30 人" in preview
+    now[0] += 3600
+    announcement = run_auto_draw(handlers).await_args.args[1]
+    assert '1. <a href="tg://user?id=123">u123</a> — a（发言 2 次）' in announcement
+    assert '2. <a href="tg://user?id=124">u124</a> — b（发言 1 次）' in announcement
+
+
+def test_activity_raffles_take_no_joins(setup):
+    store, _, handlers = setup
+    rid = store.create(99, "话痨榜", 1, 60, chat_id=GROUP["id"], kind="rank", prizes=[["a", 1]])
+    answer = join_click(handlers, rid, member(ChatMember.MEMBER))
+    assert answer == "这场抽奖在群里发言即可参与，不用报名。"
 
 
 def test_result_names_each_winners_prize():

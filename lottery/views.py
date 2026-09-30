@@ -8,6 +8,7 @@ from io import BytesIO
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 STATUS = {"OPEN": "报名中", "FROZEN": "报名已截止", "DRAWN": "已开奖", "CANCELLED": "已取消"}
+PLACES = "一二三四五六七八九十"
 EXPORT_CAPTION = "完整名单、规则、快照、开奖结果和管理员修改记录。"
 
 
@@ -44,8 +45,26 @@ def chances(entries, winner_count):
     }
 
 
-def prize_text(prizes):
+def place(index):
+    """第一名, 第二名, … for index 0, 1, …"""
+    return f"第{PLACES[index]}名"
+
+
+def prize_text(prizes, kind="join"):
+    if kind == "rank":
+        return "、".join(f"{place(i)} {name}" for i, (name, _) in enumerate(prizes))
     return "、".join(f"{name} ×{count}" for name, count in prizes)
+
+
+def activity_rule(kind, winner_count, min_messages):
+    """How a group activity raffle is won."""
+    if kind == "rank":
+        return f"💬 按发言次数排名，前 {winner_count} 名获奖"
+    return f"💬 发言满 {min_messages} 次即可参与，抽 {winner_count} 人"
+
+
+def counting_text(count_from, timezone):
+    return f"📊 统计 {when_text(count_from, timezone)} 起的文字发言"
 
 
 def join_text(keyword):
@@ -63,18 +82,25 @@ def draw_rule(raffle, timezone):
 def card(raffle, timezone):
     """The group card. Participants see the essentials only; weight details stay private,
     but a weighted raffle always says that it is weighted."""
+    kind = raffle.get("kind", "join")
     lines = [f"🎁 {raffle['title']}  #{raffle['id']}"]
     if raffle["prizes"]:
-        lines.append(f"🏆 {prize_text(raffle['prizes'])}")
-    lines += [
-        f"中奖 {raffle['winner_count']} 人 · 已参与 {len(raffle['entries'])} 人",
-        draw_rule(raffle, timezone),
-    ]
+        lines.append(f"🏆 {prize_text(raffle['prizes'], kind)}")
+    if kind == "join":
+        lines.append(f"中奖 {raffle['winner_count']} 人 · 已参与 {len(raffle['entries'])} 人")
+    else:
+        lines += [
+            activity_rule(kind, raffle["winner_count"], raffle["min_messages"]),
+            counting_text(raffle["count_from"], timezone),
+        ]
+    lines.append(draw_rule(raffle, timezone))
     if raffle["weighted"]:
         lines.append("本场设有中奖加成")
     markup = None
     if raffle["status"] == "OPEN" and raffle["chat_id"] is not None:
-        if raffle["keyword"]:
+        if kind != "join":
+            lines.append("👉 在群里发言即可参与")
+        elif raffle["keyword"]:
             lines.append(f"👉 {join_text(raffle['keyword'])}")
         else:
             markup = InlineKeyboardMarkup(
@@ -94,6 +120,8 @@ def result_text(result, mention=False):
     for index, winner in enumerate(result["winners"], 1):
         name = safe(name_text(winner["display_name"]))
         prize = f" — {safe(winner['prize'])}" if winner.get("prize") else ""
+        if "messages" in winner:  # group activity raffles
+            prize += f"（发言 {winner['messages']} 次）"
         if mention:
             link = f'<a href="tg://user?id={winner["user_id"]}">{name}</a>'
             lines.append(f"{index}. {link}{prize}")

@@ -2,9 +2,11 @@
 
 import hashlib
 import json
+import math
 import re
 import secrets
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -200,6 +202,31 @@ MIGRATIONS = [
         PRIMARY KEY (raffle_id, user_id)
     )
     """,
+    # 11: group activity raffles, won by the text messages sent in the group from count_from
+    # on: "rank" gives the prizes to the most active, "reach" draws among those with at least
+    # min_messages. Messages are counted per member and minute; speakers keeps the name each
+    # member last wrote under and when they last left.
+    """
+    ALTER TABLE raffles ADD COLUMN kind TEXT NOT NULL DEFAULT 'join';
+    ALTER TABLE raffles ADD COLUMN count_from REAL;
+    ALTER TABLE raffles ADD COLUMN min_messages INTEGER;
+    CREATE TABLE IF NOT EXISTS activity (
+        chat_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        minute INTEGER NOT NULL,
+        count INTEGER NOT NULL,
+        last_at REAL NOT NULL,
+        PRIMARY KEY (chat_id, user_id, minute)
+    );
+    CREATE INDEX IF NOT EXISTS activity_by_minute ON activity(chat_id, minute);
+    CREATE TABLE IF NOT EXISTS speakers (
+        chat_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        display_name TEXT NOT NULL,
+        left_at REAL,
+        PRIMARY KEY (chat_id, user_id)
+    )
+    """,
 ]
 # Deletion delays are seconds after posting: 0 deletes at once, None keeps the message.
 GROUP_DEFAULTS = {"pin_card": True, "pin_result": True, "delete_keyword": 60, "delete_notices": 600}
@@ -207,12 +234,22 @@ GROUP_DEFAULTS = {"pin_card": True, "pin_result": True, "delete_keyword": 60, "d
 DELETE_WINDOW = 47 * 3600
 MAX_PRIZES = 10
 MAX_KEYWORD = 32
+# join: people join by button or keyword; rank and reach: group activity raffles.
+KINDS = ("join", "rank", "reach")
+LOOK_BACK_DAYS = 30  # how far back an activity raffle may start counting
+KEEP_ACTIVITY = 31 * 86400
 
 
 class Store:
     def __init__(self, path, clock=time.time):
         self.path = str(path)
         self.clock = clock
+        # Message counts not saved yet: (chat_id, user_id, minute) -> (count, last message
+        # time), and (chat_id, user_id) -> the name last written under. See count_message().
+        self._pending = {}
+        self._names = {}
+        self._pending_lock = threading.Lock()
+        self._purged_at = 0.0
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self.transaction() as db:
             self._migrate(db)
@@ -310,6 +347,7 @@ class Store:
         """Follow Telegram's group-to-supergroup upgrade, which changes the chat ID. The old
         group's messages stay behind, out of the bot's reach, so cards, pins and deletions
         there are forgotten. Returns the raffles whose card was left behind."""
+        self.flush_activity()
         with self.transaction() as db:
             rows = db.execute(
                 "SELECT id,card_message_id FROM raffles WHERE chat_id=?", (old_chat_id,)
@@ -328,6 +366,17 @@ class Store:
                 (new_chat_id, old_chat_id),
             )
             db.execute("DELETE FROM deletions WHERE chat_id=?", (old_chat_id,))
+            db.execute(
+                "INSERT INTO activity SELECT ?,user_id,minute,count,last_at FROM activity "
+                "WHERE chat_id=? ON CONFLICT(chat_id,user_id,minute) DO UPDATE SET "
+                "count=count+excluded.count,last_at=max(last_at,excluded.last_at)",
+                (new_chat_id, old_chat_id),
+            )
+            db.execute("DELETE FROM activity WHERE chat_id=?", (old_chat_id,))
+            db.execute(
+                "UPDATE OR REPLACE speakers SET chat_id=? WHERE chat_id=?",
+                (new_chat_id, old_chat_id),
+            )
             for row in rows:
                 self.audit(
                     db, row["id"], 0, "migrate_chat", {"before": old_chat_id, "after": new_chat_id}
@@ -337,9 +386,15 @@ class Store:
     def leave_group(self, chat_id, user_id, left_at):
         """Cancel user_id's joins in raffles bound to chat_id that were still open at left_at.
 
-        Frozen raffles are untouched: their snapshot is the fixed list of the draw.
+        Frozen raffles are untouched: their snapshot is the fixed list of the draw. Activity
+        raffles leave out whoever left after their last message.
         """
+        self.flush_activity()  # so that the leave comes after every message saved
         with self.transaction() as db:
+            db.execute(
+                "UPDATE speakers SET left_at=? WHERE chat_id=? AND user_id=?",
+                (left_at, chat_id, user_id),
+            )
             ids = [
                 row["id"]
                 for row in db.execute(
@@ -369,13 +424,33 @@ class Store:
         weighted=False,
         prizes=None,
         keyword=None,
+        kind="join",
+        count_from=None,
+        min_messages=None,
     ):
         """Create a raffle ending after `minutes` or at `deadline`, or earlier once `target`
         people have joined. Menus create it already bound to `chat_id`; `weighted` shows the
         bonus notice on the card from the start, before any weight is set. `prizes` are
         handed out in draw order and must add up to `winner_count`; with a `keyword`, people
-        join by sending it in the group."""
+        join by sending it in the group.
+
+        A "rank" or "reach" raffle counts the text messages sent in its group from
+        `count_from` (default: now) on: "rank" hands its prizes, one per place, to the most
+        active; "reach" draws among those with at least `min_messages`."""
         integer(winner_count, "中奖名额", 1, 100)
+        if kind not in KINDS:
+            raise LotteryError("抽奖类型无效。")
+        if kind != "join":
+            if prizes is None or chat_id is None or keyword is not None or target is not None:
+                raise LotteryError("群活跃抽奖需要奖品和发布群，不用口令或满人开奖。")
+            if kind == "rank" and any(count != 1 for _, count in prizes):
+                raise LotteryError("排名抽奖每个名次一份奖品。")
+        if (kind == "reach") != (min_messages is not None):
+            raise LotteryError("只有达到发言次数抽奖需要设置发言次数。")
+        if min_messages is not None:
+            integer(min_messages, "发言次数", 1, 100_000)
+        if kind == "join" and count_from is not None:
+            raise LotteryError("只有群活跃抽奖统计发言。")
         if prizes is not None:
             prizes = [[name.strip(), count] for name, count in prizes]
             if check_prizes(prizes) != winner_count:
@@ -393,9 +468,17 @@ class Store:
                 deadline = now + minutes * 60
             elif not now + 60 <= deadline <= now + 525600 * 60:
                 raise LotteryError("开奖时间需在 1 分钟到 365 天之后。")
+            if kind != "join":
+                if count_from is None:
+                    count_from = now
+                elif not now - LOOK_BACK_DAYS * 86400 <= count_from < deadline:
+                    raise LotteryError(
+                        f"发言最早从 {LOOK_BACK_DAYS} 天前开始统计，且要早于开奖时间。"
+                    )
             cursor = db.execute(
-                "INSERT INTO raffles(title,winner_count,deadline,created_by,chat_id,"
-                "target_count,weighted,prizes,keyword) VALUES(?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO raffles(title,winner_count,deadline,created_by,chat_id,target_count,"
+                "weighted,prizes,keyword,kind,count_from,min_messages) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     title.strip(),
                     winner_count,
@@ -406,31 +489,33 @@ class Store:
                     int(weighted),
                     None if prizes is None else encode(prizes),
                     keyword,
+                    kind,
+                    count_from,
+                    min_messages,
                 ),
             )
             raffle_id = cursor.lastrowid
-            self.audit(
-                db,
-                raffle_id,
-                actor,
-                "create",
-                {
-                    "title": title,
-                    "deadline": deadline,
-                    "winner_count": winner_count,
-                    "chat_id": chat_id,
-                    "target": target,
-                    "weighted": weighted,
-                    "prizes": prizes,
-                    "keyword": keyword,
-                },
-            )
+            details = {
+                "title": title,
+                "deadline": deadline,
+                "winner_count": winner_count,
+                "chat_id": chat_id,
+                "target": target,
+                "weighted": weighted,
+                "prizes": prizes,
+                "keyword": keyword,
+            }
+            if kind != "join":
+                details |= {"kind": kind, "count_from": count_from, "min_messages": min_messages}
+            self.audit(db, raffle_id, actor, "create", details)
             return raffle_id
 
     def join(self, raffle_id, user_id, display_name):
         integer(user_id, "用户 ID", 1, 2**63 - 1)
         with self.transaction() as db:
             raffle = self._editable(db, raffle_id)
+            if raffle["kind"] != "join":
+                raise LotteryError("这场抽奖在群里发言即可参与，不用报名。")
             if db.execute(
                 "SELECT 1 FROM participants WHERE raffle_id=? AND user_id=?", (raffle_id, user_id)
             ).fetchone():
@@ -479,7 +564,7 @@ class Store:
         if default > cap:
             raise LotteryError("默认权重不能超过上限。")
         with self.transaction() as db:
-            before = self._editable(db, raffle_id)
+            before = self._weightable(self._editable(db, raffle_id))
             if (before["default_weight"], before["weight_cap"]) == (default, cap):
                 return False  # already so: no change to record
             maximum = db.execute(
@@ -508,7 +593,7 @@ class Store:
             raise LotteryError("规则名限 1～32 位字母、数字、下划线和短横线。")
         integer(bonus, "加成")
         with self.transaction() as db:
-            self._editable(db, raffle_id)
+            self._weightable(self._editable(db, raffle_id))
             before = db.execute(
                 "SELECT bonus FROM rules WHERE raffle_id=? AND tag=?", (raffle_id, tag)
             ).fetchone()
@@ -533,7 +618,7 @@ class Store:
     def grant(self, raffle_id, actor, user_id, tag, enabled=True):
         integer(user_id, "用户 ID", 1, 2**63 - 1)
         with self.transaction() as db:
-            self._editable(db, raffle_id)
+            self._weightable(self._editable(db, raffle_id))
             if not db.execute(
                 "SELECT 1 FROM rules WHERE raffle_id=? AND tag=?", (raffle_id, tag)
             ).fetchone():
@@ -561,7 +646,7 @@ class Store:
     def override(self, raffle_id, actor, user_id, weight):
         integer(user_id, "用户 ID", 1, 2**63 - 1)
         with self.transaction() as db:
-            raffle = self._editable(db, raffle_id)
+            raffle = self._weightable(self._editable(db, raffle_id))
             if weight is not None:
                 integer(weight, "个人权重", 0, raffle["weight_cap"])
             before = db.execute(
@@ -594,7 +679,7 @@ class Store:
         was so already. Designated winners take the first places and prizes. Unlike weights,
         a designation adds no notice to the card."""
         with self.transaction() as db:
-            raffle = self._editable(db, raffle_id)
+            raffle = self._weightable(self._editable(db, raffle_id))
             if chosen:
                 if not db.execute(
                     "SELECT 1 FROM participants WHERE raffle_id=? AND user_id=?",
@@ -625,8 +710,121 @@ class Store:
             )
             return True
 
+    def _weightable(self, raffle):
+        if raffle["kind"] != "join":
+            raise LotteryError("群活跃抽奖按发言次数决定，不能设置权重或指定获奖。")
+        return raffle
+
     def _mark_weighted(self, db, raffle_id):
         db.execute("UPDATE raffles SET weighted=1 WHERE id=?", (raffle_id,))
+
+    # Group activity: every member's text messages, counted per minute.
+
+    def count_message(self, chat_id, user_id, display_name, at):
+        """Count a member's text message sent at `at`. Counts wait in memory, cheap for every
+        message in every group, until flush_activity() saves them."""
+        key = (chat_id, user_id, int(at // 60))
+        with self._pending_lock:
+            count, last = self._pending.get(key, (0, 0.0))
+            self._pending[key] = (count + 1, max(last, at))
+            self._names[chat_id, user_id] = display_name[:128]
+
+    def flush_activity(self):
+        """Save the counts waiting in memory. Once an hour, also forget counts older than a
+        month, unless an open activity raffle still counts from further back."""
+        with self._pending_lock:
+            pending, self._pending = self._pending, {}
+            names, self._names = self._names, {}
+        now = self.clock()
+        purge = now - self._purged_at >= 3600
+        if not pending and not names and not purge:
+            return
+        try:
+            with self.transaction() as db:
+                db.executemany(
+                    "INSERT INTO activity VALUES(?,?,?,?,?) ON CONFLICT(chat_id,user_id,minute) "
+                    "DO UPDATE SET count=count+excluded.count,last_at=max(last_at,excluded.last_at)",
+                    [(*key, count, last) for key, (count, last) in pending.items()],
+                )
+                db.executemany(
+                    "INSERT INTO speakers(chat_id,user_id,display_name) VALUES(?,?,?) "
+                    "ON CONFLICT(chat_id,user_id) DO UPDATE SET display_name=excluded.display_name",
+                    [(*key, name) for key, name in names.items()],
+                )
+                if purge:
+                    oldest = db.execute(
+                        "SELECT MIN(count_from) FROM raffles WHERE kind!='join' AND status='OPEN'"
+                    ).fetchone()[0]
+                    keep = (
+                        now - KEEP_ACTIVITY if oldest is None else min(now - KEEP_ACTIVITY, oldest)
+                    )
+                    db.execute("DELETE FROM activity WHERE minute<?", (int(keep // 60),))
+                    db.execute(
+                        "DELETE FROM speakers WHERE NOT EXISTS (SELECT 1 FROM activity a "
+                        "WHERE a.chat_id=speakers.chat_id AND a.user_id=speakers.user_id)"
+                    )
+        except BaseException:
+            with self._pending_lock:  # keep them for the next try
+                for key, (count, last) in pending.items():
+                    more, later = self._pending.get(key, (0, 0.0))
+                    self._pending[key] = (count + more, max(last, later))
+                for key, name in names.items():
+                    self._names.setdefault(key, name)
+            raise
+        if purge:
+            self._purged_at = now
+
+    def activity_since(self, chat_id):
+        """When the bot's record of chat_id's messages begins, or None if it has none."""
+        with self.reading() as db:
+            first = db.execute(
+                "SELECT MIN(minute) FROM activity WHERE chat_id=?", (chat_id,)
+            ).fetchone()[0]
+        with self._pending_lock:
+            waiting = [minute for chat, _, minute in self._pending if chat == chat_id]
+        minutes = [minute for minute in (first, *waiting) if minute is not None]
+        return min(minutes) * 60 if minutes else None
+
+    def _speakers(self, db, raffle):
+        """Who wrote in the raffle's group from count_from until the deadline (or now): the
+        most messages first and, among equals, whoever got to that number first. Members
+        who left after their last message there are out; "reach" keeps those with enough."""
+        chat_id = raffle["chat_id"]
+        if chat_id is None:
+            return []
+        start = int(raffle["count_from"] // 60)
+        stop = math.ceil(min(raffle["deadline"], self.clock()) / 60)
+        tally = {
+            row[0]: list(row[1:])
+            for row in db.execute(
+                "SELECT a.user_id,SUM(a.count),MAX(a.last_at),s.display_name,s.left_at "
+                "FROM activity a JOIN speakers s ON s.chat_id=a.chat_id AND s.user_id=a.user_id "
+                "WHERE a.chat_id=? AND a.minute>=? AND a.minute<? GROUP BY a.user_id",
+                (chat_id, start, stop),
+            )
+        }
+        with self._pending_lock:  # counted but not saved yet
+            for (chat, uid, minute), (count, last) in self._pending.items():
+                if chat == chat_id and start <= minute < stop:
+                    spoken = tally.setdefault(uid, [0, 0.0, None, None])
+                    spoken[0] += count
+                    spoken[1] = max(spoken[1], last)
+            names = {uid: name for (chat, uid), name in self._names.items() if chat == chat_id}
+        entries = [
+            {
+                "user_id": uid,
+                "display_name": names.get(uid) or name or str(uid),
+                "messages": count,
+                "reached_at": last,
+                "weight": 1,
+            }
+            for uid, (count, last, name, left) in tally.items()
+            if left is None or left < last
+        ]
+        entries.sort(key=lambda e: (-e["messages"], e["reached_at"], e["user_id"]))
+        if raffle["kind"] == "reach":
+            entries = [e for e in entries if e["messages"] >= raffle["min_messages"]]
+        return entries
 
     def presets(self, raffle_id):
         """Personal weights of people who have not joined, as (user_id, weight)."""
@@ -642,6 +840,8 @@ class Store:
             ]
 
     def _entries(self, db, raffle):
+        if raffle["kind"] != "join":
+            return self._speakers(db, raffle)
         rid = raffle["id"]
         people = db.execute(
             "SELECT * FROM participants WHERE raffle_id=? ORDER BY user_id", (rid,)
@@ -705,6 +905,12 @@ class Store:
             ],
             "entries": self._entries(db, raffle),
         }
+        if raffle["kind"] != "join":
+            snapshot |= {
+                "kind": raffle["kind"],
+                "count_from": raffle["count_from"],
+                "min_messages": raffle["min_messages"],
+            }
         raw = encode(snapshot)
         digest = hashlib.sha256(raw.encode()).hexdigest()
         db.execute(
@@ -756,7 +962,10 @@ class Store:
                 raise LotteryError("尚未到截止时间。如需提前开奖，请先 /freeze 截止报名。")
             raffle = self._freeze(db, raffle, actor)
             snapshot = json.loads(raffle["snapshot"])
-            winners = pick_winners(snapshot["entries"], raffle["winner_count"])
+            if raffle["kind"] == "rank":
+                winners = [dict(entry) for entry in snapshot["entries"][: raffle["winner_count"]]]
+            else:
+                winners = pick_winners(snapshot["entries"], raffle["winner_count"])
             if raffle["prizes"]:
                 # The first winners drawn take the first prizes listed.
                 names = [name for name, count in json.loads(raffle["prizes"]) for _ in range(count)]

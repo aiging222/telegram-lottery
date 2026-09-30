@@ -584,6 +584,123 @@ def test_nothing_is_drawn_when_designations_take_every_place(setup, monkeypatch)
     assert [w["user_id"] for w in store.draw(rid, 99)["winners"]] == [2]
 
 
+def ranking(store, chat_id=-100, winners=3, **options):
+    """A group activity raffle in chat_id ending in an hour."""
+    options.setdefault("kind", "rank")
+    options.setdefault("prizes", [[f"奖{i}", 1] for i in range(winners)])
+    return store.create(
+        99, "活跃", winners, deadline=store.clock() + 3600, chat_id=chat_id, **options
+    )
+
+
+def test_most_messages_win_and_equals_go_by_who_got_there_first(setup):
+    store, _, now = setup
+    start = now[0]
+    rid = ranking(store)  # counts from now, on a minute boundary
+    said = {1: [10, 20, 30], 2: [15, 25, 95], 3: [5, 6, 7, 8, 9], 4: [-600, 3700]}
+    for uid, times in said.items():
+        for at in times:  # user 4 speaks only before and after the raffle
+            store.count_message(-100, uid, f"u{uid}", start + at)
+        if uid == 2:
+            store.flush_activity()  # saved or still in memory, all counts count
+    now[0] = start + 3600
+    winners = store.draw(rid, 99)["winners"]
+    assert [(w["user_id"], w["prize"], w["messages"]) for w in winners] == [
+        (3, "奖0", 5),
+        (1, "奖1", 3),  # three messages by 30s, before user 2's third at 95s
+        (2, "奖2", 3),
+    ]
+
+
+def test_members_who_left_after_speaking_are_not_ranked(setup):
+    store, _, now = setup
+    start = now[0]
+    rid = ranking(store, winners=2)
+    for at in range(5):
+        store.count_message(-100, 1, "Eve", start + 10 + at)
+    store.count_message(-100, 2, "Frank", start + 10)
+    store.leave_group(-100, 1, start + 100)
+    store.leave_group(-100, 2, start + 100)
+    store.count_message(-100, 2, "Frank", start + 200)  # back in the group
+    now[0] = start + 3600
+    assert [w["user_id"] for w in store.draw(rid, 99)["winners"]] == [2]
+
+
+def test_reach_draws_among_those_with_enough_messages(setup):
+    store, _, now = setup
+    start = now[0]
+    rid = ranking(store, winners=2, kind="reach", prizes=[["奖", 2]], min_messages=3)
+    for uid, count in ((1, 3), (2, 5), (3, 2)):
+        for i in range(count):
+            store.count_message(-100, uid, f"u{uid}", start + 60 * i + uid)
+    now[0] = start + 600
+    assert [e["user_id"] for e in store.view(rid)["entries"]] == [2, 1]
+    now[0] = start + 3600
+    assert sorted(w["user_id"] for w in store.draw(rid, 99)["winners"]) == [1, 2]
+
+
+def test_activity_raffles_look_back_at_most_30_days(setup):
+    store, _, now = setup
+    start = now[0]
+    store.count_message(-100, 1, "近", start - 29 * 86400)
+    store.count_message(-100, 2, "远", start - 31 * 86400)
+    rid = ranking(store, winners=1, count_from=start - 30 * 86400)
+    with pytest.raises(LotteryError, match="30 天前"):
+        ranking(store, winners=1, count_from=start - 31 * 86400)
+    now[0] += 3600
+    assert [w["user_id"] for w in store.draw(rid, 99)["winners"]] == [1]
+
+
+def test_old_counts_are_forgotten_unless_an_open_raffle_needs_them(setup):
+    store, _, now = setup
+    start = now[0]
+    store.count_message(-100, 1, "a", start - 29 * 86400)
+    rid = store.create(
+        99,
+        "回溯",
+        1,
+        deadline=start + 3 * 86400,
+        chat_id=-100,
+        kind="rank",
+        prizes=[["a", 1]],
+        count_from=start - 30 * 86400,
+    )
+    now[0] += 2 * 86400  # the message is 31 days old now
+    store.flush_activity()
+    assert store.view(rid)["entries"][0]["messages"] == 1
+    store.cancel(rid, 99)
+    now[0] += 3600  # the next hourly clean-up
+    store.flush_activity()
+    assert store.activity_since(-100) is None
+
+
+def test_activity_raffles_have_their_own_rules(setup):
+    store, _, _ = setup
+    activity = ranking(store, winners=1)
+    for operation, message in (
+        (lambda: store.join(activity, 1, "x"), "发言即可参与"),
+        (lambda: store.override(activity, 99, 1, 5), "群活跃抽奖"),
+        (lambda: store.designate(activity, 99, 1), "群活跃抽奖"),
+        (lambda: ranking(store, winners=1, prizes=[["奖", 2]]), "每个名次一份奖品"),
+        (lambda: ranking(store, winners=1, kind="reach", prizes=[["奖", 1]]), "发言次数"),
+        (lambda: store.create(99, "x", 1, 60, count_from=0), "只有群活跃抽奖统计发言"),
+        (lambda: ranking(store, chat_id=None, winners=1), "发布群"),
+    ):
+        with pytest.raises(LotteryError, match=message):
+            operation()
+
+
+def test_message_counts_follow_a_supergroup_upgrade(setup):
+    store, _, now = setup
+    start = now[0]
+    rid = ranking(store, winners=1)
+    store.count_message(-100, 1, "a", start + 10)
+    store.migrate_chat(-100, -1001)
+    store.count_message(-1001, 1, "a", start + 20)
+    now[0] = start + 3600
+    assert store.draw(rid, 99)["winners"][0]["messages"] == 2
+
+
 def test_keyword_raffles(setup):
     store, _, now = setup
     rid = store.create(99, "a", 1, 60, chat_id=-100, keyword=" Hello ")

@@ -41,6 +41,7 @@ DEFAULT_TIMEZONE = "Asia/Shanghai"
 ALLOWED_UPDATES = ["message", "callback_query", "chat_member", "my_chat_member"]
 AUTO_DRAW_SECONDS = 30  # how often due raffles are drawn and old messages deleted
 CARD_REFRESH_SECONDS = 5  # joins arriving within this window share one card edit
+SAVE_ACTIVITY_SECONDS = 10  # message counts wait in memory at most this long
 JOINED_REACTION = "🎉"  # a keyword join is confirmed quietly, with a reaction
 ADMIN_COMMANDS = {
     "new",
@@ -317,6 +318,13 @@ class BotHandlers:
                             or "暂无规则。"
                         ),
                     )
+                elif command == "preview" and raffle["kind"] != "join":
+                    lines = [f"抽奖 {rid}｜{status_text(raffle)}｜按发言次数"]
+                    for p in raffle["entries"][:30]:
+                        lines.append(
+                            f"{name_text(p['display_name'])} / {p['user_id']}："
+                            f"发言 {p['messages']} 次"
+                        )
                 elif command == "preview":
                     odds = chances(raffle["entries"], raffle["winner_count"])
                     total = sum(p["weight"] for p in raffle["entries"])
@@ -327,6 +335,7 @@ class BotHandlers:
                             f"{name_text(p['display_name'])} / {p['user_id']}："
                             f"权重 {p['weight']}（{source}），首轮 {odds[p['user_id']]}"
                         )
+                if command == "preview":
                     lines.append("展示前 30 人。完整名单和记录使用 /export。")
                     await reply(message, "\n".join(lines))
                 return
@@ -410,6 +419,20 @@ class BotHandlers:
             except TelegramError as exc:
                 LOG.info("报名成功的表情回应失败：%s", exc)
         await self.tidy(context.bot, message.chat.id, [message.message_id], "delete_keyword")
+
+    async def count_message(self, update, context):
+        """Count a member's text message in a group, for group activity raffles. Channels,
+        anonymous admins and bots do not count."""
+        message, user = update.effective_message, update.effective_user
+        if message is None or user is None or user.is_bot or message.sender_chat:
+            return
+        self.store.count_message(
+            message.chat.id, user.id, name_text(user.full_name), message.date.timestamp()
+        )
+
+    async def save_activity(self, _context):
+        """Save the message counts kept in memory; also run when the bot stops."""
+        await asyncio.to_thread(self.store.flush_activity)
 
     @one_at_a_time(lambda update: update.chat_member.new_chat_member.user)
     async def member_changed(self, update, context):
@@ -691,6 +714,7 @@ def build_application(settings):
         # person's own updates keep their order (one_at_a_time).
         .concurrent_updates(True)
         .post_init(register_commands)
+        .post_shutdown(handlers.save_activity)
         .build()
     )
     menu = Menu(handlers)
@@ -707,11 +731,17 @@ def build_application(settings):
     app.add_handler(
         MessageHandler(filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND, handlers.keyword)
     )
+    # A handler group of its own, so text is counted for activity raffles besides the above.
+    texts = filters.ChatType.GROUPS & (filters.TEXT | filters.CAPTION) & ~filters.COMMAND
+    app.add_handler(MessageHandler(texts, handlers.count_message), group=1)
     app.add_handler(ChatMemberHandler(handlers.member_changed, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(ChatMemberHandler(menu.bot_membership, ChatMemberHandler.MY_CHAT_MEMBER))
     for job in (handlers.auto_draw, handlers.cleanup):
         app.job_queue.run_repeating(job, interval=AUTO_DRAW_SECONDS, first=AUTO_DRAW_SECONDS)
     app.job_queue.run_once(menu.sync_all_admins, when=0)
+    app.job_queue.run_repeating(
+        handlers.save_activity, interval=SAVE_ACTIVITY_SECONDS, first=SAVE_ACTIVITY_SECONDS
+    )
     app.add_error_handler(handlers.on_error)
     return app
 

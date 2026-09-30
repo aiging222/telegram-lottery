@@ -218,7 +218,10 @@ HEADER = "🎁 发起抽奖（/cancel 退出）\n\n"
 
 
 def test_wizard_publishes_a_timed_raffle(env):
-    text, _ = shown(press(env, OWNER, f"m:new:{GROUP}"))
+    text, buttons = shown(press(env, OWNER, f"m:new:{GROUP}"))
+    assert text.endswith("选择抽奖类型：")
+    assert {"🎟 普通抽奖", "🔥 群活跃抽奖"} <= set(buttons)
+    text, _ = shown(press(env, OWNER, buttons["🎟 普通抽奖"]))
     assert text == HEADER + "请发送奖品名称，例如：1USDT"
     text, buttons = type_text(env, OWNER, "1usdt")
     assert text.endswith("「1usdt」有几份？点按钮或直接发送数字：")
@@ -258,6 +261,7 @@ def test_wizard_publishes_a_timed_raffle(env):
 
 def test_wizard_several_prizes_keyword_and_full_mode(env):
     press(env, OWNER, f"m:new:{GROUP}")
+    press(env, OWNER, "m:k:join")
     type_text(env, OWNER, "iPhone")
     text, _ = type_text(env, OWNER, "1")  # counts can be typed instead of pressed
     assert text.endswith("怎么开奖？")
@@ -290,8 +294,84 @@ def test_wizard_several_prizes_keyword_and_full_mode(env):
     assert card.kwargs["reply_markup"] is None  # no button to press
 
 
+def test_wizard_creates_an_activity_ranking(env):
+    press(env, OWNER, f"m:new:{GROUP}")
+    text, buttons = shown(press(env, OWNER, "m:k:act"))
+    assert {"1️⃣ 根据活跃排名抽奖", "2️⃣ 达到发言次数参与随机抽奖"} <= set(buttons)
+    text, _ = shown(press(env, OWNER, buttons["⬅️ 返回选择抽奖类型"]))
+    assert text.endswith("选择抽奖类型：")
+    press(env, OWNER, "m:k:act")
+    text, _ = shown(press(env, OWNER, "m:ka:rank"))
+    assert "├ 类型：群活跃抽奖 · 按发言排名" in text
+    assert "发言次数从什么时候开始统计？" in text and "本群还没有记录到发言" in text
+    too_early = type_text(env, OWNER, "2026-12-01 00:00")[0]
+    assert too_early == "统计开始时间需在 30 天前到一年之内，请重新输入。"
+    text, buttons = type_text(env, OWNER, "01-15 12:00")  # four hours ago
+    assert "├ 统计：从 2027-01-15 12:00（UTC+08:00） 起的文字发言" in text
+    assert press(env, OWNER, "m:ka:reach").answer.await_args.args[0] == STALE
+    text, buttons = shown(press(env, OWNER, buttons["1小时"]))
+    assert text.endswith("请发送第一名的奖品，例如：1USDT")
+    assert "👉 结束添加奖品，进入下一步" not in buttons
+    text, buttons = type_text(env, OWNER, "10USDT")
+    assert "├ 奖品：第一名 10USDT" in text
+    assert text.endswith("请发送第二名的奖品，例如：1USDT")
+    type_text(env, OWNER, "5USDT")
+    text, _ = shown(press(env, OWNER, buttons["👉 结束添加奖品，进入下一步"]))
+    assert text.endswith("最后，请发送抽奖活动名称：")
+    text, buttons = type_text(env, OWNER, "本周话痨榜")
+    assert "├ 奖品：第一名 10USDT、第二名 5USDT" in text
+    assert "⚖️ 中奖加成：关" not in buttons
+    assert shown(press(env, OWNER, buttons["✅ 发布抽奖"]))[0] == "✅ 已发布到群。"
+    raffle = env.store.view(1)
+    assert (raffle["kind"], raffle["winner_count"], raffle["prizes"]) == (
+        "rank",
+        2,
+        [["10USDT", 1], ["5USDT", 1]],
+    )
+    assert raffle["count_from"] == datetime(2027, 1, 15, 12, tzinfo=SHANGHAI).timestamp()
+    assert raffle["deadline"] == NOW + 3600
+    card = env.bot.send_message.await_args
+    assert "👉 在群里发言即可参与" in card.args[1] and card.kwargs["reply_markup"] is None
+
+
+def test_wizard_creates_an_activity_draw(env):
+    press(env, OWNER, f"m:new:{GROUP}")
+    press(env, OWNER, "m:k:act")
+    press(env, OWNER, "m:ka:reach")
+    text, _ = shown(press(env, OWNER, "m:fr:0"))
+    assert "├ 统计：从抽奖发布时起的文字发言" in text
+    text, buttons = type_text(env, OWNER, "2小时")
+    assert text.endswith("至少发言多少次才能参与抽奖？点按钮或直接发送数字：")
+    text, _ = shown(press(env, OWNER, buttons["20"]))
+    assert "├ 类型：群活跃抽奖 · 发言满 20 次参与抽奖" in text
+    type_text(env, OWNER, "1usdt")
+    type_text(env, OWNER, "3")
+    press(env, OWNER, "m:tt")
+    press(env, OWNER, "m:pub")
+    raffle = env.store.view(1)
+    assert (raffle["kind"], raffle["winner_count"], raffle["min_messages"]) == ("reach", 3, 20)
+    assert (raffle["count_from"], raffle["deadline"]) == (NOW, NOW + 7200)
+
+
+def test_activity_raffles_in_the_records(env):
+    rid = env.store.create(
+        OWNER, "话痨榜", 2, 60, chat_id=GROUP, kind="rank", prizes=[["a", 1], ["b", 1]]
+    )
+    env.store.count_message(GROUP, 7, "Tom", NOW + 30)
+    env.now[0] += 90
+    text, buttons = shown(press(env, ADMIN, f"m:r:{rid}"))
+    assert "🏆 第一名 a、第二名 b\n💬 按发言次数排名，前 2 名获奖\n2 人中奖 · 已发言 1 人" in text
+    assert "⚖️ 中奖加成" not in buttons
+    text, _ = shown(press(env, ADMIN, buttons["📄 导出记录"]))
+    assert text.startswith("话痨榜")
+    env.bot.send_document.assert_awaited_once()
+    query = press(env, ADMIN, f"m:w:{rid}:0")
+    assert query.answer.await_args.args[0].startswith("群活跃抽奖按发言次数决定")
+
+
 def test_wizard_typed_deadline(env):
     press(env, OWNER, f"m:new:{GROUP}")
+    press(env, OWNER, "m:k:join")
     type_text(env, OWNER, "耳机")
     press(env, OWNER, "m:c:1")
     press(env, OWNER, "m:mode:t")
@@ -303,6 +383,7 @@ def test_wizard_typed_deadline(env):
 
 def test_typed_duration_counts_from_publishing(env):
     press(env, OWNER, f"m:new:{GROUP}")
+    press(env, OWNER, "m:k:join")
     type_text(env, OWNER, "耳机")
     press(env, OWNER, "m:c:1")
     press(env, OWNER, "m:mode:t")
@@ -316,6 +397,7 @@ def test_typed_duration_counts_from_publishing(env):
 
 def test_typed_date_that_has_passed_is_asked_again(env):
     press(env, OWNER, f"m:new:{GROUP}")
+    press(env, OWNER, "m:k:join")
     type_text(env, OWNER, "耳机")
     press(env, OWNER, "m:c:1")
     press(env, OWNER, "m:mode:t")
@@ -699,6 +781,7 @@ def test_export_goes_to_the_super_admin(weighted_env):
 
 def fill_wizard(env, user_id):
     press(env, user_id, f"m:new:{GROUP}")
+    press(env, user_id, "m:k:join")
     type_text(env, user_id, "坦克300")
     press(env, user_id, "m:c:1")
     press(env, user_id, "m:mode:t")
