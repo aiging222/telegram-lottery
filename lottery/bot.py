@@ -9,7 +9,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
-from telegram import BotCommand, ChatMember, Update
+from telegram import BotCommand, BotCommandScopeAllGroupChats, ChatMember, Update
 from telegram.error import BadRequest, ChatMigrated, Forbidden, TelegramError
 from telegram.ext import (
     Application,
@@ -927,8 +927,12 @@ class TokenFilter(logging.Filter):
 
 async def register_commands(app):
     # Everything else is done with buttons; the other commands still work when typed.
+    # Groups also list /link, which answers only there.
+    commands = [BotCommand("start", "打开菜单"), BotCommand("id", "查看我的用户 ID")]
+    await app.bot.set_my_commands(commands)
     await app.bot.set_my_commands(
-        [BotCommand("start", "打开菜单"), BotCommand("id", "查看我的用户 ID")]
+        [*commands, BotCommand("link", "领取我的专属邀请链接")],
+        scope=BotCommandScopeAllGroupChats(),
     )
 
 

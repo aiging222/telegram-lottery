@@ -901,10 +901,14 @@ def test_standing_in_a_reach_raffle_and_its_length():
     assert standing_text(rank, crowd, 8).endswith("你：第 9 名 · 99992 次")
 
 
-def test_only_start_and_id_are_in_the_command_menu():
+def test_the_command_menu_lists_start_and_id_and_link_in_groups():
     bot = SimpleNamespace(set_my_commands=AsyncMock())
     asyncio.run(register_commands(SimpleNamespace(bot=bot)))
-    assert [c.command for c in bot.set_my_commands.await_args.args[0]] == ["start", "id"]
+    menus = {
+        getattr(call.kwargs.get("scope"), "type", "default"): [c.command for c in call.args[0]]
+        for call in bot.set_my_commands.await_args_list
+    }
+    assert menus == {"default": ["start", "id"], "all_group_chats": ["start", "id", "link"]}
 
 
 def test_preview_shows_corrections(setup):
