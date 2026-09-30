@@ -397,6 +397,16 @@ class BotHandlers:
                     raise LotteryError("暂时无法确认你的群成员身份，请稍后重试。") from None
                 if not member:
                     raise LotteryError("仅限发布群的成员报名，请先加入该群。")
+                report = await asyncio.to_thread(self.store.report_group, rid)
+                if report is not None:
+                    try:
+                        there = await self.group_member(context.bot, report, query.from_user.id)
+                    except TelegramError as exc:
+                        LOG.warning("报道群成员校验失败：%s", exc)
+                        raise LotteryError("暂时无法确认你在不在报道群，请稍后重试。") from None
+                    if not there:
+                        title = await asyncio.to_thread(self.store.group_title, report)
+                        raise LotteryError(f"请先加入「{title}」，加入后会自动报名。")
                 added = await asyncio.to_thread(
                     self.store.join, rid, query.from_user.id, name_text(query.from_user.full_name)
                 )
@@ -550,6 +560,24 @@ class BotHandlers:
         if counted:
             for rid in await asyncio.to_thread(self.store.full_invite_raffles, chat_id):
                 await self.announce(context.bot, rid, chat_id)
+        await self.report_in(context, chat_id, user)
+
+    async def report_in(self, context, chat_id, user):
+        """user joined chat_id: join them to the report raffles it is the report group of,
+        if they are members of the raffle's own group."""
+        for rid, home in await asyncio.to_thread(self.store.report_raffles, chat_id):
+            try:
+                if not await self.group_member(context.bot, home, user.id):
+                    continue
+                added = await asyncio.to_thread(
+                    self.store.join, rid, user.id, name_text(user.full_name)
+                )
+            except (TelegramError, LotteryError) as exc:
+                # They can still press the card's button; full or just closed are fine.
+                LOG.info("报道抽奖 %s 自动报名 %s 未成功：%s", rid, user.id, exc)
+                continue
+            if added:
+                await self.after_join(context, rid)
 
     async def invite_link_text(self, bot, chat_id, user, check=True):
         """The answer to asking for one's own invite link to chat_id: the link, made once

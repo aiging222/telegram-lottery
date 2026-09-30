@@ -1447,3 +1447,77 @@ def test_members_get_their_invite_link_in_private(env):
     stranger = start(env, 42, f"inv{GROUP}")
     assert stranger.reply_text.await_args.args[0] == "只有群成员才能领取这个群的邀请链接。"
     assert start(env, MEMBER, "invalid").reply_text.await_args.args[0] == "这个链接无效。"
+
+
+def test_wizard_creates_a_report_raffle(env):
+    env.store.remember_group(-200, "报道群")
+    env.statuses[(-200, OWNER)] = ChatMember.OWNER
+    env.store.set_manager(-200, OWNER, True)
+    env.bot.get_chat = AsyncMock(return_value=SimpleNamespace(username="report_group"))
+    _, buttons = shown(press(env, OWNER, f"m:new:{GROUP}"))
+    text, buttons = shown(press(env, OWNER, buttons["🙋 指定群报道抽奖"]))
+    assert text.endswith("是否继续创建？")
+    assert list(buttons) == ["▶️ 继续", "⬅️ 返回选择抽奖类型", "✖ 取消"]
+    text, buttons = shown(press(env, OWNER, buttons["▶️ 继续"]))
+    assert "选择报道群（你管理、机器人也在的群）" in text
+    assert list(buttons) == ["报道群", "⬅️ 返回", "✖ 取消"]  # not the group it is for
+    text, _ = shown(press(env, OWNER, buttons["报道群"]))
+    assert "├ 类型：指定群报道抽奖 · 报道群「报道群」\n" in text
+    assert "├ 加入「报道群」即可参与\n" in text
+    assert text.endswith("请发送奖品名称，例如：1USDT")
+    type_text(env, OWNER, "1usdt")
+    press(env, OWNER, "m:c:1")
+    press(env, OWNER, "m:mode:t")
+    press(env, OWNER, "m:t:60")
+    press(env, OWNER, "m:tt")
+    press(env, OWNER, "m:pub")
+    raffle = env.store.view(1)
+    assert (raffle["report_chat"], raffle["report_link"], raffle["keyword"]) == (
+        -200,
+        "https://t.me/report_group",
+        None,
+    )
+    card = env.bot.send_message.await_args
+    assert card.args[0] == GROUP
+    assert "👉 加入「报道群」即可参与" in card.args[1]
+    assert labels(card.kwargs["reply_markup"]) == {
+        "➡️ 进入报道群": "https://t.me/report_group",
+        "✅ 我已加入报道群": "join:1",
+    }
+
+
+def test_a_report_group_can_be_typed_as_a_public_link(env):
+    env.statuses[(-300, OWNER)] = ChatMember.OWNER
+    env.statuses[(-300, 4242)] = ChatMember.ADMINISTRATOR  # the bot is in it
+    env.bot.get_chat = AsyncMock(
+        return_value=SimpleNamespace(
+            id=-300, type="supergroup", title="公开群", username="pub_group"
+        )
+    )
+    press(env, OWNER, f"m:new:{GROUP}")
+    press(env, OWNER, "m:k:rep")
+    press(env, OWNER, "m:ro:go")
+    assert type_text(env, OWNER, "https://t.me/+AbCdEf")[0].startswith(
+        "私密群的邀请链接认不出是哪个群"
+    )
+    assert type_text(env, OWNER, "随便写写")[0].startswith("请发送公开群的链接")
+    text, _ = type_text(env, OWNER, "https://t.me/pub_group")
+    assert "├ 类型：指定群报道抽奖 · 报道群「公开群」\n" in text
+    assert env.bot.get_chat.await_args.args == ("@pub_group",)
+    _, data = env.store.draft(OWNER)
+    assert (data["report"], data["report_link"]) == (-300, "https://t.me/pub_group")
+
+
+def test_a_typed_report_group_must_be_the_admins_own(env):
+    env.bot.get_chat = AsyncMock(
+        return_value=SimpleNamespace(id=-300, type="supergroup", title="别人的群", username="x")
+    )
+    press(env, OWNER, f"m:new:{GROUP}")
+    press(env, OWNER, "m:k:rep")
+    press(env, OWNER, "m:ro:go")
+    assert (
+        type_text(env, OWNER, "@xxxx")[0]
+        == "机器人还不在这个群里，请先把机器人拉进去并设为管理员。"
+    )
+    env.statuses[(-300, 4242)] = ChatMember.ADMINISTRATOR
+    assert type_text(env, OWNER, "@xxxx")[0] == "只能选你管理的群作报道群。"

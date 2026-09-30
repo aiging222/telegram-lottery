@@ -1120,3 +1120,32 @@ def test_invite_links_and_a_supergroup_upgrade(setup):
     assert store.invite_link(-1001, 1) is None  # links to the old group are gone
     assert store.invite_link(-100, 1) is None
     assert [e["user_id"] for e in store.ranking(rid)[1]] == [1]
+
+
+def test_report_raffles(setup):
+    store, _, now = setup
+    store.remember_group(-200, "报道群")
+    rid = store.create(
+        99, "报道", 1, 60, chat_id=-100, report_chat=-200, report_link="https://t.me/r"
+    )
+    raffle = store.view(rid)
+    assert (raffle["report_chat"], raffle["report_title"], raffle["report_link"]) == (
+        -200,
+        "报道群",
+        "https://t.me/r",
+    )
+    assert store.report_group(rid) == -200
+    assert store.report_raffles(-200) == [(rid, -100)]
+    assert store.report_raffles(-100) == []
+    store.join(rid, 1, "Eve")
+    assert store.leave_group(-200, 1, now[0] + 10) == [rid]  # leaving the report group
+    assert store.view(rid)["entries"] == []
+    store.migrate_chat(-200, -2001)
+    assert store.report_raffles(-2001) == [(rid, -100)]
+    for options in (
+        {"report_chat": -100},  # its own group
+        {"report_chat": -200, "keyword": "报到"},
+        {"report_chat": -200, "chat_id": None},
+    ):
+        with pytest.raises(LotteryError, match="指定群报道抽奖"):
+            store.create(99, "x", 1, 60, **({"chat_id": -100} | options))

@@ -1199,3 +1199,42 @@ def test_standing_in_an_invite_raffle():
     assert standing_text(reach, ranked, 1) == (
         "📊 邀请满 5 人即可参与抽奖\n已达标 0 人\n你已邀请 3 人，还差 2 人"
     )
+
+
+def test_members_join_a_report_raffle_by_joining_its_report_group(inviting):
+    store, now, handlers = inviting
+    store.remember_group(-200, "报道群")
+    rid = store.create(
+        99, "报道", 2, 60, chat_id=GROUP["id"], report_chat=-200, report_link="https://t.me/r"
+    )
+    text, markup = card(store.view(rid), SHANGHAI)
+    assert "👉 加入「报道群」即可参与；已经在里面的，点「✅ 我已加入报道群」" in text
+    buttons = markup.inline_keyboard[0]
+    assert [(b.text, b.url, b.callback_data) for b in buttons] == [
+        ("➡️ 进入报道群", "https://t.me/r", None),
+        ("✅ 我已加入报道群", None, f"join:{rid}"),
+    ]
+    in_group_a = {11, 123}
+
+    async def lookup(chat_id, user_id):
+        member = chat_id == GROUP["id"] and user_id in in_group_a
+        return SimpleNamespace(status=ChatMember.MEMBER if member else ChatMember.LEFT)
+
+    bot = fake_bot(get_chat_member=AsyncMock(side_effect=lookup))
+    context = SimpleNamespace(bot=bot, job_queue=None)
+    for user_id in (11, 12):  # a member of the raffle's group, and someone else
+        update = arrival(user_id, now[0] + 10, by=user_id)
+        update.chat_member.chat = SimpleNamespace(id=-200)
+        asyncio.run(handlers.member_changed(update, context))
+    assert [e["user_id"] for e in store.view(rid)["entries"]] == [11]
+    # Already in the report group before: the card's button, which checks both groups.
+    assert (
+        join_click(handlers, rid, AsyncMock(side_effect=lookup))
+        == "请先加入「报道群」，加入后会自动报名。"
+    )
+
+    async def both(chat_id, user_id):
+        return SimpleNamespace(status=ChatMember.MEMBER)
+
+    assert join_click(handlers, rid, AsyncMock(side_effect=both)) == "报名成功！"
+    assert [e["user_id"] for e in store.view(rid)["entries"]] == [11, 123]

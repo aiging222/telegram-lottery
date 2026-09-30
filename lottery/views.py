@@ -97,7 +97,9 @@ def cost_text(cost):
     return f"🪙 参与需 {cost} 灵石，报名时扣除"
 
 
-def join_text(keyword):
+def join_text(keyword, report_title=None):
+    if report_title:
+        return f"加入「{report_title}」即可参与"
     return f"在群里发送「{keyword}」参与" if keyword else "点按钮参与"
 
 
@@ -148,6 +150,15 @@ def card(raffle, timezone):
                     "🔗 领取我的邀请链接", callback_data=f"invite:{raffle['id']}"
                 )
                 row.insert(0, link)
+            markup = InlineKeyboardMarkup([row])
+        elif raffle.get("report_chat"):
+            lines.append(
+                f"👉 {join_text(None, raffle['report_title'])}；"
+                "已经在里面的，点「✅ 我已加入报道群」"
+            )
+            row = [InlineKeyboardButton("✅ 我已加入报道群", callback_data=f"join:{raffle['id']}")]
+            if raffle.get("report_link"):
+                row.insert(0, InlineKeyboardButton("➡️ 进入报道群", url=raffle["report_link"]))
             markup = InlineKeyboardMarkup([row])
         elif raffle["keyword"]:
             lines.append(f"👉 {join_text(raffle['keyword'])}")

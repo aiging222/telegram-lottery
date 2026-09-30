@@ -326,6 +326,14 @@ MIGRATIONS = [
         PRIMARY KEY (chat_id, user_id)
     )
     """,
+    # 18: report raffles (指定群报道抽奖): members of the raffle's group join by joining
+    # another group, report_chat, or by pressing the card's button once in it; report_link
+    # takes them there from the card.
+    """
+    ALTER TABLE raffles ADD COLUMN report_chat INTEGER;
+    ALTER TABLE raffles ADD COLUMN report_link TEXT;
+    CREATE INDEX IF NOT EXISTS raffles_by_report ON raffles(report_chat)
+    """,
 ]
 # Deletion delays are seconds after posting: 0 deletes at once, None keeps the message.
 GROUP_DEFAULTS = {
@@ -484,6 +492,12 @@ class Store:
             raise LotteryError("本场抽奖尚未在群里发布，暂不能报名。")
         return chat_id
 
+    def report_group(self, raffle_id):
+        """The group a report raffle's members must be in too, or None."""
+        with self.reading() as db:
+            row = db.execute("SELECT report_chat FROM raffles WHERE id=?", (raffle_id,)).fetchone()
+        return row[0] if row else None
+
     def migrate_chat(self, old_chat_id, new_chat_id):
         """Follow Telegram's group-to-supergroup upgrade, which changes the chat ID. The old
         group's messages stay behind, out of the bot's reach, so cards, pins and deletions
@@ -503,6 +517,9 @@ class Store:
                 (new_chat_id, old_chat_id),
             )
             db.execute("UPDATE drafts SET chat_id=? WHERE chat_id=?", (new_chat_id, old_chat_id))
+            db.execute(
+                "UPDATE raffles SET report_chat=? WHERE report_chat=?", (new_chat_id, old_chat_id)
+            )
             db.execute(
                 "UPDATE OR REPLACE managers SET chat_id=? WHERE chat_id=?",
                 (new_chat_id, old_chat_id),
@@ -565,12 +582,13 @@ class Store:
             ).fetchone()
             if row and row["balance"]:
                 self._credit(db, chat_id, user_id, -row["balance"], "leave", 0)
-            ids = [
+            ids = [  # leaving a report raffle's report group counts as much as leaving its own
                 row["id"]
                 for row in db.execute(
                     "SELECT r.id FROM raffles r JOIN participants p ON p.raffle_id=r.id "
-                    "WHERE r.chat_id=? AND p.user_id=? AND r.status='OPEN' AND r.deadline>?",
-                    (chat_id, user_id, left_at),
+                    "WHERE (r.chat_id=? OR r.report_chat=?) AND p.user_id=? AND r.status='OPEN' "
+                    "AND r.deadline>?",
+                    (chat_id, chat_id, user_id, left_at),
                 )
             ]
             for raffle_id in ids:
@@ -599,6 +617,8 @@ class Store:
         min_messages=None,
         cost=None,
         invite_via=None,
+        report_chat=None,
+        report_link=None,
     ):
         """Create a raffle ending after `minutes` or at `deadline`, or earlier once `target`
         people have joined. Menus create it already bound to `chat_id`; `weighted` shows the
@@ -614,7 +634,10 @@ class Store:
         brought in from its publishing on instead, and `min_messages` is the invites needed;
         a "reach" one may then be drawn once `target` members have enough.
 
-        Joining a raffle with a `cost` takes that many of the member's 灵石 in its group."""
+        Joining a raffle with a `cost` takes that many of the member's 灵石 in its group.
+
+        With a `report_chat`, the members of chat_id join by being in that group too;
+        `report_link` leads to it."""
         integer(winner_count, "中奖名额", 1, 100)
         if kind not in KINDS:
             raise LotteryError("抽奖类型无效。")
@@ -646,6 +669,10 @@ class Store:
                 raise LotteryError("奖品份数之和需等于中奖人数。")
         if keyword is not None:
             keyword = check_keyword(keyword.strip())
+        if report_chat is not None and (
+            kind != "join" or keyword is not None or chat_id is None or report_chat == chat_id
+        ):
+            raise LotteryError("指定群报道抽奖要选另一个群作报道群，加入即可参与，不用口令。")
         if not 1 <= len(title.strip()) <= 160:
             raise LotteryError("标题长度需为 1～160 字。")
         if target is not None:
@@ -666,8 +693,8 @@ class Store:
                     )
             cursor = db.execute(
                 "INSERT INTO raffles(title,winner_count,deadline,created_by,chat_id,target_count,"
-                "weighted,prizes,keyword,kind,count_from,min_messages,cost,invite_via) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "weighted,prizes,keyword,kind,count_from,min_messages,cost,invite_via,"
+                "report_chat,report_link) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     title.strip(),
                     winner_count,
@@ -683,6 +710,8 @@ class Store:
                     min_messages,
                     cost,
                     invite_via,
+                    report_chat,
+                    report_link,
                 ),
             )
             raffle_id = cursor.lastrowid
@@ -700,6 +729,8 @@ class Store:
                 details |= {"kind": kind, "count_from": count_from, "min_messages": min_messages}
             if invite_via is not None:
                 details["invite_via"] = invite_via
+            if report_chat is not None:
+                details |= {"report_chat": report_chat, "report_link": report_link}
             if cost is not None:
                 details["cost"] = cost
             self.audit(db, raffle_id, actor, "create", details)
@@ -745,6 +776,17 @@ class Store:
                 (chat_id, self.clock()),
             ).fetchall()
         return [row["id"] for row in rows if row["keyword"].casefold() == text.casefold()]
+
+    def report_raffles(self, chat_id):
+        """Open report raffles whose report group is chat_id, as (raffle ID, the group whose
+        members may join them)."""
+        with self.reading() as db:
+            rows = db.execute(
+                "SELECT id,chat_id FROM raffles WHERE report_chat=? AND status='OPEN' "
+                "AND deadline>?",
+                (chat_id, self.clock()),
+            ).fetchall()
+        return [(row["id"], row["chat_id"]) for row in rows]
 
     def is_full(self, raffle_id):
         with self.transaction() as db:
@@ -1369,6 +1411,11 @@ class Store:
                 )
             ]
         raffle["weighted"] = bool(raffle["weighted"])
+        if raffle["report_chat"] is not None:
+            row = db.execute(
+                "SELECT title FROM groups WHERE chat_id=?", (raffle["report_chat"],)
+            ).fetchone()
+            raffle["report_title"] = row["title"] if row else str(raffle["report_chat"])
         raffle["prizes"] = json.loads(raffle["prizes"]) if raffle["prizes"] else None
         raffle["result"] = json.loads(raffle["result"]) if raffle["result"] else None
         return raffle

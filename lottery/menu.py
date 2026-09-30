@@ -126,6 +126,8 @@ BUTTON_STEPS = {
     "mm": "minimum",
     "iv": "via",
     "ik": "ikind",
+    "ro": "repok",
+    "rc": "report",
     "co": "cost",
     "c": "count",
     "mode": "mode",
@@ -146,7 +148,12 @@ TYPED_STEPS = {
     "rank",
     "minimum",
     "cost",
+    "report",
 }
+# A public group typed as a link, t.me/name or @name; private invite links name no group.
+PUBLIC_GROUP = re.compile(
+    r"(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z0-9_]{4,32})/?|@([A-Za-z0-9_]{4,32})"
+)
 
 
 def button(text, data):
@@ -616,6 +623,22 @@ class Menu:
             data["ranks_done"] = True
         elif action == "tt":
             self.answer(data, "title", data["prizes"][0][0])
+        elif action == "ro":
+            if value == "back":
+                del data["kind"]
+            else:  # the groups to pick from, those the admin manages besides this one
+                mine = await self.my_groups(bot, user_id)
+                data["report_choices"] = [[chat, title] for chat, title in mine if chat != chat_id]
+        elif action == "rc":
+            if value == "back":
+                data.pop("report_choices")
+            else:
+                chosen = dict(data["report_choices"])
+                report = int(value)
+                if report not in chosen:
+                    raise LotteryError(STALE)
+                await self.require(bot, user_id, report)
+                data.update(report=report, report_title=chosen[report])
         elif action != "cur":
             self.answer(data, BUTTON_STEPS[action], value, typed=False)
         return await self.advance(user_id, chat_id, data)
@@ -642,7 +665,10 @@ class Menu:
             await message.reply_text("请点上面消息里的按钮选择，或发送 /cancel 退出。")
             return
         try:
-            self.answer(data, data["step"], message.text.strip())
+            if data["step"] == "report":
+                await self.report_typed(context.bot, user.id, chat_id, data, message.text)
+            else:
+                self.answer(data, data["step"], message.text.strip())
         except LotteryError as exc:
             await message.reply_text(str(exc), reply_markup=keyboard(CANCEL_ROW))
             return
@@ -680,7 +706,8 @@ class Menu:
                 raise LotteryError("开奖时间要晚于开始统计发言的时间，请重新输入。")
             data.update(when)
         elif step == "kind":
-            data["kind"] = {"join": "join", "act": "act", "points": "points", "inv": "inv"}[value]
+            kinds = ("join", "act", "points", "inv", "rep")
+            data["kind"] = {kind: kind for kind in kinds}[value]
         elif step == "via":
             if value == "back":
                 del data["kind"]
@@ -750,6 +777,15 @@ class Menu:
                 self.ask_title,
             ],
             "inv": [self.ask_via, self.ask_invite_kind],
+            "rep": [
+                self.ask_report_intro,
+                self.ask_report_chat,
+                self.ask_prizes,
+                self.ask_mode,
+                self.ask_time,
+                self.ask_target,
+                self.ask_title,
+            ],
             "irank": [self.ask_time, self.ask_ranks, self.ask_title],
             "ireach": [
                 self.ask_minimum,
@@ -780,14 +816,80 @@ class Menu:
             "🎟 普通抽奖：点按钮或发口令参与\n"
             "🔥 群活跃抽奖：按发言排名，或发言达到次数参与随机抽奖\n"
             "🪙 积分抽奖：用签到、发言得到的灵石报名，参与时扣除\n"
-            "🪁 邀请抽奖：用专属链接或「添加成员」拉人进群，按邀请人数排名或达到人数参与抽奖\n\n"
+            "🪁 邀请抽奖：用专属链接或「添加成员」拉人进群，按邀请人数排名或达到人数参与抽奖\n"
+            "🙋 指定群报道抽奖：本群成员加入指定的报道群即可参与\n\n"
             "选择抽奖类型："
         )
         return self.draft_text(data, ask), keyboard(
             (button("🎟 普通抽奖", "m:k:join"), button("🔥 群活跃抽奖", "m:k:act")),
             (button("🪙 积分抽奖", "m:k:points"), button("🪁 邀请抽奖", "m:k:inv")),
+            (button("🙋 指定群报道抽奖", "m:k:rep"),),
             CANCEL_ROW,
         )
+
+    async def ask_report_intro(self, chat_id, data):
+        if "report_choices" in data:
+            return None
+        data["step"] = "repok"
+        ask = (
+            "🙋 指定群报道抽奖：本群成员加入指定的报道群即可参与。进报道群时自动报名；"
+            "原来就在报道群里的，点卡片上的「✅ 我已加入报道群」报名。开奖前退出任一个群都会取消报名。\n\n"
+            "注意：两个群都要把机器人拉进去并设为管理员，机器人才收得到有人进群的通知；"
+            "报道群是私密群的话，机器人还要有「邀请用户」权限，才能在卡片上放进群按钮。\n\n"
+            "是否继续创建？"
+        )
+        return self.draft_text(data, ask), keyboard(
+            (button("▶️ 继续", "m:ro:go"),),
+            (button("⬅️ 返回选择抽奖类型", "m:ro:back"),),
+            CANCEL_ROW,
+        )
+
+    async def ask_report_chat(self, chat_id, data):
+        if "report" in data:
+            return None
+        data["step"] = "report"
+        choices = [(button(title[:30], f"m:rc:{chat}"),) for chat, title in data["report_choices"]]
+        ask = (
+            "选择报道群（你管理、机器人也在的群），或发送报道群的链接，"
+            "如 https://t.me/xxx 或 @xxx（只支持公开群）："
+        )
+        if not choices:
+            ask = "还没有你管理、机器人也在的其他群。请发送报道群的链接，如 https://t.me/xxx 或 @xxx（只支持公开群）："
+        return self.draft_text(data, ask), keyboard(
+            *choices, (button("⬅️ 返回", "m:rc:back"),), CANCEL_ROW
+        )
+
+    async def report_typed(self, bot, user_id, chat_id, data, text):
+        """A report group typed as a public group's link."""
+        match = PUBLIC_GROUP.fullmatch(text.strip())
+        if not match:
+            if "t.me/+" in text or "joinchat" in text:
+                raise LotteryError(
+                    "私密群的邀请链接认不出是哪个群，请点上面的按钮选择，或发送公开群的链接。"
+                )
+            raise LotteryError(
+                "请发送公开群的链接，如 https://t.me/xxx 或 @xxx，或点上面的按钮选择。"
+            )
+        name = match[1] or match[2]
+        try:
+            chat = await bot.get_chat(f"@{name}")
+        except TelegramError:
+            raise LotteryError("找不到这个群，请确认链接无误。") from None
+        if chat.type not in ("group", "supergroup"):
+            raise LotteryError("这不是一个群，请发送群的链接。")
+        if chat.id == chat_id:
+            raise LotteryError("报道群不能是发布抽奖的这个群，请换一个。")
+        try:
+            me = await bot.get_chat_member(chat.id, bot.id)
+        except TelegramError:
+            me = None
+        if me is None or me.status not in (ChatMember.ADMINISTRATOR, ChatMember.MEMBER):
+            raise LotteryError("机器人还不在这个群里，请先把机器人拉进去并设为管理员。")
+        if not await self.can_manage(bot, user_id, chat.id):
+            raise LotteryError("只能选你管理的群作报道群。")
+        title = chat.title or f"@{name}"
+        await asyncio.to_thread(self.store.remember_group, chat.id, title)
+        data.update(report=chat.id, report_title=title, report_link=f"https://t.me/{name}")
 
     async def ask_via(self, chat_id, data):
         if "via" in data:
@@ -961,7 +1063,7 @@ class Menu:
         group = await asyncio.to_thread(self.store.group_title, chat_id)
         more = (button("➕ 添加奖品", "m:more"),) if room_for_prize(data) else ()
         bonus = ()
-        if self.is_super(user_id) and data["kind"] in ("join", "points"):
+        if self.is_super(user_id) and data["kind"] in ("join", "points", "rep"):
             # Turning this on shows the bonus notice on the card from the very start, so it
             # does not appear halfway through when the first weight is set.
             bonus = (button(f"⚖️ 中奖加成：{'开' if data.get('weighted') else '关'}", "m:wz"),)
@@ -997,6 +1099,9 @@ class Menu:
         elif kind == "reach":
             need = f"发言满 {data['min_messages']} 次" if "min_messages" in data else "发言达到次数"
             lines.append(f"├ 类型：群活跃抽奖 · {need}参与抽奖")
+        elif kind == "rep":
+            where = f" · 报道群「{data['report_title']}」" if "report" in data else ""
+            lines.append(f"├ 类型：指定群报道抽奖{where}")
         elif kind in ("inv", "irank", "ireach") and "via" in data:
             way = f"├ 类型：邀请抽奖 · {INVITE_WAYS[data['via']]}"
             if kind == "irank":
@@ -1026,6 +1131,8 @@ class Menu:
             lines.append(f"├ {rule}")
         if data.get("join") == "b" or data.get("keyword"):
             lines.append(f"├ {join_text(data.get('keyword'))}")
+        elif "report" in data:
+            lines.append(f"├ {join_text(None, data['report_title'])}")
         if data.get("weighted"):
             lines.append("本场设有中奖加成")
         if len(lines) > 2:
@@ -1037,6 +1144,19 @@ class Menu:
         if data.get("deadline"):
             return data["deadline"]
         return self.store.clock() + data.get("minutes", FULL_DEADLINE_MINUTES) * 60
+
+    async def way_in(self, bot, chat_id):
+        """A link into a report group for the card: its public address, or an invite link
+        the bot makes; None if neither can be had."""
+        try:
+            chat = await bot.get_chat(chat_id)
+            if chat.username:
+                return f"https://t.me/{chat.username}"
+            made = await bot.create_chat_invite_link(chat_id, name="指定群报道抽奖")
+        except TelegramError as exc:
+            LOG.warning("没能拿到报道群 %s 的进群链接：%s", chat_id, exc)
+            return None
+        return made.invite_link
 
     async def target_groups(self, bot, user_id, current):
         rows = [
@@ -1061,6 +1181,17 @@ class Menu:
                 "weighted": bool(data.get("weighted")) and self.is_super(user_id),
                 "keyword": data.get("keyword") if data["join"] == "k" else None,
                 "cost": data.get("cost"),  # 积分抽奖 is a join raffle that costs 灵石
+            }
+            minutes = data.get("minutes") or (
+                FULL_DEADLINE_MINUTES if data["mode"] == "f" else None
+            )
+        elif kind == "rep":
+            await self.require(bot, user_id, data["report"])
+            options = {
+                "target": data.get("target"),
+                "weighted": bool(data.get("weighted")) and self.is_super(user_id),
+                "report_chat": data["report"],
+                "report_link": data.get("report_link") or await self.way_in(bot, data["report"]),
             }
             minutes = data.get("minutes") or (
                 FULL_DEADLINE_MINUTES if data["mode"] == "f" else None
@@ -1096,7 +1227,7 @@ class Menu:
             )
         )
         await asyncio.to_thread(self.store.drop_draft, user_id)
-        weights = self.is_super(user_id) and kind in ("join", "points")
+        weights = self.is_super(user_id) and kind in ("join", "points", "rep")
         back = keyboard(
             (button("⚖️ 设置加成", f"m:w:{rid}:0"),) if weights else (),
             (button("📜 抽奖记录", f"m:list:{chat_id}:0"), button("⬅️ 返回", f"m:g:{chat_id}")),
@@ -1482,7 +1613,7 @@ class Menu:
                 f"{raffle['title']}  #{rid} · {status_text(raffle)}",
                 f"{raffle['winner_count']} 人中奖 · 已参与 {len(raffle['entries'])} 人",
                 draw_rule(raffle, zone),
-                join_text(raffle["keyword"]),
+                join_text(raffle["keyword"], raffle.get("report_title")),
             ]
             if raffle["cost"]:
                 lines.append(cost_text(raffle["cost"]))
