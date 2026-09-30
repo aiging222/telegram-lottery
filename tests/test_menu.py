@@ -628,6 +628,19 @@ def test_draw_now_from_records(env):
     assert env.store.pending_announcements() == []
 
 
+def test_a_long_list_of_winners_is_cut_to_fit_one_message(env):
+    prizes = [[f"{'奖' * 63}{i}", 10] for i in range(10)]
+    rid = env.store.create(OWNER, "大抽奖", 100, 60, chat_id=GROUP, prizes=prizes)
+    for uid in range(1, 101):
+        env.store.join(rid, uid, "😀" * 128)  # emoji count twice towards Telegram's limit
+    env.store.freeze(rid, OWNER)
+    env.store.draw(rid, OWNER)
+    text, _ = shown(press(env, OWNER, f"m:r:{rid}"))
+    assert len(text.encode("utf-16-le")) // 2 <= 4096
+    assert "\n中奖：😀" in text
+    assert text.endswith("…等 100 人，完整名单见开奖公告")
+
+
 def test_cancel_from_records(env):
     rid = env.store.create(OWNER, "耳机", 1, 60, chat_id=GROUP)
     env.store.set_card(rid, 500)

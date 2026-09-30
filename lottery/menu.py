@@ -44,6 +44,7 @@ MANAGERS = {ChatMember.OWNER, ChatMember.ADMINISTRATOR}
 GONE = {ChatMember.LEFT, ChatMember.BANNED}
 ADMIN_CACHE_SECONDS = 60
 PAGE_SIZE = 8
+MESSAGE_LIMIT = 4096  # Telegram's characters in a message
 FULL_DEADLINE_MINUTES = 7 * 1440  # a raffle that never fills up still ends after a week
 COUNTS = (1, 2, 3, 5, 10)
 DURATIONS = (("1小时", 60), ("6小时", 360), ("1天", 1440), ("3天", 4320), ("7天", 10080))
@@ -268,6 +269,31 @@ def change_text(change, timezone):
     when = datetime.fromtimestamp(change["at"], timezone)
     before, after = shown(change["before"]), shown(change["after"])
     return f"{when:%m-%d %H:%M} {who}：{label} {before} → {after}"
+
+
+def utf16_len(text):
+    """Length as Telegram counts it: emoji and other characters beyond the BMP count twice."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def winners_line(winners, room):
+    """中奖：A（prize）、B（prize）… in at most `room` of Telegram's characters; when not all
+    fit, as many as do and how many won in all."""
+    names = [
+        name_text(w["display_name"]) + (f"（{w['prize']}）" if w.get("prize") else "")
+        for w in winners
+    ]
+    line = "中奖：" + ("、".join(names) or "无")
+    if utf16_len(line) <= room:
+        return line
+    tail = f"…等 {len(names)} 人，完整名单见开奖公告"
+    line = "中奖："
+    for index, name in enumerate(names):
+        more = ("、" if index else "") + name
+        if utf16_len(line + more + tail) > room:
+            break
+        line += more
+    return line + tail
 
 
 def number(text, name, low, high):
@@ -1639,11 +1665,9 @@ class Menu:
         if raffle["weighted"]:
             lines.append("本场设有中奖加成")
         if raffle["result"]:
-            names = "、".join(
-                name_text(w["display_name"]) + (f"（{w['prize']}）" if w.get("prize") else "")
-                for w in raffle["result"]["winners"]
-            )
-            lines.append(f"中奖：{names or '无'}")
+            # A hundred winners with long names would pass Telegram's limit for a message.
+            room = MESSAGE_LIMIT - utf16_len("\n".join(lines)) - 1
+            lines.append(winners_line(raffle["result"]["winners"], room))
         rows = []
         if raffle["status"] == "OPEN":
             rows += [
