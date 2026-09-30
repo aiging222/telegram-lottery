@@ -679,6 +679,15 @@ class Menu:
         message, user = update.effective_message, update.effective_user
         self.saw(user)
         asking = self._asking.get(user.id)
+        # A group admin's question may have waited while they stopped being one.
+        if (
+            asking
+            and asking[0] in ("delay", "setting")
+            and not await self.can_manage(context.bot, user.id, asking[1])
+        ):
+            self._asking.pop(user.id, None)
+            await message.reply_text(NOT_MANAGER)
+            return
         if asking:
             points = asking[0] in ("setting", "balance", "balance_id", "balance_find")
             typed = self.points_typed if points else self.weight_typed

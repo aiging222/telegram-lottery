@@ -641,6 +641,22 @@ def test_a_long_list_of_winners_is_cut_to_fit_one_message(env):
     assert text.endswith("…等 100 人，完整名单见开奖公告")
 
 
+@pytest.mark.parametrize(
+    "asked, key, before",
+    [
+        (f"m:sk:{GROUP}:delete_notices", "delete_notices", 3),
+        (f"m:pk:{GROUP}:reward_chance", "reward_chance", 5),
+    ],
+)
+def test_a_typed_setting_is_refused_once_no_longer_an_admin(env, asked, key, before):
+    press(env, OWNER, asked)  # the question waits for a number
+    env.statuses[(GROUP, OWNER)] = ChatMember.MEMBER
+    env.menu._managers.clear()  # the 60-second cache has run out
+    assert type_text(env, OWNER, "10")[0] == NOT_MANAGER
+    assert env.store.group_settings(GROUP)[key] == before
+    assert type_text(env, OWNER, "10")[0] == "发送 /start 打开菜单。"  # the question is dropped
+
+
 def test_what_the_menu_posts_in_a_group_counts_against_its_budget(env):
     rid = env.store.create(OWNER, "耳机", 1, 60, chat_id=GROUP)
     env.handlers.spent(GROUP, GROUP_BUDGET - 2)
