@@ -56,15 +56,32 @@ def prize_text(prizes, kind="join"):
     return "、".join(f"{name} ×{count}" for name, count in prizes)
 
 
-def activity_rule(kind, winner_count, min_messages):
-    """How a group activity raffle is won."""
+INVITE_WAYS = {"link": "专属链接邀请", "add": "添加成员邀请"}
+
+
+def activity_rule(kind, winner_count, minimum, invite_via=None):
+    """How a group activity or invite raffle is won."""
+    if invite_via:
+        if kind == "rank":
+            return f"🪁 按邀请人数排名，前 {winner_count} 名获奖"
+        return f"🪁 邀请满 {minimum} 人即可参与，抽 {winner_count} 人"
     if kind == "rank":
         return f"💬 按发言次数排名，前 {winner_count} 名获奖"
-    return f"💬 发言满 {min_messages} 次即可参与，抽 {winner_count} 人"
+    return f"💬 发言满 {minimum} 次即可参与，抽 {winner_count} 人"
 
 
-def counting_text(count_from, timezone):
-    return f"📊 统计 {when_text(count_from, timezone)} 起的文字发言"
+def counting_text(count_from, timezone, invite_via=None):
+    since = when_text(count_from, timezone)
+    if invite_via == "link":
+        return f"📊 统计 {since} 起用专属邀请链接进群的新成员"
+    if invite_via == "add":
+        return f"📊 统计 {since} 起被「添加成员」拉进群的新成员"
+    return f"📊 统计 {since} 起的文字发言"
+
+
+def tally(entry):
+    """What an activity or invite raffle counts for someone: messages or new members."""
+    return entry.get("invites", entry.get("messages", 0))
 
 
 def joined_text(joined):
@@ -87,9 +104,17 @@ def join_text(keyword):
 def draw_rule(raffle, timezone):
     """When the raffle is drawn: at its deadline, or once full but no later than it."""
     when = when_text(raffle["deadline"], timezone)
+    if raffle["target_count"] and raffle.get("invite_via"):
+        return f"满 {raffle['target_count']} 人达标即开奖（最晚 {when}）"
     if raffle["target_count"]:
         return f"满 {raffle['target_count']} 人开奖（最晚 {when}）"
     return f"开奖时间：{when}"
+
+
+INVITE_HINTS = {
+    "link": "点「🔗 领取我的邀请链接」或在群里发送 /link，把专属链接发给好友",
+    "add": "用「添加成员」把好友拉进群即可参与",
+}
 
 
 def card(raffle, timezone):
@@ -104,9 +129,10 @@ def card(raffle, timezone):
         if raffle.get("cost"):
             lines.append(cost_text(raffle["cost"]))
     else:
+        invite_via = raffle.get("invite_via")
         lines += [
-            activity_rule(kind, raffle["winner_count"], raffle["min_messages"]),
-            counting_text(raffle["count_from"], timezone),
+            activity_rule(kind, raffle["winner_count"], raffle["min_messages"], invite_via),
+            counting_text(raffle["count_from"], timezone, invite_via),
         ]
     lines.append(draw_rule(raffle, timezone))
     if raffle["weighted"]:
@@ -114,10 +140,15 @@ def card(raffle, timezone):
     markup = None
     if raffle["status"] == "OPEN" and raffle["chat_id"] is not None:
         if kind != "join":
-            lines.append("👉 在群里发言即可参与")
-            markup = InlineKeyboardMarkup(
-                [[InlineKeyboardButton("📊 查看我的排名", callback_data=f"rank:{raffle['id']}")]]
-            )
+            lines.append(f"👉 {INVITE_HINTS.get(raffle.get('invite_via'), '在群里发言即可参与')}")
+            label = "📊 查看我的邀请" if raffle.get("invite_via") else "📊 查看我的排名"
+            row = [InlineKeyboardButton(label, callback_data=f"rank:{raffle['id']}")]
+            if raffle.get("invite_via") == "link":
+                link = InlineKeyboardButton(
+                    "🔗 领取我的邀请链接", callback_data=f"invite:{raffle['id']}"
+                )
+                row.insert(0, link)
+            markup = InlineKeyboardMarkup([row])
         elif raffle["keyword"]:
             lines.append(f"👉 {join_text(raffle['keyword'])}")
         else:
@@ -136,25 +167,28 @@ def standing_text(raffle, ranked, user_id):
     """A member's standing in an open activity raffle, shown only to them when they press
     the card's button. Telegram shows at most 200 characters."""
     mine = next((i for i, e in enumerate(ranked) if e["user_id"] == user_id), None)
-    spoken = ranked[mine]["messages"] if mine is not None else 0
+    done = tally(ranked[mine]) if mine is not None else 0
+    doing, unit = ("邀请", "人") if raffle.get("invite_via") else ("发言", "次")
     if raffle["kind"] == "rank":
-        lines = [f"📊 发言排名 · 前 {raffle['winner_count']} 名获奖"]
+        lines = [f"📊 {doing}排名 · 前 {raffle['winner_count']} 名获奖"]
         lines += [
-            f"{place}. {name_text(e['display_name'])[:8]} · {e['messages']} 次"
+            f"{place}. {name_text(e['display_name'])[:8]} · {tally(e)} {unit}"
             for place, e in enumerate(ranked[:5], 1)
         ]
-        if mine is None:
+        if mine is None and raffle.get("invite_via"):
+            lines.append("你还没有邀请到新成员，邀请好友进群即可参与排名")
+        elif mine is None:
             lines.append("你还没有发言，发言即可参与排名")
         else:
-            lines.append(f"你：第 {mine + 1} 名 · {spoken} 次")
+            lines.append(f"你：第 {mine + 1} 名 · {done} {unit}")
     else:
         need = raffle["min_messages"]
-        enough = sum(1 for e in ranked if e["messages"] >= need)
-        lines = [f"📊 发言满 {need} 次即可参与抽奖", f"已达标 {enough} 人"]
-        if spoken >= need:
-            lines.append(f"你已发言 {spoken} 次，已达标")
+        enough = sum(1 for e in ranked if tally(e) >= need)
+        lines = [f"📊 {doing}满 {need} {unit}即可参与抽奖", f"已达标 {enough} 人"]
+        if done >= need:
+            lines.append(f"你已{doing} {done} {unit}，已达标")
         else:
-            lines.append(f"你已发言 {spoken} 次，还差 {need - spoken} 次")
+            lines.append(f"你已{doing} {done} {unit}，还差 {need - done} {unit}")
     return "\n".join(lines)[:200]
 
 
@@ -167,6 +201,8 @@ def result_text(result, mention=False):
         prize = f" — {safe(winner['prize'])}" if winner.get("prize") else ""
         if "messages" in winner:  # group activity raffles
             prize += f"（发言 {winner['messages']} 次）"
+        elif "invites" in winner:
+            prize += f"（邀请 {winner['invites']} 人）"
         if mention:
             link = f'<a href="tg://user?id={winner["user_id"]}">{name}</a>'
             lines.append(f"{index}. {link}{prize}")

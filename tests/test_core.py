@@ -689,7 +689,7 @@ def test_activity_raffles_have_their_own_rules(setup):
         (lambda: store.override(activity, 99, 1, 5), "群活跃抽奖"),
         (lambda: store.designate(activity, 99, 1), "群活跃抽奖"),
         (lambda: ranking(store, winners=1, prizes=[["奖", 2]]), "每个名次一份奖品"),
-        (lambda: ranking(store, winners=1, kind="reach", prizes=[["奖", 1]]), "发言次数"),
+        (lambda: ranking(store, winners=1, kind="reach", prizes=[["奖", 1]]), "设置次数"),
         (lambda: store.create(99, "x", 1, 60, count_from=0), "只有群活跃抽奖统计发言"),
         (lambda: ranking(store, chat_id=None, winners=1), "发布群"),
     ):
@@ -1037,3 +1037,86 @@ def test_points_panel(setup):
     assert store.swap_points_panel(-100, 9) == 5
     store.migrate_chat(-100, -1001)  # left behind in the old group
     assert store.swap_points_panel(-1001, 12) is None
+
+
+def invite_raffle(store, winners=2, **options):
+    options.setdefault("kind", "rank")
+    options.setdefault("invite_via", "link")
+    options.setdefault("prizes", [[f"奖{i}", 1] for i in range(winners)])
+    return store.create(99, "邀请榜", winners, 60, chat_id=-100, **options)
+
+
+def test_invites_count_new_members_once(setup):
+    store, _, now = setup
+    start = now[0]
+    assert store.joined(-100, 10, start - 5, 1, "Eve", "link")  # before the raffle
+    rid = invite_raffle(store)
+    assert store.joined(-100, 11, start + 10, 1, "Eve", "link")
+    assert store.joined(-100, 12, start + 11, 2, "Frank", "link")
+    assert store.joined(-100, 13, start + 12, 1, "Eve", "link")
+    assert not store.joined(-100, 1, start + 13, 1, "Eve", "link")  # bringing oneself in
+    assert not store.joined(-100, 14, start + 14, None)  # nobody brought them
+    store.count_message(-100, 20, "老成员", start - 3600)
+    store.flush_activity()
+    assert not store.joined(-100, 20, start + 15, 2, "Frank", "link")  # seen here before
+    assert store.joined(-100, 21, start + 16, 2, "Frank", "add")  # another way of inviting
+    _, ranked = store.ranking(rid)
+    assert [(e["user_id"], e["invites"]) for e in ranked] == [(1, 2), (2, 1)]
+    store.leave_group(-100, 13, start + 20)  # gone before the draw: no longer counts
+    assert not store.joined(-100, 13, start + 30, 2, "Frank", "link")  # nor when back
+    store.leave_group(-100, 11, start + 40)
+    _, ranked = store.ranking(rid)
+    assert [(e["user_id"], e["invites"]) for e in ranked] == [(2, 1)]  # both of Eve's left
+    now[0] = start + 3600
+    winners = store.draw(rid, 99)["winners"]
+    assert [(w["user_id"], w["prize"], w["invites"]) for w in winners] == [(2, "奖0", 1)]
+
+
+def test_inviters_who_left_are_out(setup):
+    store, _, now = setup
+    rid = invite_raffle(store, winners=1)
+    store.joined(-100, 11, now[0] + 10, 1, "Eve", "link")
+    store.leave_group(-100, 1, now[0] + 20)
+    assert store.ranking(rid)[1] == []
+    store.joined(-100, 1, now[0] + 30)  # back again
+    assert [e["user_id"] for e in store.ranking(rid)[1]] == [1]
+
+
+def test_invite_reach_is_drawn_once_enough_have_enough(setup):
+    store, _, now = setup
+    rid = invite_raffle(store, winners=1, kind="reach", invite_via="add", min_messages=2, target=1)
+    store.joined(-100, 11, now[0] + 10, 1, "Eve", "add")
+    assert store.full_invite_raffles(-100) == []
+    store.joined(-100, 12, now[0] + 20, 1, "Eve", "add")
+    assert store.full_invite_raffles(-100) == [rid]
+    winners = store.draw(rid, 99)["winners"]  # full: no need to wait for the deadline
+    assert [(w["user_id"], w["invites"]) for w in winners] == [(1, 2)]
+
+
+def test_invite_raffles_have_their_own_rules(setup):
+    store, _, _ = setup
+    rid = invite_raffle(store, winners=1)
+    for operation, message in (
+        (lambda: invite_raffle(store, invite_via="mail"), "邀请方式无效"),
+        (lambda: store.create(99, "x", 1, 60, chat_id=-100, invite_via="link"), "邀请方式无效"),
+        (lambda: invite_raffle(store, winners=1, target=5), "只有邀请次数抽奖可以满人开奖"),
+        (lambda: invite_raffle(store, count_from=store.clock() - 60), "从发布时开始统计"),
+        (lambda: store.adjust(rid, 99, 1, by=1), "只有群活跃抽奖能修改发言次数"),
+        (lambda: store.join(rid, 1, "x"), "不用报名"),
+    ):
+        with pytest.raises(LotteryError, match=message):
+            operation()
+
+
+def test_invite_links_and_a_supergroup_upgrade(setup):
+    store, _, now = setup
+    store.save_invite_link(-100, 1, "https://t.me/+abc", "Eve")
+    assert store.invite_link(-100, 1) == "https://t.me/+abc"
+    assert store.link_owner(-100, "https://t.me/+abc") == (1, "Eve")
+    assert store.link_owner(-100, "https://t.me/+other") is None
+    rid = invite_raffle(store, winners=1)
+    store.joined(-100, 11, now[0] + 10, 1, "Eve", "link")
+    store.migrate_chat(-100, -1001)
+    assert store.invite_link(-1001, 1) is None  # links to the old group are gone
+    assert store.invite_link(-100, 1) is None
+    assert [e["user_id"] for e in store.ranking(rid)[1]] == [1]

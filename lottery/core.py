@@ -294,6 +294,38 @@ MIGRATIONS = [
     # 16: the 灵石 panel each group has pinned: a message whose buttons answer the member who
     # presses them alone.
     "ALTER TABLE groups ADD COLUMN points_panel INTEGER",
+    # 17: invite raffles, "rank" and "reach" raffles that count the new members each member
+    # brought in from count_from on, by their own invite link ("link") or by adding them
+    # ("add"); min_messages is then the invites needed. invites keeps who brought in whom,
+    # once for each member ever; departed, who has left and not come back.
+    """
+    ALTER TABLE raffles ADD COLUMN invite_via TEXT;
+    CREATE TABLE IF NOT EXISTS invite_links (
+        chat_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        link TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        PRIMARY KEY (chat_id, user_id)
+    );
+    CREATE INDEX IF NOT EXISTS invite_links_by_link ON invite_links(link);
+    CREATE TABLE IF NOT EXISTS invites (
+        chat_id INTEGER NOT NULL,
+        invitee_id INTEGER NOT NULL,
+        inviter_id INTEGER NOT NULL,
+        inviter_name TEXT NOT NULL,
+        via TEXT NOT NULL,
+        joined_at REAL NOT NULL,
+        left_at REAL,
+        PRIMARY KEY (chat_id, invitee_id)
+    );
+    CREATE INDEX IF NOT EXISTS invites_by_inviter ON invites(chat_id, inviter_id);
+    CREATE TABLE IF NOT EXISTS departed (
+        chat_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        at REAL NOT NULL,
+        PRIMARY KEY (chat_id, user_id)
+    )
+    """,
 ]
 # Deletion delays are seconds after posting: 0 deletes at once, None keeps the message.
 GROUP_DEFAULTS = {
@@ -332,6 +364,7 @@ MAX_PRIZES = 10
 MAX_KEYWORD = 32
 # join: people join by button or keyword; rank and reach: group activity raffles.
 KINDS = ("join", "rank", "reach")
+INVITE_WAYS = ("link", "add")  # an invite raffle counts joins by invite link, or by adding
 LOOK_BACK_DAYS = 30  # how far back an activity raffle may start counting
 KEEP_ACTIVITY = 31 * 86400
 
@@ -411,14 +444,16 @@ class Store:
         return raffle["status"] == "OPEN" and self.clock() < raffle["deadline"]
 
     def _full(self, db, raffle):
+        """Whether `target_count` have joined, or for an invite raffle have enough invites."""
         target = raffle["target_count"]
-        return (
-            target is not None
-            and db.execute(
-                "SELECT COUNT(*) FROM participants WHERE raffle_id=?", (raffle["id"],)
-            ).fetchone()[0]
-            >= target
-        )
+        if target is None:
+            return False
+        if raffle["invite_via"]:
+            return len(self._invited(db, raffle)) >= target
+        count = db.execute(
+            "SELECT COUNT(*) FROM participants WHERE raffle_id=?", (raffle["id"],)
+        ).fetchone()[0]
+        return count >= target
 
     def _editable(self, db, raffle_id):
         raffle = self._get(db, raffle_id)
@@ -491,6 +526,13 @@ class Store:
             db.execute(
                 "UPDATE setting_changes SET chat_id=? WHERE chat_id=?", (new_chat_id, old_chat_id)
             )
+            for table in ("invites", "departed"):
+                db.execute(
+                    f"UPDATE OR REPLACE {table} SET chat_id=? WHERE chat_id=?",
+                    (new_chat_id, old_chat_id),
+                )
+            # Invite links lead to the old group; members get new ones for the supergroup.
+            db.execute("DELETE FROM invite_links WHERE chat_id=?", (old_chat_id,))
             for row in rows:
                 self.audit(
                     db, row["id"], 0, "migrate_chat", {"before": old_chat_id, "after": new_chat_id}
@@ -503,7 +545,9 @@ class Store:
         """Cancel user_id's joins in raffles bound to chat_id that were still open at left_at.
 
         Frozen raffles are untouched: their snapshot is the fixed list of the draw. Activity
-        raffles leave out whoever left after their last message. Their 灵石 there are gone.
+        raffles leave out whoever left after their last message. Their 灵石 there are gone,
+        an invite that brought them in no longer counts, and their own invites count no more
+        unless they come back.
         """
         self.flush_activity()  # so that the leave comes after every message saved
         with self.transaction() as db:
@@ -511,6 +555,11 @@ class Store:
                 "UPDATE speakers SET left_at=? WHERE chat_id=? AND user_id=?",
                 (left_at, chat_id, user_id),
             )
+            db.execute(
+                "UPDATE invites SET left_at=? WHERE chat_id=? AND invitee_id=? AND left_at IS NULL",
+                (left_at, chat_id, user_id),
+            )
+            db.execute("INSERT OR REPLACE INTO departed VALUES(?,?,?)", (chat_id, user_id, left_at))
             row = db.execute(
                 "SELECT balance FROM points WHERE chat_id=? AND user_id=?", (chat_id, user_id)
             ).fetchone()
@@ -549,6 +598,7 @@ class Store:
         count_from=None,
         min_messages=None,
         cost=None,
+        invite_via=None,
     ):
         """Create a raffle ending after `minutes` or at `deadline`, or earlier once `target`
         people have joined. Menus create it already bound to `chat_id`; `weighted` shows the
@@ -560,19 +610,30 @@ class Store:
         `count_from` (default: now) on: "rank" hands its prizes, one per place, to the most
         active; "reach" draws among those with at least `min_messages`.
 
+        With `invite_via` ("link" or "add") such a raffle counts the new members each member
+        brought in from its publishing on instead, and `min_messages` is the invites needed;
+        a "reach" one may then be drawn once `target` members have enough.
+
         Joining a raffle with a `cost` takes that many of the member's 灵石 in its group."""
         integer(winner_count, "中奖名额", 1, 100)
         if kind not in KINDS:
             raise LotteryError("抽奖类型无效。")
+        if invite_via is not None and (invite_via not in INVITE_WAYS or kind == "join"):
+            raise LotteryError("邀请方式无效。")
         if kind != "join":
-            if prizes is None or chat_id is None or keyword is not None or target is not None:
-                raise LotteryError("群活跃抽奖需要奖品和发布群，不用口令或满人开奖。")
+            full = invite_via is not None and kind == "reach"  # enough people with enough
+            if prizes is None or chat_id is None or keyword is not None:
+                raise LotteryError("群活跃抽奖和邀请抽奖需要奖品和发布群，不用口令。")
+            if target is not None and not full:
+                raise LotteryError("只有邀请次数抽奖可以满人开奖。")
             if kind == "rank" and any(count != 1 for _, count in prizes):
                 raise LotteryError("排名抽奖每个名次一份奖品。")
+            if invite_via is not None and count_from is not None:
+                raise LotteryError("邀请抽奖从发布时开始统计。")
         if (kind == "reach") != (min_messages is not None):
-            raise LotteryError("只有达到发言次数抽奖需要设置发言次数。")
+            raise LotteryError("只有达标抽奖需要设置次数。")
         if min_messages is not None:
-            integer(min_messages, "发言次数", 1, 100_000)
+            integer(min_messages, "邀请人数" if invite_via else "发言次数", 1, 100_000)
         if kind == "join" and count_from is not None:
             raise LotteryError("只有群活跃抽奖统计发言。")
         if cost is not None:
@@ -605,8 +666,8 @@ class Store:
                     )
             cursor = db.execute(
                 "INSERT INTO raffles(title,winner_count,deadline,created_by,chat_id,target_count,"
-                "weighted,prizes,keyword,kind,count_from,min_messages,cost) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "weighted,prizes,keyword,kind,count_from,min_messages,cost,invite_via) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     title.strip(),
                     winner_count,
@@ -621,6 +682,7 @@ class Store:
                     count_from,
                     min_messages,
                     cost,
+                    invite_via,
                 ),
             )
             raffle_id = cursor.lastrowid
@@ -636,6 +698,8 @@ class Store:
             }
             if kind != "join":
                 details |= {"kind": kind, "count_from": count_from, "min_messages": min_messages}
+            if invite_via is not None:
+                details["invite_via"] = invite_via
             if cost is not None:
                 details["cost"] = cost
             self.audit(db, raffle_id, actor, "create", details)
@@ -956,6 +1020,8 @@ class Store:
                 raise LotteryError("这场抽奖不按发言次数。")
             if not self._open(raffle):
                 raise LotteryError("统计已截止，结果以开奖公告为准。")
+            if raffle["invite_via"]:
+                return raffle, self._invited(db, raffle, everyone=True)
             return raffle, self._speakers(db, raffle, everyone=True)
 
     def adjust(self, raffle_id, actor, user_id, *, by=None, to=None):
@@ -965,7 +1031,7 @@ class Store:
         integer(user_id, "用户 ID", 1, 2**63 - 1)
         with self.transaction() as db:
             raffle = self._get(db, raffle_id)
-            if raffle["kind"] == "join":
+            if raffle["kind"] == "join" or raffle["invite_via"]:
                 raise LotteryError("只有群活跃抽奖能修改发言次数。")
             if not self._open(raffle):
                 raise LotteryError("统计已截止，不能再修改发言次数。")
@@ -1081,6 +1147,103 @@ class Store:
                     tally[uid][2] = name
         return tally
 
+    def _invited(self, db, raffle, everyone=False):
+        """Who brought new members into the raffle's group from count_from until the
+        deadline, the way it counts: most invites first and, among equals, whoever got to that
+        number first. Invites of members who left before the deadline do not count, nor do
+        those of an inviter who left; "reach" keeps those with enough unless `everyone`."""
+        deadline = raffle["deadline"]
+        gone = {
+            row[0]
+            for row in db.execute(
+                "SELECT user_id FROM departed WHERE chat_id=? AND at<?",
+                (raffle["chat_id"], deadline),
+            )
+        }
+        entries = {}
+        for row in db.execute(
+            "SELECT inviter_id,inviter_name,joined_at FROM invites WHERE chat_id=? AND via=? "
+            "AND joined_at>=? AND joined_at<? AND (left_at IS NULL OR left_at>=?) "
+            "ORDER BY joined_at",
+            (raffle["chat_id"], raffle["invite_via"], raffle["count_from"], deadline, deadline),
+        ):
+            uid = row["inviter_id"]
+            if uid in gone:
+                continue
+            entry = entries.setdefault(uid, {"user_id": uid, "invites": 0, "weight": 1})
+            entry["invites"] += 1
+            entry["reached_at"] = row["joined_at"]
+            entry["display_name"] = row["inviter_name"] or f"用户 {uid}"
+        ranked = sorted(
+            entries.values(), key=lambda e: (-e["invites"], e["reached_at"], e["user_id"])
+        )
+        if raffle["kind"] == "reach" and not everyone:
+            ranked = [e for e in ranked if e["invites"] >= raffle["min_messages"]]
+        return ranked
+
+    def joined(self, chat_id, user_id, at, inviter_id=None, inviter_name="", via=None):
+        """user_id joined chat_id at `at`, brought in by inviter_id `via` "link" or "add" if
+        known. It counts as an invite only the first time the bot sees them join, never for
+        someone it saw there before, and never for bringing oneself in. Whether it counted."""
+        with self.transaction() as db:
+            known = any(
+                db.execute(
+                    f"SELECT 1 FROM {table} WHERE chat_id=? AND {column}=?", (chat_id, user_id)
+                ).fetchone()
+                for table, column in (
+                    ("invites", "invitee_id"),
+                    ("departed", "user_id"),
+                    ("speakers", "user_id"),
+                    ("points", "user_id"),
+                )
+            )
+            db.execute("DELETE FROM departed WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+            if known or inviter_id is None or inviter_id == user_id or via not in INVITE_WAYS:
+                return False
+            db.execute(
+                "INSERT INTO invites(chat_id,invitee_id,inviter_id,inviter_name,via,joined_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (chat_id, user_id, inviter_id, inviter_name[:128], via, at),
+            )
+            return True
+
+    def full_invite_raffles(self, chat_id):
+        """Open invite raffles of chat_id that have as many members with enough invites as
+        they wait for, to be drawn now."""
+        with self.transaction() as db:
+            return [
+                row["id"]
+                for row in db.execute(
+                    "SELECT * FROM raffles WHERE chat_id=? AND status='OPEN' "
+                    "AND invite_via IS NOT NULL AND target_count IS NOT NULL AND deadline>?",
+                    (chat_id, self.clock()),
+                ).fetchall()
+                if self._full(db, dict(row))
+            ]
+
+    def invite_link(self, chat_id, user_id):
+        with self.reading() as db:
+            row = db.execute(
+                "SELECT link FROM invite_links WHERE chat_id=? AND user_id=?", (chat_id, user_id)
+            ).fetchone()
+        return row[0] if row else None
+
+    def save_invite_link(self, chat_id, user_id, link, display_name):
+        with self.transaction() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO invite_links VALUES(?,?,?,?)",
+                (chat_id, user_id, link, display_name[:128]),
+            )
+
+    def link_owner(self, chat_id, link):
+        """Whose invite link to chat_id `link` is, as (user_id, name), or None."""
+        with self.reading() as db:
+            row = db.execute(
+                "SELECT user_id,display_name FROM invite_links WHERE chat_id=? AND link=?",
+                (chat_id, link),
+            ).fetchone()
+        return tuple(row) if row else None
+
     def presets(self, raffle_id):
         """Personal weights of people who have not joined, as (user_id, weight)."""
         with self.transaction() as db:
@@ -1095,6 +1258,8 @@ class Store:
             ]
 
     def _entries(self, db, raffle):
+        if raffle["invite_via"]:
+            return self._invited(db, raffle)
         if raffle["kind"] != "join":
             return self._speakers(db, raffle)
         rid = raffle["id"]
@@ -1166,6 +1331,8 @@ class Store:
                 "count_from": raffle["count_from"],
                 "min_messages": raffle["min_messages"],
             }
+            if raffle["invite_via"]:
+                snapshot["invite_via"] = raffle["invite_via"]
         raw = encode(snapshot)
         digest = hashlib.sha256(raw.encode()).hexdigest()
         db.execute(

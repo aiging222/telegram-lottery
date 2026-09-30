@@ -98,6 +98,7 @@ PUBLIC_HELP = """🎁 抽奖机器人
 /raffle 抽奖ID — 在发布群里查看抽奖
 /result 抽奖ID — 在发布群里查看开奖结果
 /id — 查看自己的用户 ID
+/link — 在群里领取自己的专属邀请链接（邀请抽奖用）
 在群里发送「签到」领灵石，「灵石」查看自己的灵石，「灵石榜」看排行。"""
 ADMIN_HELP = """
 
@@ -336,6 +337,12 @@ class BotHandlers:
                             or "暂无规则。"
                         ),
                     )
+                elif command == "preview" and raffle["invite_via"]:
+                    lines = [f"抽奖 {rid}｜{status_text(raffle)}｜按邀请人数"]
+                    lines += [
+                        f"{name_text(p['display_name'])} / {p['user_id']}：邀请 {p['invites']} 人"
+                        for p in raffle["entries"][:30]
+                    ]
                 elif command == "preview" and raffle["kind"] != "join":
                     lines = [f"抽奖 {rid}｜{status_text(raffle)}｜按发言次数"]
                     for p in raffle["entries"][:30]:
@@ -376,6 +383,7 @@ class BotHandlers:
         query = update.callback_query
         if query is None or query.from_user.is_bot:
             return
+        url = None
         try:
             action, raw_id = query.data.split(":", 1)
             rid = integer(int(raw_id), "抽奖 ID", 1, 2**63 - 1)
@@ -398,13 +406,23 @@ class BotHandlers:
             elif action == "rank":
                 raffle, ranked = await self.ranking(rid)
                 text = standing_text(raffle, ranked, query.from_user.id)
+            elif action == "invite":
+                raffle = await asyncio.to_thread(self.store.view, rid)
+                if raffle["status"] != "OPEN" or not raffle["invite_via"]:
+                    raise LotteryError("统计已截止，结果以开奖公告为准。")
+                # A t.me link to the bot, opened by the member's app: a private chat with it
+                # that hands them their link (see Menu.start).
+                url = f"https://t.me/{context.bot.username}?start=inv{raffle['chat_id']}"
             else:
                 # Cards published before weights became private still carry this button.
                 text = "该功能已下线。"
         except (LotteryError, ValueError, OverflowError) as exc:
             text = str(exc) if isinstance(exc, LotteryError) else "无效的抽奖按钮。"
         try:
-            await query.answer(text, show_alert=True)
+            if url:
+                await query.answer(url=url)
+            else:
+                await query.answer(text, show_alert=True)
         except TelegramError as exc:
             # Clicks replayed after downtime are too old to answer. Any join above is
             # already saved, so there is nothing to retry and nothing to tell the group.
@@ -493,6 +511,8 @@ class BotHandlers:
                 self.store.set_manager, change.chat.id, member.user.id, member.status in MANAGERS
             )
         if in_group(member):
+            if not in_group(change.old_chat_member):
+                await self.member_joined(context, change)
             return
         # Judge by when the member left, not when the update arrives: after downtime a
         # leave from before the deadline still cancels the join if the list is not frozen.
@@ -504,6 +524,74 @@ class BotHandlers:
         )
         for rid in left:
             self.refresh_card_soon(context, rid)  # one fewer on the card
+
+    async def member_joined(self, context, change):
+        """Record who brought a new member in, for invite raffles: the owner of the invite
+        link they came by, or whoever added them. Invite raffles that now have as many
+        members with enough invites as they wait for are drawn."""
+        user = change.new_chat_member.user
+        if user.is_bot:
+            return
+        chat_id = change.chat.id
+        inviter, name, via = None, "", None
+        link = change.invite_link
+        adder = change.from_user
+        if link is not None:
+            # Only links the bot made are shown in full, so only those are found.
+            owner = await asyncio.to_thread(self.store.link_owner, chat_id, link.invite_link)
+            if owner is not None:
+                (inviter, name), via = owner, "link"
+        elif adder is not None and adder.id != user.id and not adder.is_bot:
+            if not change.via_join_request:  # else it is the admin who let them in
+                inviter, name, via = adder.id, name_text(adder.full_name), "add"
+        counted = await asyncio.to_thread(
+            self.store.joined, chat_id, user.id, change.date.timestamp(), inviter, name, via
+        )
+        if counted:
+            for rid in await asyncio.to_thread(self.store.full_invite_raffles, chat_id):
+                await self.announce(context.bot, rid, chat_id)
+
+    async def invite_link_text(self, bot, chat_id, user, check=True):
+        """The answer to asking for one's own invite link to chat_id: the link, made once
+        and kept, or why there is none. With `check`, only a member of the group gets one."""
+        if check:
+            try:
+                member = await self.group_member(bot, chat_id, user.id)
+            except TelegramError as exc:
+                LOG.warning("群成员校验失败：%s", exc)
+                return "暂时无法确认你的群成员身份，请稍后重试。"
+            if not member:
+                return "只有群成员才能领取这个群的邀请链接。"
+        link = await asyncio.to_thread(self.store.invite_link, chat_id, user.id)
+        if link is None:
+            name = name_text(user.full_name)
+            try:
+                made = await bot.create_chat_invite_link(chat_id, name=(name or str(user.id))[:32])
+            except TelegramError as exc:
+                LOG.warning("群 %s 生成邀请链接失败：%s", chat_id, exc)
+                return (
+                    "没能生成邀请链接：机器人需要是群管理员并有「邀请用户」权限，请联系群管理员。"
+                )
+            link = made.invite_link
+            await asyncio.to_thread(self.store.save_invite_link, chat_id, user.id, link, name)
+        title = await asyncio.to_thread(self.store.group_title, chat_id)
+        return (
+            f"🔗 你在「{title}」的专属邀请链接：\n{link}\n\n"
+            "把它发给好友，好友通过这条链接进群，就算你邀请的。"
+        )
+
+    @one_at_a_time(sender)
+    async def link(self, update, context):
+        """/link in a group: the sender's own invite link, left a minute to be copied."""
+        message, user, chat = update.effective_message, update.effective_user, update.effective_chat
+        if message is None or user is None or user.is_bot or message.sender_chat:
+            return
+        if chat.type not in ("group", "supergroup"):
+            await reply(message, "请在群里发送 /link，或点抽奖卡片上的「🔗 领取我的邀请链接」。")
+            return
+        # Whoever writes in the group is in it: no need to ask Telegram.
+        text = await self.invite_link_text(context.bot, chat.id, user, check=False)
+        await self.notice(context.bot, message, text, at_least=60)
 
     async def after_join(self, context, rid):
         if await asyncio.to_thread(self.store.is_full, rid):
@@ -638,13 +726,14 @@ class BotHandlers:
 
     # Tidying up: group messages are deleted now or later, as each group's settings say.
 
-    async def notice(self, bot, message, text, markup=None):
-        """Answer a command; in a group both the command and the answer are tidied away."""
+    async def notice(self, bot, message, text, markup=None, at_least=0):
+        """Answer a command; in a group both the command and the answer are tidied away, no
+        sooner than `at_least` seconds."""
         sent = await reply(message, text, markup)
         if message.chat.type in ("group", "supergroup"):
             self.spent(message.chat.id, len(sent))
             ids = [message.message_id, *(part.message_id for part in sent)]
-            await self.tidy(bot, message.chat.id, ids, "delete_notices")
+            await self.tidy(bot, message.chat.id, ids, "delete_notices", at_least)
 
     async def tidy(self, bot, chat_id, message_ids, setting, at_least=0):
         """Delete messages as the group's `setting` says, but no sooner than `at_least`
@@ -822,8 +911,9 @@ def build_application(settings):
     app.add_handler(CommandHandler("start", menu.start))
     app.add_handler(CommandHandler("cancel", menu.cancel, filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler(commands, handlers.command))
+    app.add_handler(CommandHandler("link", handlers.link))
     app.add_handler(
-        CallbackQueryHandler(handlers.callback, pattern=r"^(join|rank|weight):[0-9]{1,19}$")
+        CallbackQueryHandler(handlers.callback, pattern=r"^(join|rank|weight|invite):[0-9]{1,19}$")
     )
     app.add_handler(CallbackQueryHandler(menu.callback, pattern=r"^m:"))
     points = Points(handlers)

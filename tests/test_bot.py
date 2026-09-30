@@ -298,7 +298,7 @@ def test_build_application_offline(tmp_path, monkeypatch):
         "123456:offline-test-token", frozenset({99}), str(tmp_path / "test.sqlite3"), SHANGHAI
     )
     app = build_application(settings)
-    assert len(app.handlers[0]) == 11
+    assert len(app.handlers[0]) == 12
     assert app.concurrent_updates > 1
     assert {"chat_member", "my_chat_member"} <= set(ALLOWED_UPDATES)
     jobs = [job.callback.__name__ for job in app.job_queue.jobs()]
@@ -1062,3 +1062,140 @@ def test_short_delays_are_timed_to_the_second(setup, monkeypatch):
     assert waited == [3]
     with store.reading() as db:
         assert db.execute("SELECT COUNT(*) FROM deletions").fetchone()[0] == 2
+
+
+def arrival(user_id, at, link=None, by=None, request=False):
+    """A chat_member update: user_id joined the group at `at`, by an invite link or added
+    by someone."""
+    user = SimpleNamespace(id=user_id, is_bot=False, full_name=f"u{user_id}")
+    adder = SimpleNamespace(id=by, is_bot=False, full_name=f"u{by}") if by else user
+    change = SimpleNamespace(
+        chat=SimpleNamespace(id=GROUP["id"]),
+        date=datetime.fromtimestamp(at, UTC),
+        old_chat_member=SimpleNamespace(status=ChatMember.LEFT),
+        new_chat_member=SimpleNamespace(status=ChatMember.MEMBER, user=user),
+        invite_link=link and SimpleNamespace(invite_link=link),
+        from_user=adder,
+        via_join_request=request,
+    )
+    return SimpleNamespace(chat_member=change)
+
+
+@pytest.fixture
+def inviting(tmp_path):
+    now = [1_800_000_000.0]
+    store = Store(tmp_path / "invite.sqlite3", clock=lambda: now[0])
+    store.remember_group(GROUP["id"], "测试群")
+    return store, now, BotHandlers(store, {99}, SHANGHAI)
+
+
+def test_joins_are_credited_to_whoever_brought_them_in(inviting):
+    store, now, handlers = inviting
+    by_link = store.create(
+        99, "链接榜", 1, 60, chat_id=GROUP["id"], kind="rank", prizes=[["a", 1]], invite_via="link"
+    )
+    by_adding = store.create(
+        99, "拉人榜", 1, 60, chat_id=GROUP["id"], kind="rank", prizes=[["a", 1]], invite_via="add"
+    )
+    store.save_invite_link(GROUP["id"], 1, "https://t.me/+eve", "Eve")
+    context = SimpleNamespace(bot=fake_bot(), job_queue=None)
+    for update in (
+        arrival(11, now[0] + 10, link="https://t.me/+eve"),
+        arrival(12, now[0] + 11, link="https://t.me/+someone-elses"),  # not the bot's link
+        arrival(13, now[0] + 12, by=2),
+        arrival(14, now[0] + 13, by=2, request=True),  # an admin letting them in
+        arrival(15, now[0] + 14),  # came in by themselves
+    ):
+        asyncio.run(handlers.member_changed(update, context))
+    assert [(e["user_id"], e["display_name"]) for e in store.ranking(by_link)[1]] == [(1, "Eve")]
+    assert [(e["user_id"], e["display_name"]) for e in store.ranking(by_adding)[1]] == [(2, "u2")]
+
+
+def test_invite_reach_raffles_are_drawn_once_enough_have_enough(inviting):
+    store, now, handlers = inviting
+    rid = store.create(
+        99,
+        "拉人抽奖",
+        1,
+        deadline=now[0] + 86400,
+        chat_id=GROUP["id"],
+        kind="reach",
+        prizes=[["a", 1]],
+        invite_via="add",
+        min_messages=2,
+        target=1,
+    )
+    bot = fake_bot()
+    context = SimpleNamespace(bot=bot, job_queue=None)
+    asyncio.run(handlers.member_changed(arrival(11, now[0] + 10, by=2), context))
+    bot.send_message.assert_not_awaited()
+    asyncio.run(handlers.member_changed(arrival(12, now[0] + 20, by=2), context))
+    announcement = bot.send_message.await_args.args[1]
+    assert '1. <a href="tg://user?id=2">u2</a> — a（邀请 2 人）' in announcement
+    assert store.view(rid)["status"] == "DRAWN"
+
+
+def test_members_get_their_invite_link(inviting):
+    store, now, handlers = inviting
+    bot = fake_bot(
+        create_chat_invite_link=AsyncMock(
+            return_value=SimpleNamespace(invite_link="https://t.me/+alice")
+        ),
+        get_chat_member=member(ChatMember.MEMBER),
+    )
+    update, context = command_update("/link", user_id=123, chat_type="supergroup")
+    update.effective_user.full_name = "Alice"
+    context.bot = bot
+    asyncio.run(handlers.link(update, context))
+    text = update.effective_message.reply_text.call_args.args[0]
+    assert text.startswith("🔗 你在「测试群」的专属邀请链接：\nhttps://t.me/+alice\n")
+    assert bot.create_chat_invite_link.await_args.kwargs == {"name": "Alice"}
+    assert store.link_owner(GROUP["id"], "https://t.me/+alice") == (123, "Alice")
+    now[0] += 3
+    assert store.due_deletions() == {}  # left a minute to be copied, not 3 seconds
+    now[0] += 57
+    assert store.due_deletions() == {GROUP["id"]: [10, 77]}
+    # The same link every time, also in private.
+    user = SimpleNamespace(id=123, full_name="Alice")
+    again = asyncio.run(handlers.invite_link_text(bot, GROUP["id"], user))
+    assert "https://t.me/+alice" in again
+    assert bot.create_chat_invite_link.await_count == 1
+    bot.get_chat_member = member(ChatMember.LEFT)
+    stranger = SimpleNamespace(id=456, full_name="Mallory")
+    refused = asyncio.run(handlers.invite_link_text(bot, GROUP["id"], stranger))
+    assert refused == "只有群成员才能领取这个群的邀请链接。"
+
+
+def test_the_card_button_opens_a_private_chat_for_the_link(inviting):
+    store, _, handlers = inviting
+    rid = store.create(
+        99, "链接榜", 1, 60, chat_id=GROUP["id"], kind="rank", prizes=[["a", 1]], invite_via="link"
+    )
+    text, markup = card(store.view(rid), SHANGHAI)
+    assert "🪁 按邀请人数排名，前 1 名获奖\n📊 统计 " in text
+    assert "起用专属邀请链接进群的新成员\n" in text
+    assert [b.callback_data for b in markup.inline_keyboard[0]] == [f"invite:{rid}", f"rank:{rid}"]
+    query = SimpleNamespace(
+        data=f"invite:{rid}",
+        answer=AsyncMock(),
+        from_user=SimpleNamespace(id=123, full_name="Alice", is_bot=False),
+    )
+    bot = fake_bot(username="lottery_test_bot")
+    asyncio.run(handlers.callback(SimpleNamespace(callback_query=query), SimpleNamespace(bot=bot)))
+    assert query.answer.await_args.kwargs == {
+        "url": f"https://t.me/lottery_test_bot?start=inv{GROUP['id']}"
+    }
+
+
+def test_standing_in_an_invite_raffle():
+    rank = {"kind": "rank", "winner_count": 1, "invite_via": "link"}
+    ranked = [{"user_id": 1, "display_name": "Eve", "invites": 3}]
+    assert (
+        standing_text(rank, ranked, 1)
+        == "📊 邀请排名 · 前 1 名获奖\n1. Eve · 3 人\n你：第 1 名 · 3 人"
+    )
+    assert standing_text(rank, ranked, 2).endswith("你还没有邀请到新成员，邀请好友进群即可参与排名")
+    reach = {"kind": "reach", "winner_count": 1, "min_messages": 5, "invite_via": "add"}
+    assert standing_text(reach, ranked, 1) == (
+        "📊 邀请满 5 人即可参与抽奖\n已达标 0 人\n你已邀请 3 人，还差 2 人"
+    )

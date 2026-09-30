@@ -22,6 +22,7 @@ from lottery.core import (
 )
 from lottery.views import (
     EXPORT_CAPTION,
+    INVITE_WAYS,
     activity_rule,
     chances,
     cost_text,
@@ -48,6 +49,9 @@ COUNTS = (1, 2, 3, 5, 10)
 DURATIONS = (("1小时", 60), ("6小时", 360), ("1天", 1440), ("3天", 4320), ("7天", 10080))
 TARGETS = (10, 50, 100)
 MINIMUMS = (5, 10, 20, 50, 100)
+INVITES_NEEDED = (1, 3, 5, 10, 20)
+# Invite raffles in the creation wizard: its kind is "inv" until the draw is picked.
+INVITE_KINDS = {"irank": "rank", "ireach": "reach"}
 COSTS = (10, 20, 50, 100)
 WEIGHTS = (0, 1, 2, 3, 5, 10)
 CORRECTIONS = (1, 5, 10, -1, -5, -10)
@@ -120,6 +124,8 @@ BUTTON_STEPS = {
     "fr": "since",
     "pe": "rank",
     "mm": "minimum",
+    "iv": "via",
+    "ik": "ikind",
     "co": "cost",
     "c": "count",
     "mode": "mode",
@@ -359,7 +365,7 @@ class Menu:
         # startgroup opens Telegram's group picker; admin= pre-selects the rights we ask for.
         url = (
             f"https://t.me/{bot.username}?startgroup=menu"
-            "&admin=delete_messages+pin_messages+restrict_members"
+            "&admin=delete_messages+pin_messages+restrict_members+invite_users"
         )
         return InlineKeyboardButton("➕ 添加到群组", url=url)
 
@@ -393,6 +399,15 @@ class Menu:
             return
         self._asking.pop(user.id, None)
         payload = context.args[0] if context.args else ""
+        if payload.startswith("inv"):  # 「🔗 领取我的邀请链接」 on an invite raffle's card
+            try:
+                chat_id = int(payload[3:])
+            except ValueError:
+                await message.reply_text("这个链接无效。")
+                return
+            text = await self.handlers.invite_link_text(context.bot, chat_id, user)
+            await message.reply_text(text)
+            return
         if payload.startswith("g"):
             try:
                 chat_id = int(payload[1:])
@@ -423,7 +438,7 @@ class Menu:
         if status == ChatMember.ADMINISTRATOR:
             text = "✅ 已就绪。群管理员点击下面按钮发起和管理抽奖。"
         else:
-            text = "请把我设为管理员（需要：删除消息、置顶消息、封禁用户），否则无法正常工作。"
+            text = "请把我设为管理员（需要：删除消息、置顶消息、封禁用户、邀请用户），否则无法正常工作。"
         await self.welcome(context.bot, chat.id, text)
 
     # Button presses
@@ -591,7 +606,7 @@ class Menu:
         elif action == "more":
             if not room_for_prize(data):
                 raise LotteryError("奖品最多 10 种、共 100 人，不超过满人开奖人数。")
-            if data["kind"] == "rank":
+            if data["kind"] in ("rank", "irank"):
                 data.pop("ranks_done")
             else:
                 data["adding"] = True
@@ -665,7 +680,19 @@ class Menu:
                 raise LotteryError("开奖时间要晚于开始统计发言的时间，请重新输入。")
             data.update(when)
         elif step == "kind":
-            data["kind"] = {"join": "join", "act": "act", "points": "points"}[value]
+            data["kind"] = {"join": "join", "act": "act", "points": "points", "inv": "inv"}[value]
+        elif step == "via":
+            if value == "back":
+                del data["kind"]
+            else:
+                data["via"] = {"link": "link", "add": "add"}[value]
+        elif step == "ikind":
+            if value == "back":
+                del data["via"]
+            else:
+                data["kind"] = {"rank": "irank", "reach": "ireach"}[value]
+                if value == "rank":
+                    data["mode"] = "t"  # drawn at a set time
         elif step == "activity":
             if value == "back":
                 del data["kind"]
@@ -681,11 +708,12 @@ class Menu:
             if len(data["prizes"]) == MAX_PRIZES:
                 data["ranks_done"] = True
         elif step == "minimum":
-            data["min_messages"] = number(value, "发言次数", 1, 100_000)
+            name = "邀请人数" if data["kind"] == "ireach" else "发言次数"
+            data["min_messages"] = number(value, name, 1, 100_000)
         elif step == "cost":
             data["cost"] = number(value, "参与所需灵石", 1, 1_000_000)
         elif step == "target":
-            data["target"] = number(value, "满人开奖人数", total, 100_000)
+            data["target"] = number(value, "满人开奖人数", max(total, 1), 100_000)
         elif step == "join":
             data["join"] = {"b": "b", "k": "k"}[value]
         elif step == "keyword":
@@ -721,6 +749,16 @@ class Menu:
                 self.ask_keyword,
                 self.ask_title,
             ],
+            "inv": [self.ask_via, self.ask_invite_kind],
+            "irank": [self.ask_time, self.ask_ranks, self.ask_title],
+            "ireach": [
+                self.ask_minimum,
+                self.ask_mode,
+                self.ask_time,
+                self.ask_target,
+                self.ask_prizes,
+                self.ask_title,
+            ],
             "rank": [self.ask_since, self.ask_time, self.ask_ranks, self.ask_title],
             "reach": [
                 self.ask_since,
@@ -741,12 +779,41 @@ class Menu:
         ask = (
             "🎟 普通抽奖：点按钮或发口令参与\n"
             "🔥 群活跃抽奖：按发言排名，或发言达到次数参与随机抽奖\n"
-            "🪙 积分抽奖：用签到、发言得到的灵石报名，参与时扣除\n\n"
+            "🪙 积分抽奖：用签到、发言得到的灵石报名，参与时扣除\n"
+            "🪁 邀请抽奖：用专属链接或「添加成员」拉人进群，按邀请人数排名或达到人数参与抽奖\n\n"
             "选择抽奖类型："
         )
         return self.draft_text(data, ask), keyboard(
             (button("🎟 普通抽奖", "m:k:join"), button("🔥 群活跃抽奖", "m:k:act")),
-            (button("🪙 积分抽奖", "m:k:points"),),
+            (button("🪙 积分抽奖", "m:k:points"), button("🪁 邀请抽奖", "m:k:inv")),
+            CANCEL_ROW,
+        )
+
+    async def ask_via(self, chat_id, data):
+        if "via" in data:
+            return None
+        data["step"] = "via"
+        ask = (
+            "🪁 邀请抽奖\n\n"
+            "专属链接邀请：群成员点抽奖卡片上的「🔗 领取我的邀请链接」私聊领取，或在群里发送 "
+            "/link，用自己的专属链接拉人进群\n\n"
+            "添加成员邀请：群成员用「添加成员」直接拉人进群。群里要允许成员添加成员；"
+            "这种方式容易拉小号刷人数\n\n"
+            "只算发布抽奖之后第一次进群的新成员；开奖前退群的不算。\n"
+            "选择邀请方式："
+        )
+        return self.draft_text(data, ask), keyboard(
+            (button("🔗 专属链接邀请", "m:iv:link"), button("⚠️ 添加成员邀请", "m:iv:add")),
+            (button("⬅️ 返回选择抽奖类型", "m:iv:back"),),
+            CANCEL_ROW,
+        )
+
+    async def ask_invite_kind(self, chat_id, data):
+        data["step"] = "ikind"
+        ask = "🪁 邀请抽奖：根据邀请排名抽奖，或达到邀请人数参与随机抽奖。\n选择一种："
+        return self.draft_text(data, ask), keyboard(
+            (button("🏆 邀请排名抽奖", "m:ik:rank"), button("🎯 邀请次数抽奖", "m:ik:reach")),
+            (button("⬅️ 返回选择邀请方式", "m:ik:back"),),
             CANCEL_ROW,
         )
 
@@ -807,9 +874,11 @@ class Menu:
         if data["mode"] != "f" or "target" in data:
             return None
         data["step"] = "target"
-        total = sum(count for _, count in data["prizes"])
+        total = max(sum(count for _, count in data["prizes"]), 1)
         choices = [button(str(n), f"m:f:{n}") for n in TARGETS if n >= total]
         ask = f"满多少人开奖？点按钮或直接发送数字（至少 {total}）："
+        if data["kind"] == "ireach":
+            ask = "满多少人达标就开奖？点按钮或直接发送数字："
         return self.draft_text(data, ask), keyboard(choices, CANCEL_ROW)
 
     async def ask_join(self, chat_id, data):
@@ -870,8 +939,12 @@ class Menu:
         if "min_messages" in data:
             return None
         data["step"] = "minimum"
-        choices = [button(str(n), f"m:mm:{n}") for n in MINIMUMS]
-        ask = "至少发言多少次才能参与抽奖？点按钮或直接发送数字："
+        if data["kind"] == "ireach":
+            choices = [button(str(n), f"m:mm:{n}") for n in INVITES_NEEDED]
+            ask = "至少邀请多少人才能参与抽奖？点按钮或直接发送数字："
+        else:
+            choices = [button(str(n), f"m:mm:{n}") for n in MINIMUMS]
+            ask = "至少发言多少次才能参与抽奖？点按钮或直接发送数字："
         return self.draft_text(data, ask), keyboard(choices, CANCEL_ROW)
 
     async def ask_title(self, chat_id, data):
@@ -924,14 +997,30 @@ class Menu:
         elif kind == "reach":
             need = f"发言满 {data['min_messages']} 次" if "min_messages" in data else "发言达到次数"
             lines.append(f"├ 类型：群活跃抽奖 · {need}参与抽奖")
+        elif kind in ("inv", "irank", "ireach") and "via" in data:
+            way = f"├ 类型：邀请抽奖 · {INVITE_WAYS[data['via']]}"
+            if kind == "irank":
+                way += " · 按邀请人数排名"
+            elif kind == "ireach":
+                need = (
+                    f"邀请满 {data['min_messages']} 人"
+                    if "min_messages" in data
+                    else "邀请达到人数"
+                )
+                way += f" · {need}参与抽奖"
+            lines.append(way)
         if "count_from" in data:
             since = data["count_from"] and when_text(data["count_from"], self.handlers.timezone)
             lines.append(f"├ 统计：从{f' {since} ' if since else '抽奖发布时'}起的文字发言")
         if data["prizes"]:
-            lines.append(f"├ 奖品：{prize_text(data['prizes'], kind)}")
+            lines.append(f"├ 奖品：{prize_text(data['prizes'], INVITE_KINDS.get(kind, kind))}")
         if data.get("target") or data.get("minutes") or data.get("deadline"):
             rule = draw_rule(
-                {"deadline": self.deadline_of(data), "target_count": data.get("target")},
+                {
+                    "deadline": self.deadline_of(data),
+                    "target_count": data.get("target"),
+                    "invite_via": data.get("via"),
+                },
                 self.handlers.timezone,
             )
             lines.append(f"├ {rule}")
@@ -972,6 +1061,16 @@ class Menu:
                 "weighted": bool(data.get("weighted")) and self.is_super(user_id),
                 "keyword": data.get("keyword") if data["join"] == "k" else None,
                 "cost": data.get("cost"),  # 积分抽奖 is a join raffle that costs 灵石
+            }
+            minutes = data.get("minutes") or (
+                FULL_DEADLINE_MINUTES if data["mode"] == "f" else None
+            )
+        elif kind in INVITE_KINDS:
+            options = {
+                "kind": INVITE_KINDS[kind],
+                "invite_via": data["via"],
+                "min_messages": data.get("min_messages"),
+                "target": data.get("target"),
             }
             minutes = data.get("minutes") or (
                 FULL_DEADLINE_MINUTES if data["mode"] == "f" else None
@@ -1028,6 +1127,7 @@ class Menu:
             rights = {
                 "置顶消息": admin and getattr(me, "can_pin_messages", False),
                 "删除消息": admin and getattr(me, "can_delete_messages", False),
+                "邀请用户": admin and getattr(me, "can_invite_users", False),
             }
             lines.append(
                 "机器人权限：" + " · ".join(f"{k} {'✅' if v else '❌'}" for k, v in rights.items())
@@ -1387,12 +1487,13 @@ class Menu:
             if raffle["cost"]:
                 lines.append(cost_text(raffle["cost"]))
         else:
-            counted = "已发言" if kind == "rank" else "已达标"
+            via = raffle["invite_via"]
+            counted = "已达标" if kind == "reach" else "有邀请" if via else "已发言"
             lines = [
                 f"{raffle['title']}  #{rid} · {status_text(raffle)}",
-                activity_rule(kind, raffle["winner_count"], raffle["min_messages"]),
+                activity_rule(kind, raffle["winner_count"], raffle["min_messages"], via),
                 f"{raffle['winner_count']} 人中奖 · {counted} {len(raffle['entries'])} 人",
-                counting_text(raffle["count_from"], zone),
+                counting_text(raffle["count_from"], zone, via),
                 draw_rule(raffle, zone),
             ]
         if raffle["prizes"]:
@@ -1428,7 +1529,7 @@ class Menu:
             rows.append((button("⚖️ 中奖加成", f"m:w:{rid}:0"),))
         elif self.is_super(user_id):
             export = button("📄 导出记录", f"m:export:{rid}:0")
-            if raffle["status"] == "OPEN":
+            if raffle["status"] == "OPEN" and not raffle["invite_via"]:
                 rows.append((button("✏️ 修改发言次数", f"m:ac:{rid}:0"), export))
             else:
                 rows.append((export,))

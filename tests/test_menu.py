@@ -95,7 +95,7 @@ def start(env, user_id, *args, chat_type="private"):
     chat_id = user_id if chat_type == "private" else GROUP
     update = SimpleNamespace(
         effective_message=message,
-        effective_user=SimpleNamespace(id=user_id, is_bot=False),
+        effective_user=SimpleNamespace(id=user_id, is_bot=False, full_name=f"user{user_id}"),
         effective_chat=SimpleNamespace(type=chat_type, id=chat_id, title="测试群"),
     )
     asyncio.run(env.menu.start(update, SimpleNamespace(bot=env.bot, args=list(args))))
@@ -108,7 +108,7 @@ def test_start_offers_to_add_the_bot_to_a_group(env):
     assert labels(call.kwargs["reply_markup"]) == {
         "➕ 添加到群组": (
             "https://t.me/lottery_test_bot?startgroup=menu"
-            "&admin=delete_messages+pin_messages+restrict_members"
+            "&admin=delete_messages+pin_messages+restrict_members+invite_users"
         ),
         "📋 我的群": "m:groups",
     }
@@ -856,7 +856,9 @@ def test_settings_page(env):
     _, buttons = shown(press(env, ADMIN, f"m:g:{GROUP}"))
     assert buttons["⚙️ 抽奖设置"] == f"m:set:{GROUP}"
     text, buttons = shown(press(env, ADMIN, f"m:set:{GROUP}"))
-    assert text.startswith("⚙️ 测试群 · 抽奖设置\n机器人权限：置顶消息 ✅ · 删除消息 ❌\n缺少的权限")
+    assert text.startswith(
+        "⚙️ 测试群 · 抽奖设置\n机器人权限：置顶消息 ✅ · 删除消息 ❌ · 邀请用户 ❌\n缺少的权限"
+    )
     assert env.bot.get_chat_member.await_args.args == (GROUP, 4242)
     assert list(buttons) == [
         "📌 置顶报名卡片：开",
@@ -1364,3 +1366,84 @@ def test_admins_are_told_when_the_panel_could_not_be_pinned(env):
     assert text.startswith(
         "✅ 灵石面板已发到群里，但没能置顶：请给机器人打开「置顶消息」权限。\n\n"
     )
+
+
+def test_wizard_creates_an_invite_ranking(env):
+    _, buttons = shown(press(env, OWNER, f"m:new:{GROUP}"))
+    text, buttons = shown(press(env, OWNER, buttons["🪁 邀请抽奖"]))
+    assert "专属链接邀请：" in text
+    assert text.endswith("选择邀请方式：")
+    assert list(buttons) == ["🔗 专属链接邀请", "⚠️ 添加成员邀请", "⬅️ 返回选择抽奖类型", "✖ 取消"]
+    text, _ = shown(press(env, OWNER, buttons["⬅️ 返回选择抽奖类型"]))
+    assert text.endswith("选择抽奖类型：")
+    press(env, OWNER, "m:k:inv")
+    text, buttons = shown(press(env, OWNER, "m:iv:link"))
+    assert text == HEADER + (
+        "├ 类型：邀请抽奖 · 专属链接邀请\n\n"
+        "🪁 邀请抽奖：根据邀请排名抽奖，或达到邀请人数参与随机抽奖。\n选择一种："
+    )
+    text, _ = shown(press(env, OWNER, buttons["⬅️ 返回选择邀请方式"]))
+    assert text.endswith("选择邀请方式：")
+    press(env, OWNER, "m:iv:link")
+    text, _ = shown(press(env, OWNER, "m:ik:rank"))
+    assert "├ 类型：邀请抽奖 · 专属链接邀请 · 按邀请人数排名\n" in text
+    assert "什么时候开奖？" in text
+    press(env, OWNER, "m:t:1440")
+    text, _ = type_text(env, OWNER, "10usdt")
+    assert text.endswith("请发送第二名的奖品，例如：1USDT")
+    press(env, OWNER, "m:pe")
+    _, buttons = type_text(env, OWNER, "拉新榜")
+    press(env, OWNER, "m:pub")
+    raffle = env.store.view(1)
+    assert (raffle["kind"], raffle["invite_via"], raffle["deadline"]) == (
+        "rank",
+        "link",
+        NOW + 86400,
+    )
+    card = env.bot.send_message.await_args
+    assert "🪁 按邀请人数排名，前 1 名获奖" in card.args[1]
+    assert "🔗 领取我的邀请链接" in labels(card.kwargs["reply_markup"])
+    text, buttons = shown(press(env, ADMIN, "m:r:1"))
+    assert "1 人中奖 · 有邀请 0 人" in text
+    assert "✏️ 修改发言次数" not in buttons  # message counts only
+
+
+def test_wizard_creates_an_invite_draw_that_ends_once_enough_reach_it(env):
+    press(env, OWNER, f"m:new:{GROUP}")
+    press(env, OWNER, "m:k:inv")
+    press(env, OWNER, "m:iv:add")
+    text, buttons = shown(press(env, OWNER, "m:ik:reach"))
+    assert text.endswith("至少邀请多少人才能参与抽奖？点按钮或直接发送数字：")
+    assert list(buttons) == ["1", "3", "5", "10", "20", "✖ 取消"]
+    text, _ = shown(press(env, OWNER, "m:mm:3"))
+    assert "├ 类型：邀请抽奖 · 添加成员邀请 · 邀请满 3 人参与抽奖\n" in text
+    assert text.endswith("怎么开奖？")
+    text, _ = shown(press(env, OWNER, "m:mode:f"))
+    assert text.endswith("满多少人达标就开奖？点按钮或直接发送数字：")
+    text, _ = type_text(env, OWNER, "2")
+    assert "├ 满 2 人达标即开奖（最晚 2027-01-22 16:00（UTC+08:00））" in text
+    type_text(env, OWNER, "1usdt")
+    assert type_text(env, OWNER, "3")[0] == "中奖总人数不能超过满人开奖人数 2。"
+    type_text(env, OWNER, "2")
+    press(env, OWNER, "m:tt")
+    press(env, OWNER, "m:pub")
+    raffle = env.store.view(1)
+    assert (raffle["kind"], raffle["invite_via"], raffle["min_messages"]) == ("reach", "add", 3)
+    assert (raffle["target_count"], raffle["winner_count"]) == (2, 2)
+    card = env.bot.send_message.await_args
+    assert "🪁 邀请满 3 人即可参与，抽 2 人" in card.args[1]
+    assert "👉 用「添加成员」把好友拉进群即可参与" in card.args[1]
+    assert list(labels(card.kwargs["reply_markup"])) == ["📊 查看我的邀请"]
+
+
+def test_members_get_their_invite_link_in_private(env):
+    env.bot.create_chat_invite_link = AsyncMock(
+        return_value=SimpleNamespace(invite_link="https://t.me/+six")
+    )
+    message = start(env, MEMBER, f"inv{GROUP}")
+    assert message.reply_text.await_args.args[0].startswith(
+        "🔗 你在「测试群」的专属邀请链接：\nhttps://t.me/+six\n"
+    )
+    stranger = start(env, 42, f"inv{GROUP}")
+    assert stranger.reply_text.await_args.args[0] == "只有群成员才能领取这个群的邀请链接。"
+    assert start(env, MEMBER, "invalid").reply_text.await_args.args[0] == "这个链接无效。"
