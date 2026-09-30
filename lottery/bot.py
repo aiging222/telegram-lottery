@@ -109,7 +109,7 @@ PUBLIC_HELP = """🎁 抽奖机器人
 /raffle 抽奖ID — 在发布群里查看抽奖
 /result 抽奖ID — 在发布群里查看开奖结果
 /id — 查看自己的用户 ID
-/link — 在群里领取自己的专属邀请链接，查看自己邀请了多少人
+/link — 在群里领取自己的专属邀请链接，查看自己在进行中的邀请抽奖里邀请了多少人
 /checkin — 在群里每日签到领灵石，和发「签到」一样
 /ban、/unban — 群管理员回复某人的消息（或跟用户 ID）封禁、解除封禁
 在群里发送「签到」领灵石，「灵石」查看自己的灵石，「灵石榜」看排行。"""
@@ -651,8 +651,9 @@ class BotHandlers:
 
     async def invite_link_text(self, bot, chat_id, user, check=True):
         """The answer to asking for one's own invite link to chat_id: the link, made once
-        and handed out again until it expires or is used up, and how many they invited; or
-        why there is none. With `check`, only a member of the group gets one."""
+        and handed out again until it expires or is used up, and how many they invited in
+        each invite raffle still counting; or why there is none. With `check`, only a member
+        of the group gets one."""
         if check:
             try:
                 member = await self.group_member(bot, chat_id, user.id)
@@ -681,15 +682,15 @@ class BotHandlers:
             limits.append(f"最多 {found['member_limit']} 人通过它进群")
         if limits:
             lines.append("；".join(limits) + "。到期或用满后再领取，会拿到新链接。")
-        lines += ["", "把它发给好友，好友通过这条链接进群，就算你邀请的。", ""]
-        count = await asyncio.to_thread(
-            self.store.invite_count, chat_id, user.id, settings["invite_since"]
-        )
-        lines.append(f"📊 你已邀请 {count} 人（只算第一次进群、现在还在群里的）")
+        lines += ["", "把它发给好友，好友通过这条链接进群，就算你邀请的。"]
+        # Counts only of raffles still counting: any other would pass for one of them.
+        counts = []
         for raffle in raffles:
             line = await self.invites_in(raffle, user.id)
             if line:
-                lines.append(line)
+                counts.append(line)
+        if counts:
+            lines += ["", *counts]
         return "\n".join(lines)
 
     async def make_invite_link(self, bot, chat_id, user, settings):

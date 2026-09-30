@@ -1416,9 +1416,10 @@ def test_the_link_answer_counts_invites(inviting):
     asyncio.run(handlers.member_changed(arrival(12, now[0] + 10, "https://t.me/+alice"), context))
     alice = SimpleNamespace(id=123, full_name="Alice")
     text = asyncio.run(handlers.invite_link_text(fake_bot(), GROUP["id"], alice, check=False))
-    assert text.endswith(
-        "\n\n📊 你已邀请 2 人（只算第一次进群、现在还在群里的）\n🪁「拉满三人」已邀请 1 人，还差 2 人达标"
-    )
+    assert text.endswith("就算你邀请的。\n\n🪁「拉满三人」已邀请 1 人，还差 2 人达标")
+    now[0] += 3600  # drawn: no count is left to pass for the raffle's
+    text = asyncio.run(handlers.invite_link_text(fake_bot(), GROUP["id"], alice, check=False))
+    assert text.endswith("把它发给好友，好友通过这条链接进群，就算你邀请的。")
 
 
 def test_the_group_hears_who_brought_members_in(inviting):
