@@ -24,6 +24,7 @@ from lottery.views import (
     EXPORT_CAPTION,
     INVITE_WAYS,
     activity_rule,
+    alert_text,
     chances,
     cost_text,
     counting_text,
@@ -36,6 +37,7 @@ from lottery.views import (
     points_file,
     prize_text,
     status_text,
+    utf16_len,
     when_text,
 )
 
@@ -271,11 +273,6 @@ def change_text(change, timezone):
     return f"{when:%m-%d %H:%M} {who}：{label} {before} → {after}"
 
 
-def utf16_len(text):
-    """Length as Telegram counts it: emoji and other characters beyond the BMP count twice."""
-    return len(text.encode("utf-16-le")) // 2
-
-
 def winners_line(winners, room):
     """中奖：A（prize）、B（prize）… in at most `room` of Telegram's characters; when not all
     fit, as many as do and how many won in all."""
@@ -491,7 +488,7 @@ class Menu:
         try:
             text, markup = await self.route(context, query.from_user.id, action, args)
         except LotteryError as exc:
-            await query.answer(str(exc), show_alert=True)
+            await query.answer(alert_text(str(exc)), show_alert=True)
             return
         except (ValueError, IndexError, KeyError):
             await query.answer("按钮已失效。", show_alert=True)

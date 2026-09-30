@@ -25,6 +25,7 @@ from lottery.menu import MANAGERS, Menu, one_at_a_time, presser, sender
 from lottery.points import ADJUST, WORDS, Points
 from lottery.views import (
     EXPORT_CAPTION,
+    alert_text,
     card,
     chances,
     chunks,
@@ -449,7 +450,7 @@ class BotHandlers:
             if url:
                 await query.answer(url=url)
             else:
-                await query.answer(text, show_alert=True)
+                await query.answer(alert_text(text), show_alert=True)
         except TelegramError as exc:
             # Clicks replayed after downtime are too old to answer. Any join above is
             # already saved, so there is nothing to retry and nothing to tell the group.

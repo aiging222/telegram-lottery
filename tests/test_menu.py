@@ -666,6 +666,13 @@ def test_what_the_menu_posts_in_a_group_counts_against_its_budget(env):
     assert not env.handlers.room(GROUP)
 
 
+def test_a_long_error_still_pops_up(env):
+    rid = env.store.create(OWNER, "耳机", 1, 60, chat_id=GROUP)
+    env.bot.send_message.side_effect = BadRequest("x" * 300)  # Telegram's own words
+    text = press(env, OWNER, f"m:repost:{rid}").answer.await_args.args[0]
+    assert text.startswith("发布失败：") and text.endswith("…") and len(text) <= 200
+
+
 def test_cancel_from_records(env):
     rid = env.store.create(OWNER, "耳机", 1, 60, chat_id=GROUP)
     env.store.set_card(rid, 500)

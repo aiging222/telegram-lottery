@@ -23,7 +23,7 @@ from lottery.bot import (
 )
 from lottery.core import LotteryError, Store
 from lottery.points import Points
-from lottery.views import card, chunks, result_text, standing_text
+from lottery.views import alert_text, card, chunks, result_text, standing_text, utf16_len
 
 TOKEN = "123456:SECRET-token"
 USER = {"id": 123, "is_bot": False, "first_name": "Alice"}
@@ -292,6 +292,13 @@ def test_result_mentions_winners_and_escapes_names(setup):
     html = result_text(result, mention=True)
     assert '<a href="tg://user?id=123">&lt;b&gt;Al &amp; ice&lt;/b&gt;</a>' in html
     assert "<b>Al & ice</b>（ID：123）" in result_text(result)
+
+
+def test_a_pop_up_is_cut_to_what_telegram_takes():
+    assert alert_text("名额已满，即将开奖。") == "名额已满，即将开奖。"
+    for text in ("错" * 300, "😀" * 150, "a" * 199 + "😀"):  # emoji count twice
+        cut = alert_text(text)
+        assert utf16_len(cut) <= 200 and cut.endswith("…")
 
 
 def test_long_messages_split_at_line_breaks():

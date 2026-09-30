@@ -16,6 +16,25 @@ def name_text(text):
     return " ".join(text.split())[:128]
 
 
+ALERT_LIMIT = 200  # Telegram's characters in a button's pop-up
+
+
+def utf16_len(text):
+    """Length as Telegram counts it: emoji and other characters beyond the BMP count twice."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def alert_text(text):
+    """text as a button's pop-up takes it, cut to ALERT_LIMIT with … where it was cut:
+    Telegram refuses a longer one, and the member would see nothing at all."""
+    if utf16_len(text) <= ALERT_LIMIT:
+        return text
+    cut = text[: ALERT_LIMIT - 1]
+    while utf16_len(cut) > ALERT_LIMIT - 1:
+        cut = cut[:-1]
+    return cut + "…"
+
+
 def status_text(raffle):
     return STATUS[raffle["status"]]
 

@@ -19,7 +19,14 @@ from telegram.error import TelegramError
 
 from lottery.core import LotteryError
 from lottery.menu import one_at_a_time, presser, sender
-from lottery.views import board_text, checkin_text, name_text, reward_text, wallet_text
+from lottery.views import (
+    alert_text,
+    board_text,
+    checkin_text,
+    name_text,
+    reward_text,
+    wallet_text,
+)
 
 LOG = logging.getLogger(__name__)
 # What members send, as the method that answers it. Such messages never count as speaking.
@@ -114,7 +121,7 @@ class Points:
         else:
             text = POINTS_OFF
         try:
-            await query.answer(text[:200], show_alert=True)
+            await query.answer(alert_text(text), show_alert=True)
         except TelegramError as exc:
             LOG.warning("灵石面板按钮应答失败：%s", exc)
 
