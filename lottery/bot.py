@@ -171,6 +171,15 @@ def asks_bot(message):
     return text.startswith("/") or text in WORDS or ADJUST.fullmatch(text) is not None
 
 
+def lock_in(locks, key):
+    """The lock kept for key in `locks`, a WeakValueDictionary: made when first asked for,
+    and gone once nobody holds or waits for it."""
+    lock = locks.get(key)
+    if lock is None:
+        lock = locks[key] = asyncio.Lock()
+    return lock
+
+
 def in_group(member):
     # Restricted users may still be in the group; only ChatMemberRestricted has is_member.
     return member.status in MEMBER_STATUSES or getattr(member, "is_member", False)
@@ -203,18 +212,16 @@ class BotHandlers:
         self._posted_parts = {}
         # user ID -> the lock that keeps that person's updates in order; see one_at_a_time.
         self._user_locks = weakref.WeakValueDictionary()
-        # raffle ID -> (until when, raffle, ranking) for the card's 📊 button; see ranking().
+        # raffle ID -> (until when, raffle, ranking) for the card's 📊 button, and the lock
+        # under which each raffle's is worked out; see ranking().
         self._rankings = {}
+        self._ranking_locks = weakref.WeakValueDictionary()
         # chat ID -> when the bot sent its messages there in the last minute; see room().
         self._sent = {}
         self._deleting = set()  # deletions waiting a few seconds; see tidy()
-        self._ranking = asyncio.Lock()
 
     def user_lock(self, user_id):
-        lock = self._user_locks.get(user_id)
-        if lock is None:
-            lock = self._user_locks[user_id] = asyncio.Lock()
-        return lock
+        return lock_in(self._user_locks, user_id)
 
     @one_at_a_time(sender)
     async def command(self, update, context):
@@ -477,9 +484,9 @@ class BotHandlers:
     async def ranking(self, rid):
         """An open activity raffle and its ranking, for the card's 📊 button. Working it out
         reads every message counted, a second or so in a big group, and many may press at
-        once: whoever presses within RANKING_SECONDS of it being worked out gets the same one,
-        and only one is worked out at a time."""
-        async with self._ranking:
+        once: whoever presses within RANKING_SECONDS of it being worked out gets the same one.
+        Each raffle's is worked out once at a time, those of different raffles side by side."""
+        async with lock_in(self._ranking_locks, rid):
             now = self.store.clock()
             found = self._rankings.get(rid)
             if found is None or found[0] <= now or found[1]["deadline"] <= now:

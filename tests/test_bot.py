@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import sys
+import threading
 import time
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -1124,6 +1125,29 @@ def test_presses_at_once_share_one_ranking(setup):
 
     assert len(asyncio.run(crowd())) == 10
     assert worked_out == [rid]
+
+
+def test_rankings_of_different_raffles_are_worked_out_side_by_side(setup):
+    store, _, handlers = setup
+    first, second = (
+        store.create(99, title, 1, 60, chat_id=GROUP["id"], kind="rank", prizes=[["a", 1]])
+        for title in ("大群", "小群")
+    )
+    second_started = threading.Event()
+
+    def ranking(r):
+        if r == first:  # slow to work out
+            assert second_started.wait(2), "the other raffle's ranking waited for this one"
+        else:
+            second_started.set()
+        return Store.ranking(store, r)
+
+    store.ranking = ranking
+
+    async def both():
+        return await asyncio.gather(handlers.ranking(first), handlers.ranking(second))
+
+    assert [raffle["id"] for raffle, _ in asyncio.run(both())] == [first, second]
 
 
 def test_the_database_uses_write_ahead_logging(setup):
