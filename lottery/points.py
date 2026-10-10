@@ -136,6 +136,10 @@ class Points:
             member = await self.handlers.group_member(bot, chat_id, user.id)
         except TelegramError as exc:
             LOG.warning("群成员校验失败：%s", exc)
+            if "admin_required" in exc.message.lower():  # a group hiding its members
+                return (
+                    "机器人还不是本群管理员，暂时无法用按钮签到，请在群里发送「签到」或 /checkin。"
+                )
             return "暂时无法确认你的群成员身份，请稍后重试。"
         if not member:
             return "只有本群成员可以签到。"

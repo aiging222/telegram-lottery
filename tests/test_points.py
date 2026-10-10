@@ -334,6 +334,23 @@ def test_the_panel_answers_only_the_member_who_pressed(env):
     assert env.store.due_deletions() == {}
 
 
+def test_the_panel_asks_for_a_text_check_in_where_the_bot_is_no_admin(env):
+    # A group hiding its members lets only its admins look a member up.
+    env.bot.get_chat_member = AsyncMock(side_effect=BadRequest("Bad Request: CHAT_ADMIN_REQUIRED"))
+    query = SimpleNamespace(
+        data="pts:checkin",
+        answer=AsyncMock(),
+        from_user=SimpleNamespace(id=1, full_name="user1", is_bot=False),
+        message=SimpleNamespace(chat=SimpleNamespace(id=GROUP)),
+    )
+    asyncio.run(
+        env.points.button(SimpleNamespace(callback_query=query), SimpleNamespace(bot=env.bot))
+    )
+    assert query.answer.await_args.args[0] == (
+        "机器人还不是本群管理员，暂时无法用按钮签到，请在群里发送「签到」或 /checkin。"
+    )
+
+
 def test_past_the_budget_answers_become_reactions(env):
     env.store.set_group_setting(GROUP, "reward_chance", 100)
     env.store.set_group_setting(GROUP, "crit_percent", 0)
