@@ -80,6 +80,33 @@ def pick_winners(entries, count, randbelow=secrets.randbelow):
     return winners
 
 
+def hand_out(entries, prizes, randbelow=secrets.randbelow):
+    """The winners of a "reach" raffle, each with a prize of [[name, count], ...], in the
+    prizes' order. An entry assigned one (its place in the list, as "assigned") takes it; the
+    places left are drawn by weight from everyone else, the first drawn taking the first of
+    them. Without assignments it draws as pick_winners() does."""
+    places = [index for index, (_, count) in enumerate(prizes) for _ in range(count)]
+    taken = [None] * len(places)
+    rest = []
+    for entry in entries:
+        free = [i for i, index in enumerate(places) if index == entry.get("assigned")]
+        free = [i for i in free if taken[i] is None]
+        if free:
+            taken[free[0]] = dict(entry)
+        else:
+            rest.append(entry)
+    left = [i for i, winner in enumerate(taken) if winner is None]
+    if left:
+        for i, winner in zip(left, weighted_draw(rest, len(left), randbelow), strict=False):
+            taken[i] = winner
+    winners = []
+    for place, winner in zip(places, taken, strict=True):
+        if winner is not None:
+            winner["prize"] = prizes[place][0]
+            winners.append(winner)
+    return winners
+
+
 # Migration N upgrades a database from schema version N-1 (PRAGMA user_version) to N.
 # Append new migrations; never edit one that has shipped.
 MIGRATIONS = [
@@ -358,6 +385,10 @@ MIGRATIONS = [
     CREATE INDEX invite_links_by_user ON invite_links(chat_id, user_id);
     ALTER TABLE invites ADD COLUMN invitee_name TEXT NOT NULL DEFAULT ''
     """,
+    # 20: in a "reach" activity raffle a super admin may assign a member with enough messages
+    # one of its prizes, as its place in the prize list. Join raffles' designations have none:
+    # their designated winners take the first prizes.
+    "ALTER TABLE designations ADD COLUMN prize INTEGER",
 ]
 # Deletion delays are seconds after posting: 0 deletes at once, None keeps the message.
 GROUP_DEFAULTS = {
@@ -1007,7 +1038,9 @@ class Store:
                     return False
                 if len(taken) >= raffle["winner_count"]:
                     raise LotteryError(f"指定人数不能超过中奖人数 {raffle['winner_count']}。")
-                db.execute("INSERT INTO designations VALUES(?,?)", (raffle_id, user_id))
+                db.execute(
+                    "INSERT INTO designations(raffle_id,user_id) VALUES(?,?)", (raffle_id, user_id)
+                )
             elif not db.execute(
                 "DELETE FROM designations WHERE raffle_id=? AND user_id=?", (raffle_id, user_id)
             ).rowcount:
@@ -1020,6 +1053,70 @@ class Store:
                 {"user_id": user_id},
             )
             return True
+
+    def assign_prize(self, raffle_id, actor, user_id, prize):
+        """Assign a member with enough messages in an open "reach" activity raffle the prize
+        at `prize` in its list, or take it back with None; False if that was so already. They
+        win it if they still have enough messages when the list is frozen; the places left
+        are drawn among the rest. Like a designation, it shows on neither card nor result."""
+        integer(user_id, "用户 ID", 1, 2**63 - 1)
+        with self.transaction() as db:
+            raffle = self._get(db, raffle_id)
+            if raffle["kind"] != "reach" or raffle["invite_via"]:
+                raise LotteryError("只有发言达标抽奖可以指定奖品。")
+            if not self._open(raffle):
+                raise LotteryError("统计已截止，不能再指定奖品。")
+            before = self._assigned(db, raffle_id).get(user_id)
+            if before == prize:
+                return False
+            prizes = json.loads(raffle["prizes"])
+            if prize is None:
+                db.execute(
+                    "DELETE FROM designations WHERE raffle_id=? AND user_id=?", (raffle_id, user_id)
+                )
+            else:
+                if type(prize) is not int or not 0 <= prize < len(prizes):
+                    raise LotteryError("没有这个奖品。")
+                if user_id not in {e["user_id"] for e in self._speakers(db, raffle)}:
+                    raise LotteryError("只能给已达标的成员指定奖品。")
+                name, count = prizes[prize]
+                taken = db.execute(
+                    "SELECT COUNT(*) FROM designations WHERE raffle_id=? AND prize=? "
+                    "AND user_id!=?",
+                    (raffle_id, prize, user_id),
+                ).fetchone()[0]
+                if taken >= count:
+                    raise LotteryError(f"「{name}」的名额已经指定满了。")
+                db.execute(
+                    "INSERT INTO designations(raffle_id,user_id,prize) VALUES(?,?,?) "
+                    "ON CONFLICT(raffle_id,user_id) DO UPDATE SET prize=excluded.prize",
+                    (raffle_id, user_id, prize),
+                )
+            self.audit(
+                db,
+                raffle_id,
+                actor,
+                "assign_prize",
+                {
+                    "user_id": user_id,
+                    "before": None if before is None else prizes[before][0],
+                    "after": None if prize is None else prizes[prize][0],
+                },
+            )
+            return True
+
+    def prize_assignments(self, raffle_id):
+        """The prizes assigned in a "reach" activity raffle: user_id -> place in the list."""
+        with self.reading() as db:
+            return self._assigned(db, raffle_id)
+
+    def _assigned(self, db, raffle_id):
+        return dict(
+            db.execute(
+                "SELECT user_id,prize FROM designations WHERE raffle_id=? AND prize IS NOT NULL",
+                (raffle_id,),
+            )
+        )
 
     def _weightable(self, raffle):
         if raffle["kind"] != "join":
@@ -1559,7 +1656,13 @@ class Store:
         if raffle["invite_via"]:
             return self._invited(db, raffle)
         if raffle["kind"] != "join":
-            return self._speakers(db, raffle)
+            entries = self._speakers(db, raffle)
+            # "reach": the prizes assigned to those who have enough messages; see hand_out().
+            assigned = self._assigned(db, raffle["id"])
+            for entry in entries:
+                if entry["user_id"] in assigned:
+                    entry["assigned"] = assigned[entry["user_id"]]
+            return entries
         rid = raffle["id"]
         people = db.execute(
             "SELECT * FROM participants WHERE raffle_id=? ORDER BY user_id", (rid,)
@@ -1694,11 +1797,14 @@ class Store:
                 raise LotteryError("尚未到截止时间。如需提前开奖，请先 /freeze 截止报名。")
             raffle = self._freeze(db, raffle, actor)
             snapshot = json.loads(raffle["snapshot"])
-            if raffle["kind"] == "rank":
+            reach = raffle["kind"] == "reach"  # prizes may be assigned; see hand_out()
+            if reach:
+                winners = hand_out(snapshot["entries"], json.loads(raffle["prizes"]))
+            elif raffle["kind"] == "rank":
                 winners = [dict(entry) for entry in snapshot["entries"][: raffle["winner_count"]]]
             else:
                 winners = pick_winners(snapshot["entries"], raffle["winner_count"])
-            if raffle["prizes"]:
+            if raffle["prizes"] and not reach:
                 # The first winners drawn take the first prizes listed.
                 names = [name for name, count in json.loads(raffle["prizes"]) for _ in range(count)]
                 for winner, name in zip(winners, names, strict=False):

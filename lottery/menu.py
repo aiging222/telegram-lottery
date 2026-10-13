@@ -4,6 +4,7 @@ the weights."""
 
 import asyncio
 import functools
+import json
 import logging
 import re
 import time
@@ -336,6 +337,21 @@ def winners_line(winners, room):
     return line + tail
 
 
+def assigned_text(prizes, ranked, assigned, minimum):
+    """Who was assigned which prize of a "reach" raffle, in the prizes' order. Those now short
+    of `minimum` messages are marked: they win nothing unless they make it again."""
+    if not assigned:
+        return "🎯 还没有指定奖品，点成员可以指定。"
+    found = {e["user_id"]: e for e in ranked}
+    parts = []
+    for uid, index in sorted(assigned.items(), key=lambda item: (item[1], item[0])):
+        entry = found.get(uid)
+        name = name_text(entry["display_name"])[:16] if entry else f"用户 {uid}"
+        short = entry is None or entry["messages"] < minimum
+        parts.append(f"{prizes[index][0]} {name}" + ("（未达标，开奖时不生效）" if short else ""))
+    return "🎯 已指定：" + "；".join(parts)
+
+
 class BadButton(Exception):
     """A button's data this menu does not make: left by an older version of the bot, or
     forged. Told apart from the bot's own faults, which on_error logs."""
@@ -635,7 +651,7 @@ class Menu:
         if action in ("w", "wu", "ws", "wd", "wid", "wc", "export"):
             self.require_super(user_id)
             return await self.weight_action(bot, user_id, action, args)
-        if action in ("ac", "au", "as", "aid"):
+        if action in ("ac", "au", "as", "aid", "ap"):
             if not self.is_super(user_id):
                 raise LotteryError("只有超级管理员可以修改发言次数。")
             return await self.count_action(user_id, action, args)
@@ -2047,7 +2063,8 @@ class Menu:
         elif self.is_super(user_id):
             export = button("📄 导出记录", f"m:export:{rid}:0")
             if raffle["status"] == "OPEN" and not raffle["invite_via"]:
-                rows.append((button("✏️ 修改发言次数", f"m:ac:{rid}:0"), export))
+                label = "✏️ 发言次数与指定奖品" if kind == "reach" else "✏️ 修改发言次数"
+                rows.append((button(label, f"m:ac:{rid}:0"), export))
             else:
                 rows.append((export,))
         if raffle["invite_via"]:
@@ -2274,10 +2291,14 @@ class Menu:
         if action == "as":
             by = int_arg(args, 2)
             await asyncio.to_thread(functools.partial(self.store.adjust, rid, user_id, uid, by=by))
+        if action == "ap":  # a prize of a "reach" raffle, by its place in the list; x: none
+            prize = None if arg(args, 2) == "x" else int_arg(args, 2)
+            await asyncio.to_thread(self.store.assign_prize, rid, user_id, uid, prize)
         return await self.speaker(rid, uid, page)
 
     async def counts(self, rid, page):
         raffle, ranked = await asyncio.to_thread(self.store.ranking, rid)
+        prizes, assigned = await self.assignments(raffle)
         adjusted = sum(1 for e in ranked if e.get("adjusted"))
         lines = [
             f"✏️ 发言次数 · {raffle['title']}  #{rid}",
@@ -2287,6 +2308,8 @@ class Menu:
                 "修改加在机器人统计的次数上，之后的发言照常累计。"
             ),
         ]
+        if raffle["kind"] == "reach":
+            lines.append(assigned_text(prizes, ranked, assigned, raffle["min_messages"]))
         if not ranked:
             lines.append("还没有人发言。")
         rows = []
@@ -2296,6 +2319,8 @@ class Menu:
             label += f" · {e['messages']} 次"
             if e.get("adjusted"):
                 label += f"（手动 {e['adjusted']:+d}）"
+            if e["user_id"] in assigned:
+                label += f" · 🎯{prizes[assigned[e['user_id']]][0][:8]}"
             rows.append((button(label, f"m:au:{rid}:{e['user_id']}:{page}"),))
         nav = []
         if page:
@@ -2310,8 +2335,9 @@ class Menu:
         )
 
     async def speaker(self, rid, uid, page):
-        """One member's message count, with buttons to correct it."""
-        _, ranked = await asyncio.to_thread(self.store.ranking, rid)
+        """One member's message count, with buttons to correct it; in a "reach" raffle also
+        the prize assigned to them, with buttons to assign one."""
+        raffle, ranked = await asyncio.to_thread(self.store.ranking, rid)
         counted, delta = await asyncio.to_thread(self.store.counted, rid, uid)
         entry = next((e for e in ranked if e["user_id"] == uid), None)
         name = name_text(entry["display_name"]) if entry else f"用户 {uid}"
@@ -2322,12 +2348,48 @@ class Menu:
         if entry:
             lines.append(f"当前第 {ranked.index(entry) + 1} 名")
         choices = [button(f"{n:+d}", f"m:as:{rid}:{uid}:{n}:{page}") for n in CORRECTIONS]
+        picker = []
+        if raffle["kind"] == "reach":
+            prize_lines, picker = await self.prize_picker(raffle, entry, uid, page)
+            lines += prize_lines
         return "\n".join(lines), keyboard(
             *in_rows(choices, 3),
             (button("✏️ 改为…", f"m:as:{rid}:{uid}:x:{page}"),),
             (button("↩️ 清除修改", f"m:as:{rid}:{uid}:{-delta}:{page}"),) if delta else (),
+            *picker,
             (button("⬅️ 返回", f"m:ac:{rid}:{page}"),),
         )
+
+    async def assignments(self, raffle):
+        """An activity raffle's prizes and, in a "reach" one, who was assigned which of them:
+        user_id -> place in the list."""
+        prizes = json.loads(raffle["prizes"])
+        if raffle["kind"] != "reach":
+            return prizes, {}
+        return prizes, await asyncio.to_thread(self.store.prize_assignments, raffle["id"])
+
+    async def prize_picker(self, raffle, entry, uid, page):
+        """The prize assigned to a member of a "reach" raffle, as lines, and rows of buttons
+        to assign one, which only those with enough messages get."""
+        prizes, assigned = await self.assignments(raffle)
+        rid, mine = raffle["id"], assigned.get(uid)
+        lines = [f"🎯 指定奖品：{prizes[mine][0]}" if mine is not None else "🎯 未指定奖品"]
+        cancel = ()
+        if mine is not None:
+            cancel = (button("↩️ 取消指定奖品", f"m:ap:{rid}:{uid}:x:{page}"),)
+        if entry is None or entry["messages"] < raffle["min_messages"]:
+            short = "⚠️ 现在未达标，这个指定开奖时不生效。" if mine is not None else ""
+            lines.append(short or "达标后才能指定奖品。")
+            return lines, [cancel]
+        choices = []
+        for index, (name, count) in enumerate(prizes):
+            if index == mine:
+                label = f"✅ {name[:12]}"
+            else:
+                left = count - sum(1 for taken in assigned.values() if taken == index)
+                label = f"🎯 {name[:12]}（剩 {left}）"
+            choices.append(button(label, f"m:ap:{rid}:{uid}:{index}:{page}"))
+        return lines, [*in_rows(choices, 2), cancel]
 
     async def weight_typed(self, bot, message, user_id, asking):
         kind, rid, uid, page = asking

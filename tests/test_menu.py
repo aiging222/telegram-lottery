@@ -417,6 +417,53 @@ def test_super_admins_correct_message_counts(env):
     assert text == "Tom（ID：7）\n发言 1 次 · 机器人记录 1 次\n当前第 2 名"
 
 
+def test_super_admins_assign_prizes_in_a_reach_raffle(env):
+    rid = env.store.create(
+        OWNER,
+        "内部抽奖",
+        3,
+        60,
+        chat_id=GROUP,
+        kind="reach",
+        prizes=[["一等奖", 1], ["二等奖", 2]],
+        min_messages=2,
+    )
+    for uid, name, count in ((7, "Tom", 3), (8, "Ann", 1)):
+        for i in range(count):
+            env.store.count_message(GROUP, uid, name, NOW + 10 + 61 * i)
+    env.now[0] += 300
+    text, buttons = shown(press(env, OWNER, f"m:r:{rid}"))
+    assert "✏️ 发言次数与指定奖品" not in buttons and "🎯" not in text
+    denied = press(env, OWNER, f"m:ap:{rid}:7:0:0").answer.await_args.args[0]
+    assert denied == "只有超级管理员可以修改发言次数。"
+    _, buttons = shown(press(env, ADMIN, f"m:r:{rid}"))
+    text, buttons = shown(press(env, ADMIN, buttons["✏️ 发言次数与指定奖品"]))
+    assert "🎯 还没有指定奖品，点成员可以指定。" in text
+    text, buttons = shown(press(env, ADMIN, buttons["2. Ann · 1 次"]))
+    assert text.endswith("当前第 2 名\n🎯 未指定奖品\n达标后才能指定奖品。")
+    assert not any(label.startswith(("🎯", "✅")) for label in buttons)
+    _, buttons = shown(press(env, ADMIN, f"m:au:{rid}:7:0"))
+    text, buttons = shown(press(env, ADMIN, buttons["🎯 一等奖（剩 1）"]))
+    assert text.endswith("当前第 1 名\n🎯 指定奖品：一等奖")
+    assert {"✅ 一等奖", "🎯 二等奖（剩 2）", "↩️ 取消指定奖品"} <= set(buttons)
+    text, buttons = shown(press(env, ADMIN, f"m:ac:{rid}:0"))
+    assert "🎯 已指定：一等奖 Tom" in text
+    assert "1. Tom · 3 次 · 🎯一等奖" in buttons
+    _, buttons = shown(press(env, ADMIN, buttons["2. Ann · 1 次"]))
+    _, buttons = shown(press(env, ADMIN, buttons["+1"]))  # enough messages now
+    query = press(env, ADMIN, buttons["🎯 一等奖（剩 0）"])
+    assert query.answer.await_args.args[0] == "「一等奖」的名额已经指定满了。"
+    env.store.adjust(rid, ADMIN, 7, by=-2)  # Tom falls short
+    text, _ = shown(press(env, ADMIN, f"m:ac:{rid}:0"))
+    assert "🎯 已指定：一等奖 Tom（未达标，开奖时不生效）" in text
+    text, buttons = shown(press(env, ADMIN, f"m:au:{rid}:7:0"))
+    assert text.endswith("🎯 指定奖品：一等奖\n⚠️ 现在未达标，这个指定开奖时不生效。")
+    assert not any(label.startswith("🎯") for label in buttons)
+    text, _ = shown(press(env, ADMIN, buttons["↩️ 取消指定奖品"]))
+    assert text.endswith("🎯 未指定奖品\n达标后才能指定奖品。")
+    assert env.store.prize_assignments(rid) == {}
+
+
 def test_wizard_typed_deadline(env):
     press(env, OWNER, f"m:new:{GROUP}")
     press(env, OWNER, "m:k:join")

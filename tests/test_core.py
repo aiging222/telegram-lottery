@@ -14,6 +14,8 @@ from lottery.core import (
     LotteryError,
     NotEnoughPoints,
     Store,
+    hand_out,
+    pick_winners,
     weighted_draw,
 )
 
@@ -790,6 +792,76 @@ def test_counts_can_be_corrected_for_messages_the_bot_missed(setup):
     assert winners[1]["display_name"] == "用户 3"
     actions = [e["action"] for e in store.export(ranked)["audit"]]
     assert actions.count("adjust") == 3
+
+
+def test_reach_prizes_can_be_assigned_to_members_with_enough_messages(setup):
+    store, rid, now = setup
+    start = now[0]
+    prizes = [["一等奖", 1], ["二等奖", 2]]
+    reach = ranking(store, kind="reach", prizes=prizes, min_messages=2)
+    for uid, count in ((1, 2), (2, 2), (3, 2), (4, 2), (5, 1)):
+        for i in range(count):
+            store.count_message(-100, uid, f"u{uid}", start + 60 * i + uid)
+    now[0] = start + 600
+    with pytest.raises(LotteryError, match="已达标"):
+        store.assign_prize(reach, 99, 5, 0)  # one message short
+    assert store.assign_prize(reach, 99, 4, 0)
+    assert not store.assign_prize(reach, 99, 4, 0)  # so already
+    with pytest.raises(LotteryError, match="「一等奖」的名额已经指定满了"):
+        store.assign_prize(reach, 99, 3, 0)
+    assert store.assign_prize(reach, 99, 4, 1)  # moved to the other prize
+    assert store.assign_prize(reach, 99, 3, 0)
+    assert store.assign_prize(reach, 99, 2, 1)
+    assert store.assign_prize(reach, 99, 2, None)  # taken back
+    with pytest.raises(LotteryError, match="没有这个奖品"):
+        store.assign_prize(reach, 99, 2, 2)
+    for other in (rid, ranking(store, winners=1), ranking(store, winners=1, invite_via="link")):
+        with pytest.raises(LotteryError, match="只有发言达标抽奖"):
+            store.assign_prize(other, 99, 1, 0)
+    assert store.prize_assignments(reach) == {3: 0, 4: 1}
+    assert not store.view(reach)["weighted"]  # the card shows nothing of it
+    _, ranked = store.ranking(reach)
+    assert all("assigned" not in e for e in ranked)  # nor the members' ranking
+    now[0] = start + 3600
+    with pytest.raises(LotteryError, match="统计已截止"):
+        store.assign_prize(reach, 99, 1, 1)
+    winners = store.draw(reach, 99)["winners"]
+    assert [(w["user_id"], w["prize"]) for w in winners[:2]] == [(3, "一等奖"), (4, "二等奖")]
+    assert winners[2]["prize"] == "二等奖" and winners[2]["user_id"] in (1, 2)
+    actions = [e["action"] for e in store.export(reach)["audit"]]
+    assert actions.count("assign_prize") == 5
+
+
+def test_an_assigned_prize_is_drawn_again_once_its_winner_falls_short(setup):
+    store, _, now = setup
+    start = now[0]
+    prizes = [["一等奖", 1], ["二等奖", 1]]
+    rid = ranking(store, winners=2, kind="reach", prizes=prizes, min_messages=2)
+    for uid in (1, 2, 3):
+        for i in range(2):
+            store.count_message(-100, uid, f"u{uid}", start + 60 * i + uid)
+    now[0] = start + 600
+    store.assign_prize(rid, 99, 1, 0)
+    store.assign_prize(rid, 99, 2, 1)
+    store.adjust(rid, 99, 1, by=-1)  # one message short now
+    store.leave_group(-100, 2, now[0])  # and 2 has left
+    now[0] = start + 3600
+    winners = store.draw(rid, 99)["winners"]
+    assert [(w["user_id"], w["prize"]) for w in winners] == [(3, "一等奖")]
+
+
+def test_without_assignments_reach_prizes_go_in_draw_order_as_before():
+    entries = [{"user_id": uid, "weight": 1} for uid in range(1, 6)]
+    prizes = [["一等奖", 1], ["二等奖", 2]]
+
+    def last(total):  # always the last one left
+        return total - 1
+
+    before = pick_winners(entries, 3, last)
+    for winner, name in zip(before, ["一等奖", "二等奖", "二等奖"], strict=True):
+        winner["prize"] = name
+    assert hand_out(entries, prizes, last) == before
+    assert [w["user_id"] for w in before] == [5, 4, 3]
 
 
 def test_message_counts_follow_a_supergroup_upgrade(setup):
