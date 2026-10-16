@@ -682,7 +682,7 @@ class BotHandlers:
             limits.append(f"最多 {found['member_limit']} 人通过它进群")
         if limits:
             lines.append("；".join(limits) + "。到期或用满后再领取，会拿到新链接。")
-        lines += ["", "把它发给好友，好友通过这条链接进群，就算你邀请的。"]
+        lines += ["", "分享此链接邀请好友入群，通过该链接首次入群的新成员将计入你的邀请。"]
         # Counts only of raffles still counting: any other would pass for one of them.
         counts = []
         for raffle in raffles:
